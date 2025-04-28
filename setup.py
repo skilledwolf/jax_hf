@@ -1,0 +1,1 @@
+import setuptools; setuptools.setup() # required for backwards compatibility

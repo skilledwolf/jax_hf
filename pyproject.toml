@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax_hf"
+description = "A package that provides a jax-based Hartree-Fock optimization solver for simple continuum models."
+readme = "README.md"
+authors = [
+  {email = "public@wolft.xyz"},
+  {name = "Tobias Wolf"}
+]
+requires-python = ">=3.11"
+keywords = ["physics", "condensed matter", "hartree fock", "mean field", "scf"]
+license = {text = "BSD 2-clause"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3"
+]
+dependencies = [
+    "jax",
+#    "opt_einsum",
+    "optimistix",
+    "optax",
+#    "flax"
+]
+
+dynamic = ["version"]
+
+# [project.optional-dependencies]
+# dev = ["tqdm", "jupyterlab"]
+
+[tool.setuptools_scm]
+
+[tool.setuptools.packages.find]
+where = ["src"]  # list of folders that contain the packages (["."] by default)
+# include = ["my_package*"]  # package names should match these glob patterns (["*"] by default)
+# exclude = ["my_package.tests*"]  # exclude packages matching these glob patterns (empty by default)
+namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
