@@ -252,7 +252,7 @@ def mixer_update(state: MixerState,
         comm_pc = orbital_preconditioner(comm, F)
         bro_in = lax.cond(
             state.use_ediis,
-            lambda _: broyden_init(state.bройden.s_hist.shape[0], P.shape),
+            lambda _: broyden_init(state.broyden.s_hist.shape[0], P.shape),
             lambda _: state.broyden,
             operand=None
         )
