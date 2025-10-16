@@ -14,13 +14,11 @@ def fermidirac(x: jax.Array, T: float) -> jax.Array:
 
 def electron_density(P: jax.Array) -> jax.Array:
     """Real trace of density matrix."""
-    # return jnp.real(jnp.trace(P, axis1=-2, axis2=-1))
-    return jnp.real(jnp.einsum("...ii->", P))
+    return jnp.real(jnp.trace(P, axis1=-2, axis2=-1))
 
 def density_spectrum(bands: jax.Array, mu: float, T: float) -> jax.Array:
     """Sum of Fermi occupations for given band energies."""
-    # return jnp.sum(fermidirac(bands - mu, T))
-    return fermidirac(bands - mu, T).sum()
+    return fermidirac(bands - mu, T).sum(axis=-1)
 
 def selfenergy_fft(VR: jax.Array, P: jax.Array) -> jax.Array:
     """Hartree self-energy Σ(k) = -FFT⁻¹[FFT(P) * VR], shifted to center."""

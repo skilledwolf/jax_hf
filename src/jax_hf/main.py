@@ -1,44 +1,50 @@
-import jax 
-import jax.numpy as jnp
-
-# from .jax_modules import HartreeFockStep
-
-from .utils import selfenergy_fft
-from .mixing import mixer_init, mixer_update
-
 from functools import partial
-from jax import lax, debug  # ← new import
-
-from functools import partial
-from jax import lax, debug
-import jax.numpy as jnp
-
-from .utils import find_chemical_potential, fermidirac, selfenergy_fft
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax.numpy.linalg import eigh
+from jax import debug, lax
 from jax.numpy.fft import fftn
+from jax.numpy.linalg import eigh
 
-import math
-from typing import NamedTuple, Tuple
+from .mixing import mixer_init, mixer_init_like, mixer_update
+from .utils import fermidirac, find_chemical_potential, selfenergy_fft
+
+
+class HartreeFockResult(NamedTuple):
+    density: jax.Array
+    energy: jax.Array
+    fock_input: jax.Array
+    self_energy_input: jax.Array
+    fock_density: jax.Array
+    self_energy_density: jax.Array
 
 
 class HartreeFockKernel:
-    """Build and diagonalize Fock operator → return (P_new, E_HF)."""
-    def __init__(
-        self,
-        weights: jax.Array,
-        hamiltonian: jax.Array,
-        coulomb_q: jax.Array,
-        # electrondensity: float,
-        T: float
-    ):
-        self.weights = weights
-        self.h = hamiltonian
-        self.VR = fftn(weights * coulomb_q, axes=(0, 1))[..., None, None]
-        # self.n_electrons = electrondensity
-        self.T = T
+    def __init__(self, weights, hamiltonian, coulomb_q, T: float):
+        self.h        = jnp.asarray(hamiltonian)
+        self.weights  = jnp.asarray(weights[..., None, None], dtype=hamiltonian.dtype)
+        self.weight_sum = jnp.sum(self.weights)
+        # keep static trailing dims for cheap multiply/broadcast in k-space
+        self.VR       = fftn(self.weights * jnp.asarray(coulomb_q, dtype=hamiltonian.dtype), axes=(0, 1))
+        self.T        = T
+
+    def __call__(self, P: jax.Array, electrondensity):
+        # symmetrize input density
+        Ph     = 0.5 * (P + jnp.conj(jnp.swapaxes(P, -1, -2)))
+        sigma  = selfenergy_fft(self.VR, Ph)
+        fock   = self.h + sigma
+        bands, psi = eigh(fock)
+
+        mu  = find_chemical_potential(bands, self.weights, electrondensity, self.T)
+        occ = fermidirac(bands - mu, self.T)
+        P_new = jnp.einsum('...in,...n,...jn->...ij', psi, occ, jnp.conj(psi))
+
+        # use the input-side sigma for the HF energy (same as before)
+        E_hf = jnp.real(
+            jnp.einsum('klim,klmi', (self.weights * (self.h + 0.5 * sigma)), P_new)
+        )
+        return P_new, E_hf
 
     def _chemical_potential(self, P, electrondensity):
         Ph = 0.5 * (P + jnp.conj(jnp.swapaxes(P, -1, -2)))
@@ -46,32 +52,11 @@ class HartreeFockKernel:
         Hf      = self.h + Σ
         bands, ψ = eigh(Hf)                            # ψ[..., i, n]
         return find_chemical_potential(bands, self.weights, electrondensity, self.T)
-
-    def __call__(self, P: jax.Array, electrondensity) -> Tuple[jax.Array, float]:
-        Ph = 0.5 * (P + jnp.conj(jnp.swapaxes(P, -1, -2)))
-        sigma = selfenergy_fft(self.VR, Ph)
-        fock = self.h + sigma
-        bands, psi = eigh(fock)
-
-        mu = find_chemical_potential(bands, self.weights, electrondensity, self.T)
-        occ = fermidirac(bands - mu, self.T)
-
-        P_new = jnp.einsum('...in,...n,...jn->...ij', psi, occ, jnp.conj(psi))
-
-        Hhalf = self.h + 0.5 * sigma
-        E_hf = jnp.real(
-            jnp.einsum(
-                'klim,klmi',
-                self.weights[..., None, None] * Hhalf,
-                P_new
-            )
-        )
-        return P_new, E_hf
     
 
 def hartreefock_iteration(
     P0: jax.Array, 
-    electrondensity: float,
+    electrondensity0: float,
     hf_step: HartreeFockKernel, 
     *,
     max_iter:  int   = 100,
@@ -79,26 +64,34 @@ def hartreefock_iteration(
     diis_size: int   = 4,
     log_every: int | None = 1):
 
-    mixer_st  = mixer_init(diis_size, P0.shape)
+    # Single conversion: pin everything to the kernel Hamiltonian dtype
+    target_dtype = hf_step.h.dtype
+    P0 = jnp.asarray(P0, dtype=target_dtype)
 
-    # history buffers
-    hist_E  = jnp.zeros(max_iter, dtype=jnp.float64)
-    hist_dC = jnp.zeros(max_iter, dtype=jnp.float64)
+    mixer_st  = mixer_init_like(P0, diis_size)
+
+    real_dtype = jnp.zeros((), dtype=target_dtype).real.dtype
+    electrondensity = jnp.array(electrondensity0, dtype=real_dtype)
+
+    hist_E  = jnp.zeros(max_iter, dtype=real_dtype)
+    hist_dC = jnp.zeros(max_iter, dtype=real_dtype)
+
+    # Make the infinities match the loop’s real dtype
+    inf_r = jnp.asarray(jnp.inf, dtype=real_dtype)
 
     # carry = (iter, P, mixer_state, dC_prev, E_prev, hist_E, hist_dC)
-    carry0 = (jnp.int32(0), P0, mixer_st, jnp.inf, jnp.inf,
-                hist_E, hist_dC)
+    carry0 = (jnp.int32(0), P0, mixer_st, inf_r, inf_r, hist_E, hist_dC)
 
     def body(carry):
         k, P, mix_st, _dC_prev, E_prev, hE, hC = carry
 
         # 1) SCF step
+        hf_result = hf_step(P, electrondensity)
         P_new, E_new = hf_step(P, electrondensity)
-        Σ_new        = selfenergy_fft(hf_step.VR, P_new)
-        F_new        = hf_step.h + Σ_new
+        F_new        = hf_step.h + selfenergy_fft(hf_step.VR, P_new)
 
-        comm = (hf_step.weights[..., None, None] *
-                (F_new @ P_new - P_new @ F_new)) / hf_step.weights.sum()
+        comm = (hf_step.weights *
+                (F_new @ P_new - P_new @ F_new)) / hf_step.weight_sum
         dC = jnp.max(jnp.abs(comm))
 
         # 2) optional energy / comm prints
@@ -132,10 +125,7 @@ def hartreefock_iteration(
 
             _ = lax.cond(
                 switched,
-                lambda mode: lax.cond(mode,
-                                        _announce_ediis,
-                                        _announce_cdiis,
-                                        operand=None),
+                lambda mode: lax.cond(mode, _announce_ediis, _announce_cdiis, operand=None),
                 lambda _: jnp.int32(0),
                 operand=is_ediis,
             )
@@ -151,14 +141,12 @@ def hartreefock_iteration(
         return jnp.logical_and(k < max_iter, dC > comm_tol)
 
     # run the SCF loop
-    k_fin, P_fin, mix_fin, dC_fin, E_prev, hist_E, hist_dC = \
-        lax.while_loop(cond, body, carry0)
+    k_fin, P_fin, mix_fin, dC_fin, E_prev, hist_E, hist_dC = lax.while_loop(cond, body, carry0)
 
     # final energy
-    E_fin = jnp.real(hf_step(P_fin, electrondensity)[1])
+    E_fin = jnp.real(E_prev)
 
     # 5) convergence warning if we hit max_iter without converging
-    # if log_every is not None:
     did_fail = jnp.logical_and(k_fin == max_iter, dC_fin > comm_tol)
 
     def _warn(_):
@@ -168,30 +156,23 @@ def hartreefock_iteration(
         )
         return jnp.int32(0)
 
-    _ = lax.cond(
-        did_fail,
-        _warn,
-        lambda _: jnp.int32(0),
-        operand=None,
-    )
+    _ = lax.cond(did_fail, _warn, lambda _: jnp.int32(0), operand=None)
+
+    # compute the final mean field Hamiltonian
+    F_fin = hf_step.h + selfenergy_fft(hf_step.VR, P_fin)
+    mu_fin = hf_step._chemical_potential(P_fin, electrondensity)
 
     history = dict(E=hist_E, dC=hist_dC)
-    return P_fin, E_fin, k_fin, history
+    return P_fin, F_fin, E_fin, mu_fin, k_fin, history
 
 
-def jit_hartreefock_iteration(
-    hf_step: HartreeFockKernel):
-
-    # make iteration parameters and density static 
+def jit_hartreefock_iteration(hf_step: HartreeFockKernel):
     compiled_hf_iteration_fn = jax.jit(
-        partial(
-            hartreefock_iteration,
-            hf_step=hf_step
-        ),
+        partial(hartreefock_iteration, hf_step=hf_step),
         static_argnames=["max_iter", "comm_tol", "diis_size", "log_every"]
     )
-
     return compiled_hf_iteration_fn
+
 
 
 # -------------------------------------------------------------------------
@@ -213,6 +194,6 @@ def jit_hartreefock_iteration(
 # }
 #
 # hf_run   = jax_hf.build_hf_run(model, max_iter=35, comm_tol=1e-3, diis_size=10, log_every=None)
-# P_conv, E_sym, n_iter, history = hartree_fock_iteration(h.zero*(1+0j), n_cn+n_e, **iteration_settings)
+# P_conv, F_conv, E_sym, n_iter, history = hartree_fock_iteration(h.zero*(1+0j), n_cn+n_e, **iteration_settings)
 # hmf = jax_hf.wrappers.contimod_from_HartreeFock(h, model, P_conv)
 # print(f"Converged in {int(n_iter)} steps: E = {E_conv:.8f}")

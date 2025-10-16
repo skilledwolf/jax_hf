@@ -6,6 +6,8 @@
 
 .vscode/*
 *.code-workspace
+playground/*
+examples/*
 
 # Local History for Visual Studio Code
 .history/

@@ -33,6 +33,10 @@ dynamic = ["version"]
 # dev = ["tqdm", "jupyterlab"]
 
 [tool.setuptools_scm]
+# Derive version from git tags similar to cpp_hf
+version_scheme = "guess-next-dev"
+local_scheme = "node-and-date"
+fallback_version = "0.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]  # list of folders that contain the packages (["."] by default)
