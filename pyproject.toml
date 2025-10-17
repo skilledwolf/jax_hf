@@ -32,6 +32,11 @@ dynamic = ["version"]
 # [project.optional-dependencies]
 # dev = ["tqdm", "jupyterlab"]
 
+[project.urls]
+Homepage = "https://github.com/skilledwolf/jax_hf"
+Source = "https://github.com/skilledwolf/jax_hf"
+Issues = "https://github.com/skilledwolf/jax_hf/issues"
+
 [tool.setuptools_scm]
 # Derive version from git tags similar to cpp_hf
 version_scheme = "guess-next-dev"
