@@ -1,28 +1,29 @@
-"""
-Package: jax_hf
+"""jax_hf (deprecated)
+
+This package now only provides the mixing module and a minimal skeleton API to
+preserve import compatibility. Use `jax_hf2` for a working implementation.
 """
 
-from importlib.metadata import version, PackageNotFoundError
+from __future__ import annotations
 
 from importlib import metadata
 
-try:
+try:  # pragma: no cover - metadata only
     __version__ = metadata.version("jax_hf")
     __author__ = metadata.metadata("jax_hf")["Author"]
-except metadata.PackageNotFoundError:
-    # package is not installed
+except metadata.PackageNotFoundError:  # pragma: no cover - package not installed
     pass
 
-import jax
-jax.config.update("jax_enable_x64", True)
+# Export mixing (kept intact) and expose skeleton API
+from . import mixing  # noqa: F401
+from .main import HartreeFockKernel, jit_hartreefock_iteration  # noqa: F401
 
-######################################################################################
-# Imports
-######################################################################################
+# Minimal utils shim to aid migration
+from . import utils  # noqa: F401
 
-from . import utils
-from . import mixing
-from . import jax_modules
-from . import wrappers
-
-from .main import *
+__all__ = [
+    "mixing",
+    "HartreeFockKernel",
+    "jit_hartreefock_iteration",
+    "utils",
+]
