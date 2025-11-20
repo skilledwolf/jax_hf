@@ -21,11 +21,20 @@ class HartreeFockKernel:
         h = jnp.asarray(hamiltonian)
         self.h = h  # complex
         # broadcast weights for cheap elementwise ops in k-space
-        w2d = jnp.asarray(weights, dtype=h.real.dtype)
-        self.weights_b = w2d[..., None, None].astype(h.dtype)
+        w2d = jnp.asarray(weights, dtype=h.real.dtype)  # weights are physically real
+        self.weights_b = w2d[..., None, None]           # keep real to avoid downstream casting warnings
         self.weight_sum = jnp.sum(w2d)
         self.w2d = w2d
-        self.VR = jnp.fft.fftn(self.weights_b * jnp.asarray(coulomb_q, dtype=h.dtype), axes=(0, 1))
+
+        Vq = jnp.asarray(coulomb_q)
+        if jnp.iscomplexobj(Vq):
+            imag_max = float(jnp.max(jnp.abs(jnp.imag(Vq))))
+            if imag_max <= 1e-8:
+                Vq = jnp.real(Vq)  # small phase noise; use real Coulomb
+            # else keep complex Vq as provided
+        else:
+            Vq = Vq.astype(h.real.dtype)
+        self.VR = jnp.fft.fftn(self.weights_b * jnp.asarray(Vq, dtype=h.dtype), axes=(0, 1))
         self.T = float(T)
         # options
         self.include_hartree = bool(include_hartree)
@@ -61,8 +70,14 @@ class HartreeFockKernel:
     def _hartree_shift(self, P: jax.Array) -> jax.Array:
         if not self.include_hartree:
             return jnp.zeros_like(self.h)
-        dn = jnp.sum(self.w2d * jnp.real(jnp.trace(P - self.refP, axis1=-2, axis2=-1)))
-        return (dn * self.HH).astype(self.h.real.dtype)[None, None, ...]
+        dP = _herm(P) - self.refP
+        # Per-orbital fluctuation density integrated over k: n_vec[α]
+        diag_real = jnp.real(jnp.diagonal(dP, axis1=-2, axis2=-1))  # (..., nb)
+        n_vec = jnp.sum(self.w2d[..., None] * diag_real, axis=(0, 1))  # (nb,)
+        # Hartree self-energy is diagonal: (Σ_H)_αα = sum_β U_{αβ} n_β
+        sigma_diag = self.HH @ n_vec  # (nb,)
+        H_mat = jnp.diag(sigma_diag.astype(self.h.real.dtype))  # (nb,nb)
+        return H_mat[None, None, ...]
 
     def fock_matrix(self, P: jax.Array) -> jax.Array:
         return _herm(self.h + self._exchange_sigma(P) + self._hartree_shift(P))
@@ -164,8 +179,14 @@ def hartreefock_iteration(
 
         # ---- 1) Build Fock at INPUT density, diagonalize, make new density
         Sigma_in = selfenergy_fft(VR, _herm(P - refP)) if include_exchange else jnp.zeros_like(h)
-        dn_in    = jnp.sum(w2d * jnp.real(jnp.trace(P - refP, axis1=-2, axis2=-1)))
-        H_in     = (dn_in * HH).astype(h.real.dtype)[None, None, ...] if include_hartree else jnp.zeros_like(h)
+        if include_hartree:
+            dP_in = _herm(P) - refP
+            diag_real_in = jnp.real(jnp.diagonal(dP_in, axis1=-2, axis2=-1))
+            n_vec_in = jnp.sum(w2d[..., None] * diag_real_in, axis=(0, 1))
+            sigma_diag_in = HH @ n_vec_in
+            H_in = jnp.diag(sigma_diag_in.astype(h.real.dtype))[None, None, ...]
+        else:
+            H_in = jnp.zeros_like(h)
         F_in     = h + Sigma_in + H_in
         eps, U   = eigh(F_in)
         mu       = find_chemical_potential(eps, w2d, n_e, T)
@@ -174,8 +195,14 @@ def hartreefock_iteration(
 
         # ---- 2) Build Fock at NEW density, energy, and commutator residual
         Sigma_new = selfenergy_fft(VR, _herm(P_new - refP)) if include_exchange else jnp.zeros_like(h)
-        dn_new    = jnp.sum(w2d * jnp.real(jnp.trace(P_new - refP, axis1=-2, axis2=-1)))
-        H_new     = (dn_new * HH).astype(h.real.dtype)[None, None, ...] if include_hartree else jnp.zeros_like(h)
+        if include_hartree:
+            dP_new = _herm(P_new) - refP
+            diag_real_new = jnp.real(jnp.diagonal(dP_new, axis1=-2, axis2=-1))
+            n_vec_new = jnp.sum(w2d[..., None] * diag_real_new, axis=(0, 1))
+            sigma_diag_new = HH @ n_vec_new
+            H_new = jnp.diag(sigma_diag_new.astype(h.real.dtype))[None, None, ...]
+        else:
+            H_new = jnp.zeros_like(h)
         F_new     = h + Sigma_new + H_new
         # E = sum_k w_k Tr[(h + 0.5(Σ+H)) P]
         E_new     = jnp.sum(jnp.real(jnp.einsum("...ij,...ji->...", weights_b * (h + 0.5*(Sigma_new + H_new)), P_new)))
