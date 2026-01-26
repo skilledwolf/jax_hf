@@ -73,6 +73,31 @@ P_fin, F_fin, E_fin, mu_fin, n_iter, history = hf_iter(
 print("iters:", int(n_iter), "mu:", float(mu_fin), "E:", float(E_fin))
 ```
 
+## Coarse-to-fine continuation (`nk_coarse`)
+
+For large k-grids it can be helpful to converge on a smaller coarse grid and use
+the resulting mean-field self-energy as a seed for a fine-grid run. jax_hf
+includes a small helper that resamples (H, Vq, P) between uniform centered
+grids:
+
+```python
+import jax_hf
+
+out = jax_hf.coarse_to_fine_scf(
+    weights_f=weights,
+    hamiltonian_f=H,
+    coulomb_q_f=Vq,
+    P0_f=P0,
+    electrondensity0=float(ne_target),
+    T=0.5,
+    nk_coarse=64,
+    coarse_scf_kwargs=dict(max_iter=80, comm_tol=1e-3, diis_size=6),
+    fine_scf_kwargs=dict(max_iter=50, comm_tol=1e-4, diis_size=6),
+)
+print("coarse iters:", int(out.coarse.n_iter) if out.coarse else None)
+print("fine iters:", int(out.fine.n_iter))
+```
+
 ## API
 
 ```python

@@ -8,20 +8,115 @@ from jax import lax
 # -------------------------------------------------------------------------
 # 0) Preconditioners (orbital-Hessian in AO basis)
 # -------------------------------------------------------------------------
-def orbital_preconditioner(comm: jax.Array,
-                           F:    jax.Array,
-                           delta: float = 1e-3) -> jax.Array:
-    """
-    Precondition the AO-basis commutator using an orbital-Hessian approximation.
-    comm, F: shape (..., n, n). Returns a comm_pc of same shape.
-    """
-    eps, C = jnp.linalg.eigh(F)                         # eps: (..., n), C: (..., n, n)
+PRECOND_EIGH = 0
+PRECOND_DIAG = 1
+PRECOND_REUSE = 2
+PRECOND_AUTO = 3
+
+_PRECOND_NAME_MAP = {
+    "eigh": PRECOND_EIGH,
+    "exact": PRECOND_EIGH,
+    "full": PRECOND_EIGH,
+    "diag": PRECOND_DIAG,
+    "diagonal": PRECOND_DIAG,
+    "reuse": PRECOND_REUSE,
+    "auto": PRECOND_AUTO,
+    "automatic": PRECOND_AUTO,
+}
+
+
+def normalize_precond_mode(mode: int | str) -> int:
+    if isinstance(mode, str):
+        key = mode.strip().lower()
+        if key not in _PRECOND_NAME_MAP:
+            raise ValueError(f"Unknown precond_mode='{mode}'. Expected one of {sorted(_PRECOND_NAME_MAP)}.")
+        return _PRECOND_NAME_MAP[key]
+    return mode
+
+
+def _orbital_preconditioner_from_eig(comm: jax.Array,
+                                     eps: jax.Array,
+                                     C: jax.Array,
+                                     delta: float) -> jax.Array:
     R_mo = jnp.einsum('...mp,...mn,...nq->...pq', C.conj(), comm, C)
     delta_arr = jnp.asarray(delta, dtype=eps.dtype)
     denom = (eps[..., :, None] - eps[..., None, :]) + delta_arr
     R_tilde = -R_mo / denom
     comm_pc = jnp.einsum('...ip,...pq,...jq->...ij', C, R_tilde, C.conj())
     return comm_pc
+
+
+def _orbital_preconditioner_diag(comm: jax.Array,
+                                 F: jax.Array,
+                                 delta: float) -> jax.Array:
+    eps = jnp.real(jnp.diagonal(F, axis1=-2, axis2=-1))
+    delta_arr = jnp.asarray(delta, dtype=eps.dtype)
+    denom = (eps[..., :, None] - eps[..., None, :]) + delta_arr
+    return -comm / denom
+
+
+def _reuse_available(F: jax.Array, eps: jax.Array, C: jax.Array) -> bool:
+    if eps.ndim != F.ndim - 1:
+        return False
+    if C.ndim != F.ndim:
+        return False
+    if eps.shape[:-1] != F.shape[:-2]:
+        return False
+    if C.shape != F.shape:
+        return False
+    if eps.shape[-1] != F.shape[-1]:
+        return False
+    if C.shape[-2:] != F.shape[-2:]:
+        return False
+    return True
+
+
+def orbital_preconditioner(comm: jax.Array,
+                           F:    jax.Array,
+                           delta: float = 1e-3,
+                           *,
+                           mode: int = PRECOND_EIGH,
+                           eps: jax.Array = jnp.zeros(()),
+                           C: jax.Array = jnp.zeros(()),
+                           auto_nb: int = 128) -> jax.Array:
+    """
+    Precondition the AO-basis commutator using an orbital-Hessian approximation.
+    comm, F: shape (..., n, n). Returns a comm_pc of same shape.
+
+    mode: PRECOND_EIGH (exact), PRECOND_DIAG, PRECOND_REUSE, PRECOND_AUTO.
+    """
+    mode = jnp.asarray(mode, dtype=jnp.int32)
+    reuse_ok = _reuse_available(F, eps, C)
+
+    n_orb = F.shape[-1]
+    auto_fast = jnp.int32(PRECOND_REUSE if reuse_ok else PRECOND_DIAG)
+    nb_arr = jnp.asarray(n_orb, dtype=jnp.int32)
+    auto_nb_arr = jnp.asarray(auto_nb, dtype=jnp.int32)
+    auto_mode = jnp.where(nb_arr >= auto_nb_arr, auto_fast, jnp.int32(PRECOND_EIGH))
+    mode = jnp.where(mode == PRECOND_AUTO, auto_mode, mode)
+
+    if not reuse_ok:
+        mode = jnp.where(mode == PRECOND_REUSE, PRECOND_EIGH, mode)
+
+    invalid = jnp.logical_or(mode < PRECOND_EIGH, mode > PRECOND_REUSE)
+    mode = jnp.where(invalid, PRECOND_EIGH, mode).astype(jnp.int32)
+
+    def _precond_eigh(_):
+        eps_local, C_local = jnp.linalg.eigh(F)
+        return _orbital_preconditioner_from_eig(comm, eps_local, C_local, delta)
+
+    def _precond_diag(_):
+        return _orbital_preconditioner_diag(comm, F, delta)
+
+    def _precond_reuse(_):
+        if reuse_ok:
+            eps_local, C_local = eps, C
+        else:
+            eps_local, C_local = jnp.linalg.eigh(F)
+        return _orbital_preconditioner_from_eig(comm, eps_local, C_local, delta)
+
+    branches = (_precond_eigh, _precond_diag, _precond_reuse)
+    return lax.switch(mode, branches, operand=None)
 
 # -------------------------------------------------------------------------
 # 1) DIIS mixing (robust CDIIS with gentle fallback)
@@ -393,6 +488,10 @@ def mixer_update(state: MixerState,
                  to_broyden: float,
                  mixing_alpha: float = 1.0,
                  precond_delta: float = 5e-3,
+                 precond_mode: int = PRECOND_EIGH,
+                 precond_auto_nb: int = 128,
+                 precond_eps: jax.Array = jnp.zeros(()),
+                 precond_C: jax.Array = jnp.zeros(()),
                  cdiis_blend_keep: float = 0.5,
                  cdiis_blend_new: float = 0.5
                 ) -> tuple[MixerState, jax.Array]:
@@ -422,7 +521,15 @@ def mixer_update(state: MixerState,
         return MixerState(state.ediis, cdiis_state, state.broyden, PHASE_CDIIS), Pmix
 
     def _enter_broyden(_):
-        comm_pc = orbital_preconditioner(comm, F, delta=precond_delta)
+        comm_pc = orbital_preconditioner(
+            comm,
+            F,
+            delta=precond_delta,
+            mode=precond_mode,
+            eps=precond_eps,
+            C=precond_C,
+            auto_nb=precond_auto_nb,
+        )
 
         def _reset(_):
             return broyden_init(

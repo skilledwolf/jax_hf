@@ -8,6 +8,7 @@
 *.code-workspace
 playground/*
 examples/*
+!examples/contimod_example_meshgrid_offline.py
 
 # Local History for Visual Studio Code
 .history/

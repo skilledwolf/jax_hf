@@ -4,9 +4,9 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.numpy.linalg import eigh
 
-from .mixing import mixer_init_like, mixer_update
+from .linalg import eigh, normalize_block_specs
+from .mixing import PRECOND_AUTO, mixer_init_like, mixer_update, normalize_precond_mode
 from .utils import fermidirac, find_chemical_potential, selfenergy_fft
 
 
@@ -150,11 +150,21 @@ def hartreefock_iteration(
     log_every: int | None = None,   # kept for API compatibility; no prints inside JIT
     mixing_alpha: float = 1.0,
     precond_delta: float = 5e-3,
+    precond_mode: int | str = PRECOND_AUTO,
+    precond_auto_nb: int = 128,
+
+    # ---- optional block-diagonalization metadata for the Fock diagonalization ----
+    # Kept as static args (via jit_hartreefock_iteration) so Python containers work.
+    eigh_block_specs: object | None = None,
+    eigh_check_offdiag: bool | None = None,
+    eigh_offdiag_atol: float = 1e-12,
+    eigh_offdiag_rtol: float = 0.0,
 ):
     # unify dtype once
     target_dtype = h.dtype
     P0 = jnp.asarray(P0, dtype=target_dtype)
     real_dtype = jnp.zeros((), dtype=target_dtype).real.dtype
+    precond_mode = normalize_precond_mode(precond_mode)
 
     # weights for mu: (nk1,nk2)
     w2d = jnp.asarray(weights_b[..., 0, 0], dtype=real_dtype)
@@ -178,7 +188,18 @@ def hartreefock_iteration(
         k, P, mix_st, _dC_prev, E_prev, hE, hC = carry
 
         # ---- 1) Build Fock at INPUT density, diagonalize, make new density
-        Sigma_in = selfenergy_fft(VR, _herm(P - refP)) if include_exchange else jnp.zeros_like(h)
+        Sigma_in = (
+            selfenergy_fft(
+                VR,
+                _herm(P - refP),
+                block_specs=eigh_block_specs,
+                check_offdiag=eigh_check_offdiag,
+                offdiag_atol=eigh_offdiag_atol,
+                offdiag_rtol=eigh_offdiag_rtol,
+            )
+            if include_exchange
+            else jnp.zeros_like(h)
+        )
         if include_hartree:
             dP_in = _herm(P) - refP
             diag_real_in = jnp.real(jnp.diagonal(dP_in, axis1=-2, axis2=-1))
@@ -188,13 +209,30 @@ def hartreefock_iteration(
         else:
             H_in = jnp.zeros_like(h)
         F_in     = h + Sigma_in + H_in
-        eps, U   = eigh(F_in)
+        eps, U   = eigh(
+            F_in,
+            block_specs=eigh_block_specs,
+            check_offdiag=eigh_check_offdiag,
+            offdiag_atol=eigh_offdiag_atol,
+            offdiag_rtol=eigh_offdiag_rtol,
+        )
         mu       = find_chemical_potential(eps, w2d, n_e, T)
         occ      = fermidirac(eps - mu, T)
         P_new    = _density_from(U, occ)
 
         # ---- 2) Build Fock at NEW density, energy, and commutator residual
-        Sigma_new = selfenergy_fft(VR, _herm(P_new - refP)) if include_exchange else jnp.zeros_like(h)
+        Sigma_new = (
+            selfenergy_fft(
+                VR,
+                _herm(P_new - refP),
+                block_specs=eigh_block_specs,
+                check_offdiag=eigh_check_offdiag,
+                offdiag_atol=eigh_offdiag_atol,
+                offdiag_rtol=eigh_offdiag_rtol,
+            )
+            if include_exchange
+            else jnp.zeros_like(h)
+        )
         if include_hartree:
             dP_new = _herm(P_new) - refP
             diag_real_new = jnp.real(jnp.diagonal(dP_new, axis1=-2, axis2=-1))
@@ -219,6 +257,8 @@ def hartreefock_iteration(
             comm_rms=dC, sqrt_weights=jnp.sqrt(jnp.maximum(w2d, 0.0)),
             to_cdiis=9.0 * comm_tol_r, to_broyden=1.5 * comm_tol_r,
             mixing_alpha=mixing_alpha, precond_delta=precond_delta,
+            precond_mode=precond_mode, precond_auto_nb=precond_auto_nb,
+            precond_eps=eps, precond_C=U,
             cdiis_blend_keep=0.5, cdiis_blend_new=0.5,
         )
 
@@ -230,11 +270,38 @@ def hartreefock_iteration(
 
     k_fin, P_fin, mix_fin, dC_fin, E_prev, hist_E, hist_dC = lax.while_loop(cond, body, carry0)
 
-    # finalize (compute last Fock & mu)
-    F_fin  = h + selfenergy_fft(VR, P_fin)
-    eps_f, _ = eigh(F_fin)
+    # finalize (compute last Fock & mu) consistent with the loop options
+    Sigma_fin = (
+        selfenergy_fft(
+            VR,
+            _herm(P_fin - refP),
+            block_specs=eigh_block_specs,
+            check_offdiag=eigh_check_offdiag,
+            offdiag_atol=eigh_offdiag_atol,
+            offdiag_rtol=eigh_offdiag_rtol,
+        )
+        if include_exchange
+        else jnp.zeros_like(h)
+    )
+    if include_hartree:
+        dP_fin = _herm(P_fin) - refP
+        diag_real_fin = jnp.real(jnp.diagonal(dP_fin, axis1=-2, axis2=-1))
+        n_vec_fin = jnp.sum(w2d[..., None] * diag_real_fin, axis=(0, 1))
+        sigma_diag_fin = HH @ n_vec_fin
+        H_fin = jnp.diag(sigma_diag_fin.astype(h.real.dtype))[None, None, ...]
+    else:
+        H_fin = jnp.zeros_like(h)
+
+    F_fin = _herm(h + Sigma_fin + H_fin)
+    eps_f, _ = eigh(
+        F_fin,
+        block_specs=eigh_block_specs,
+        check_offdiag=eigh_check_offdiag,
+        offdiag_atol=eigh_offdiag_atol,
+        offdiag_rtol=eigh_offdiag_rtol,
+    )
     mu_fin = find_chemical_potential(eps_f, w2d, n_e, T)
-    E_fin  = jnp.real(E_prev)
+    E_fin = jnp.real(E_prev)
 
     history = dict(E=hist_E, dC=hist_dC)
     return P_fin, F_fin, E_fin, mu_fin, k_fin, history
@@ -243,9 +310,24 @@ def hartreefock_iteration(
 def jit_hartreefock_iteration(hf_step: HartreeFockKernel):
     _compiled = jax.jit(
         hartreefock_iteration,                     # the while_loop version
-        static_argnames=("max_iter", "comm_tol", "diis_size", "log_every", "include_hartree", "include_exchange"),
+        static_argnames=(
+            "max_iter",
+            "comm_tol",
+            "diis_size",
+            "log_every",
+            "include_hartree",
+            "include_exchange",
+            "eigh_block_specs",
+            "eigh_check_offdiag",
+            "eigh_offdiag_atol",
+            "eigh_offdiag_rtol",
+        ),
     )
     def run(P0, electrondensity0, **kwargs):
+        if "precond_mode" in kwargs:
+            kwargs["precond_mode"] = normalize_precond_mode(kwargs["precond_mode"])
+        if "eigh_block_specs" in kwargs:
+            kwargs["eigh_block_specs"] = normalize_block_specs(kwargs["eigh_block_specs"])
         return _compiled(P0, electrondensity0, **hf_step.as_args(), **kwargs)
     return run
 class HFStepResult(NamedTuple):
