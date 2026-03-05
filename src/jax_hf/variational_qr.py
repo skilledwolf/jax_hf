@@ -35,7 +35,6 @@ from .variational import (
     VariationalHFParams,
     _adjust_params_particle_number,
     _build_sigma_hartree,
-    _comm_norm,
     _density_from_Qp,
     _fock_in_orbital_basis,
     _frozen_F_energy,
@@ -56,7 +55,7 @@ from .variational import (
 
 
 def _orbital_gradient(
-    Ft: jax.Array, p: jax.Array, offdiag: jax.Array,
+    Ft: jax.Array, eps: jax.Array, gap: jax.Array, p: jax.Array, offdiag: jax.Array,
     p_floor: float, T: float, denom_scale: float,
 ) -> jax.Array:
     """
@@ -82,8 +81,6 @@ def _orbital_gradient(
     occ_scale = abs_diff / (abs_diff + p_floor)
 
     # Energy denominator preconditioning (same formula as inner solve / stationarity norm)
-    eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
-    gap = eps[..., :, None] - eps[..., None, :]
     eps_scale = jnp.sqrt(jnp.mean(eps ** 2) + tiny_eps)
     lam = jnp.maximum(
         jnp.asarray(T, dtype=real_dtype),
@@ -97,7 +94,7 @@ def _orbital_gradient(
     # Key: use gap_ji = eps_j - eps_i (note j,i order) with pair_sign to break
     # the symmetry when gap=0, so that theta is antisymmetric and survives
     # anti-Hermitization.
-    gap_ji = eps[..., None, :] - eps[..., :, None]  # (j,i) order
+    gap_ji = -gap  # (j,i) order
     orb_idx = jnp.arange(n, dtype=real_dtype)
     pair_sign = jnp.sign(orb_idx[None, :] - orb_idx[:, None])
     pair_sign = jnp.where(pair_sign == 0.0, 1.0, pair_sign)
@@ -111,12 +108,16 @@ def _orbital_gradient(
     return occ_scale * G_comm - (1.0 - occ_scale) * G_jac
 
 
-def _adaptive_tau(G: jax.Array, Ft: jax.Array, denom_scale: float, T: float) -> jax.Array:
+def _adaptive_tau(
+    G: jax.Array,
+    eps: jax.Array,
+    gap: jax.Array,
+    w_norm: jax.Array,
+    denom_scale: float,
+    T: float,
+) -> jax.Array:
     """Rayleigh quotient step size for orbital minimization."""
-    real_dtype = jnp.real(Ft).dtype
-
-    eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
-    gap = eps[..., :, None] - eps[..., None, :]
+    real_dtype = jnp.real(eps).dtype
 
     tiny = jnp.asarray(1e-30, dtype=real_dtype)
     eps_scale = jnp.sqrt(jnp.mean(eps**2) + tiny)
@@ -127,105 +128,97 @@ def _adaptive_tau(G: jax.Array, Ft: jax.Array, denom_scale: float, T: float) -> 
     )
 
     G2 = jnp.abs(G)**2
+    pair_weights = w_norm[..., None, None]
 
     # G is the preconditioned gradient (D = G_raw / denom).
     # The true directional gradient evaluated along D is sum(G_raw * D) = sum(|D|^2 * denom).
     denom = jnp.sqrt(gap**2 + lam**2)
-    num = jnp.sum(G2 * denom)
-    
+    num = jnp.sum(pair_weights * G2 * denom)
+
     # The curvature evaluated along D is sum(|D|^2 * (|gap| + lam))
-    den = jnp.sum(G2 * (jnp.abs(gap) + lam))
+    den = jnp.sum(pair_weights * G2 * (jnp.abs(gap) + lam))
 
     tau = num / (den + tiny)
     return tau
 
-def _qr_retract(Q: jax.Array, Ft: jax.Array, G: jax.Array, tau: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
+def _qr_retraction_unitary(G: jax.Array, tau: jax.Array) -> jax.Array:
     """
-    Orbital-basis QR retraction: U = QR(I - tau*G), Q' = Q@U, Ft' = U†FtU.
+    Orbital-basis QR retraction unitary U = QR(I - tau*G).
 
-    Stays entirely in the orbital basis — avoids recomputing Q†FQ from the
-    Hilbert-basis Fock matrix.  Sign convention: multiply columns of U by
-    sign(diag(R)) so the retraction is a smooth map.
+    The diagonal of R is only defined up to a unit-modulus phase for complex QR.
+    Normalize the column phases so diag(R) is real and non-negative.
     """
+    tiny = jnp.asarray(1e-30, dtype=jnp.real(G).dtype)
     n = G.shape[-1]
     eye = jnp.eye(n, dtype=G.dtype)
     U_trial = eye - tau * G
     U, R = jnp.linalg.qr(U_trial)
 
-    # Fix sign ambiguity: ensure diag(R) > 0
-    signs = jnp.sign(jnp.real(jnp.diagonal(R, axis1=-2, axis2=-1)))
-    signs = jnp.where(signs == 0, 1.0, signs)
-    U = U * signs[..., None, :]
+    phases = jnp.diagonal(R, axis1=-2, axis2=-1)
+    phase_norm = jnp.where(jnp.abs(phases) > tiny, phases / jnp.abs(phases), jnp.ones_like(phases))
+    return U * phase_norm[..., None, :]
 
-    Q_new = Q @ U
-    Ft_new = U.conj().swapaxes(-1, -2) @ Ft @ U
-    return Q_new, Ft_new, U
+def _apply_orbital_basis_update(Ft: jax.Array, U: jax.Array) -> jax.Array:
+    """Update Ft in orbital basis under the right-unitary rotation U."""
+    U_dag = U.conj().swapaxes(-1, -2)
+    return U_dag @ Ft @ U
 
-def _backtracking_qr(
-    Q: jax.Array,
+def _backtracking_qr_energy(
     Ft: jax.Array,
     G: jax.Array,
     *,
     p: jax.Array,
-    offdiag: jax.Array,
     w_norm: jax.Array,
     tau0: float,
     accept_ratio: float,
     shrink: float,
     max_backtrack: int,
-) -> Tuple[jax.Array, jax.Array, jax.Array]:
+) -> Tuple[jax.Array, jax.Array]:
     """
-    Try tau = tau0, tau0*shrink, ... until commutator norm decreases sufficiently.
-    
-    Unlike the Cayley backtracking, we do NOT enforce frozen-F energy monotonicity
-    here. First-order gradient steps (QR retraction) can transiently increase the
-    frozen-F energy even when moving in the correct direction; the outer loop's
-    full Fock rebuild handles global energy convergence.
+    Try tau = tau0, tau0*shrink, ... until the frozen-F energy does not increase.
 
-    Returns (Q_new, Ft_new, U). If no step is accepted, returns inputs unchanged and U=I.
+    Returns (Ft_new, U). If no step is accepted, returns inputs unchanged and U=I.
     """
     real_dtype = p.dtype
     tau0 = jnp.asarray(tau0, dtype=real_dtype)
     shrink = jnp.asarray(shrink, dtype=real_dtype)
     accept_ratio = jnp.asarray(accept_ratio, dtype=real_dtype)
 
-    diff = p[..., None, :] - p[..., :, None]
-    norm0 = _comm_norm(Ft, diff, w_norm, offdiag)
+    E0 = _frozen_F_energy(Ft, p, w_norm)
+    energy_tol = (1.0 - accept_ratio) * jnp.maximum(jnp.abs(E0), jnp.asarray(1.0, dtype=real_dtype))
 
     def cond(state):
-        i, tau, accepted, Q_best, Ft_best, U_best = state
-        del tau, Q_best, Ft_best, U_best
+        i, tau, accepted, Ft_best, U_best = state
+        del tau, Ft_best, U_best
         return jnp.logical_and(i < jnp.int32(max_backtrack), jnp.logical_not(accepted))
 
     def body(state):
-        i, tau, accepted, Q_best, Ft_best, U_best = state
+        i, tau, accepted, Ft_best, U_best = state
 
-        Q_trial, Ft_trial, U_trial = _qr_retract(Q, Ft, G, tau)
+        U_trial = _qr_retraction_unitary(G, tau)
+        Ft_trial = _apply_orbital_basis_update(Ft, U_trial)
 
-        norm_trial = _comm_norm(Ft_trial, diff, w_norm, offdiag)
-        ok = norm_trial <= accept_ratio * norm0
+        E_trial = _frozen_F_energy(Ft_trial, p, w_norm)
+        ok = E_trial <= E0 + energy_tol
 
         def accept_step(_):
-            return (Q_trial, Ft_trial, U_trial, jnp.bool_(True))
+            return (Ft_trial, U_trial, jnp.bool_(True))
 
         def reject_step(_):
-            return (Q_best, Ft_best, U_best, accepted)
+            return (Ft_best, U_best, accepted)
 
-        Q_best, Ft_best, U_best, accepted = lax.cond(ok, accept_step, reject_step, operand=None)
+        Ft_best, U_best, accepted = lax.cond(ok, accept_step, reject_step, operand=None)
 
         tau = tau * shrink
-        return (i + 1, tau, accepted, Q_best, Ft_best, U_best)
+        return (i + 1, tau, accepted, Ft_best, U_best)
 
     n = G.shape[-1]
-    # Initialize U_best to have the exact same shape as the U coming out of _qr_retract.
-    # _qr_retract operates on G which has shape (..., n, n). 
-    # U will also have shape (..., n, n)
     eye = jnp.zeros_like(G)
     eye = eye + jnp.eye(n, dtype=G.dtype)
-    
-    init_state = (jnp.int32(0), tau0, jnp.bool_(False), Q, Ft, eye)
-    _, _, _, Q_out, Ft_out, U_out = lax.while_loop(cond, body, init_state)
-    return Q_out, Ft_out, U_out
+
+    init_state = (jnp.int32(0), tau0, jnp.bool_(False), Ft, eye)
+    _, _, _, Ft_out, U_out = lax.while_loop(cond, body, init_state)
+    return Ft_out, U_out
 
 
 # ----------------------------
@@ -247,12 +240,12 @@ def _frozenF_inner_solve_qr(
     p_floor: float,
     denom_scale: float,
     max_rot: float,
-    bt_tau0: float,
     bt_accept: float,
     bt_shrink: float,
     bt_max: int,
     mu_maxiter: int,
     mu_tol: float,
+    line_search: bool,
     rotation_block_sizes: tuple[int, ...] | None = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
@@ -267,11 +260,30 @@ def _frozenF_inner_solve_qr(
     n = Ft0.shape[-1]
     eye = jnp.eye(n, dtype=real_dtype)
     offdiag = (1.0 - eye)[None, None, ...]
+    eye_u = jnp.zeros_like(Ft0)
+    eye_u = eye_u + jnp.eye(n, dtype=Q.dtype)
 
     # Build rotation block mask (None → unrestricted).
     rot_mask: jax.Array | None = None
     if rotation_block_sizes is not None:
         rot_mask = _rotation_mask_from_block_sizes(rotation_block_sizes, n, real_dtype)
+
+    def take_step(Ft_q: jax.Array, direction: jax.Array, p_q: jax.Array, tau: jax.Array) -> Tuple[jax.Array, jax.Array]:
+        if line_search and bt_max > 0:
+            Ft_new, U = _backtracking_qr_energy(
+                Ft_q,
+                direction,
+                p=p_q,
+                w_norm=w_norm,
+                tau0=tau,
+                accept_ratio=float(bt_accept),
+                shrink=float(bt_shrink),
+                max_backtrack=int(bt_max),
+            )
+        else:
+            U = _qr_retraction_unitary(direction, tau)
+            Ft_new = _apply_orbital_basis_update(Ft_q, U)
+        return Ft_new, U
 
     def inner_sweep(_, state):
         Q_s, Ft_s, p_s, mu_s = state
@@ -284,59 +296,69 @@ def _frozenF_inner_solve_qr(
         )
         p_s = _occupations_from_eps(eps, mu_s, T).astype(real_dtype)
 
-        # 2) Q sweeps via QR retraction (with Riemannian PR Conjugate Gradients)
+        if q_sweeps == 1:
+            eps_q = jnp.real(jnp.diagonal(Ft_s, axis1=-2, axis2=-1)).astype(real_dtype)
+            gap_q = eps_q[..., :, None] - eps_q[..., None, :]
+            G_step = _orbital_gradient(Ft_s, eps_q, gap_q, p_s, offdiag, float(p_floor), T, float(denom_scale))
+
+            if rot_mask is not None:
+                G_step = G_step * rot_mask
+
+            tau = _adaptive_tau(G_step, eps_q, gap_q, w_norm, float(denom_scale), T)
+
+            gen_norm = jnp.sqrt(jnp.sum(jnp.abs(G_step) ** 2, axis=(-2, -1)) + tiny_eps)
+            eff_norm = tau * gen_norm
+            clip_scale = jnp.minimum(1.0, max_rot_j / (eff_norm + clip_eps))
+            G_step = G_step * clip_scale[..., None, None]
+
+            Ft_s, U_step = take_step(Ft_s, G_step, p_s, tau)
+            return (Q_s @ U_step, Ft_s, p_s, mu_s)
+
+        # 2) Q sweeps via QR retraction (with optional Riemannian PR conjugate gradients)
         H_zero = jnp.zeros_like(Ft_s)
 
         def q_sweep(i_q, state2):
-            Q_q, Ft_q, G_prev, H_prev = state2
+            Ft_q, U_total, G_prev, H_prev = state2
 
-            G_new = _orbital_gradient(Ft_q, p_s, offdiag, float(p_floor), T, float(denom_scale))
+            eps_q = jnp.real(jnp.diagonal(Ft_q, axis1=-2, axis2=-1)).astype(real_dtype)
+            gap_q = eps_q[..., :, None] - eps_q[..., None, :]
 
-            # Restrict rotations to within symmetry blocks (if requested).
+            G_new = _orbital_gradient(Ft_q, eps_q, gap_q, p_s, offdiag, float(p_floor), T, float(denom_scale))
+
             if rot_mask is not None:
                 G_new = G_new * rot_mask
 
-            # Polak-Ribiere beta
             def compute_beta():
-                # Re(conj(A)*B) captures the inner product of two complex matrices flattened.
                 num = jnp.sum(jnp.real(jnp.conj(G_new) * (G_new - G_prev)), axis=(-2, -1))
                 den = jnp.sum(jnp.real(jnp.conj(G_prev) * G_prev), axis=(-2, -1)) + tiny_eps
                 return jnp.maximum(0.0, num / den)[..., None, None]
 
-            # If i_q == 0, beta = 0.
             beta = lax.cond(
-                i_q > 0, 
-                compute_beta, 
-                lambda: jnp.zeros(G_new.shape[:-2] + (1, 1), dtype=real_dtype)
+                i_q > 0,
+                compute_beta,
+                lambda: jnp.zeros(G_new.shape[:-2] + (1, 1), dtype=real_dtype),
             )
-            
+
             H_new = G_new + beta * H_prev
 
-            # Evaluate adaptive step size on the unclipped, masked direction
-            tau = _adaptive_tau(H_new, Ft_q, float(denom_scale), T)
+            tau = _adaptive_tau(H_new, eps_q, gap_q, w_norm, float(denom_scale), T)
 
-            # Per-k clipping on the *effective* generator norm
             gen_norm = jnp.sqrt(jnp.sum(jnp.abs(H_new) ** 2, axis=(-2, -1)) + tiny_eps)
             eff_norm = tau * gen_norm
             clip_scale = jnp.minimum(1.0, max_rot_j / (eff_norm + clip_eps))
             H_step = H_new * clip_scale[..., None, None]
 
-            Q_new, Ft_new, U = _backtracking_qr(
-                Q_q, Ft_q, H_step,
-                p=p_s, offdiag=offdiag, w_norm=w_norm,
-                tau0=tau, accept_ratio=float(bt_accept),
-                shrink=float(bt_shrink), max_backtrack=int(bt_max)
-            )
-            
-            # Parallel transport G_new and H_new to the new tangent space
-            # H_trans = U^\dagger H U
+            Ft_new, U = take_step(Ft_q, H_step, p_s, tau)
+            U_total = U_total @ U
+
             U_dag = U.conj().swapaxes(-1, -2)
             G_trans = U_dag @ G_new @ U
             H_trans = U_dag @ H_new @ U
 
-            return (Q_new, Ft_new, G_trans, H_trans)
+            return (Ft_new, U_total, G_trans, H_trans)
 
-        Q_s, Ft_s, _, _ = lax.fori_loop(0, int(q_sweeps), q_sweep, (Q_s, Ft_s, H_zero, H_zero))
+        Ft_s, U_total, _, _ = lax.fori_loop(0, int(q_sweeps), q_sweep, (Ft_s, eye_u, H_zero, H_zero))
+        Q_s = Q_s @ U_total
         return (Q_s, Ft_s, p_s, mu_s)
 
     Q_out, _, p_out, mu_out = lax.fori_loop(0, int(inner_sweeps), inner_sweep, (Q, Ft0, p, mu))
@@ -375,12 +397,12 @@ def variational_qr_optimize(
     p_floor: float = 0.10,
     denom_scale: float = 1e-3,
     max_rot: float = 0.60,
-    bt_tau0: float = 1.0,
-    bt_accept: float = 0.999,
+    bt_accept: float = 1.0,
     bt_shrink: float = 0.5,
     bt_max: int = 5,
     mu_maxiter: int = 25,
     mu_tol: float = 1e-12,
+    line_search: bool = False,
 
     # rotation constraint (optional)
     rotation_block_sizes: tuple[int, ...] | None = None,
@@ -491,49 +513,73 @@ def variational_qr_optimize(
         Ft = _fock_in_orbital_basis(Q, F)
         dC = _stationarity_norm(Ft, p, w_norm, float(p_floor), T, float(denom_scale))
 
+        # Fixed-F occupation residual at the current orbitals.
+        eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
+        mu_fd = _solve_mu_fd_newton_bracket(
+            eps, w_norm, n_target_norm, mu, T,
+            maxiter=int(mu_maxiter), tol=float(mu_tol),
+        )
+        p_fd = _occupations_from_eps(eps, mu_fd, T).astype(real_dtype)
+        dP = _weighted_rms_vec(p_fd - p, w_norm)
+
         # Record history
         hE = hE.at[k].set(E_real)
         hC = hC.at[k].set(dC)
-        hM = hM.at[k].set(mu)
+        hP = hP.at[k].set(dP)
+        hM = hM.at[k].set(mu_fd)
         hdE = hdE.at[k].set(dE)
 
-        # If converged, do not update
-        need_update = dC > comm_tol_r
+        need_occ_update = dP > p_tol_r
+        need_orbital_update = dC > comm_tol_r
+        need_update = jnp.logical_or(need_occ_update, need_orbital_update)
 
         def do_update(args):
-            Q_u, p_u, mu_u = args
-            Q1, p1, mu1 = _frozenF_inner_solve_qr(
-                Q_u, p_u, mu_u,
-                Ft=Ft, w_norm=w_norm, n_target_norm=n_target_norm, T=T,
-                inner_sweeps=int(inner_sweeps),
-                q_sweeps=int(q_sweeps),
-                p_floor=float(p_floor),
-                denom_scale=float(denom_scale),
-                max_rot=float(max_rot),
-                bt_tau0=float(bt_tau0),
-                bt_accept=float(bt_accept),
-                bt_shrink=float(bt_shrink),
-                bt_max=int(bt_max),
-                mu_maxiter=int(mu_maxiter),
-                mu_tol=float(mu_tol),
-                rotation_block_sizes=rotation_block_sizes,
+            Q_u, _p_u, _mu_u = args
+
+            def orbital_update(inner_args):
+                Q_i, p_i, mu_i = inner_args
+                return _frozenF_inner_solve_qr(
+                    Q_i, p_i, mu_i,
+                    Ft=Ft, w_norm=w_norm, n_target_norm=n_target_norm, T=T,
+                    inner_sweeps=int(inner_sweeps),
+                    q_sweeps=int(q_sweeps),
+                    p_floor=float(p_floor),
+                    denom_scale=float(denom_scale),
+                    max_rot=float(max_rot),
+                    bt_accept=float(bt_accept),
+                    bt_shrink=float(bt_shrink),
+                    bt_max=int(bt_max),
+                    mu_maxiter=int(mu_maxiter),
+                    mu_tol=float(mu_tol),
+                    line_search=bool(line_search),
+                    rotation_block_sizes=rotation_block_sizes,
+                )
+
+            def occ_only_update(inner_args):
+                Q_i, p_i, mu_i = inner_args
+                del p_i, mu_i
+                return (Q_i, p_fd, mu_fd)
+
+            Q1, p1, mu1 = lax.cond(
+                need_orbital_update,
+                orbital_update,
+                occ_only_update,
+                operand=(Q_u, p_fd, mu_fd),
             )
-            dP = _weighted_rms_vec(p1 - p_u, w_norm)
             return (Q1, p1, mu1, dP)
 
         def no_update(args):
             Q_u, p_u, mu_u = args
             return (Q_u, p_u, mu_u, jnp.asarray(0.0, dtype=real_dtype))
 
-        Q_new, p_new, mu_new, dP = lax.cond(need_update, do_update, no_update, operand=(Q, p, mu))
-        hP = hP.at[k].set(dP)
+        Q_new, p_new, mu_new, dP_prev = lax.cond(need_update, do_update, no_update, operand=(Q, p, mu))
 
         # F is fresh only if we didn't change (Q,p) this iteration.
         fresh = jnp.logical_not(need_update)
         F_last = jnp.where(need_update, _F_last, F)
         E_last = jnp.where(need_update, _E_last, E_real)
 
-        return (k + 1, Q_new, p_new, mu_new, dC, dP, dE, E_real,
+        return (k + 1, Q_new, p_new, mu_new, dC, dP_prev, dE, E_real,
                 F_last, E_last, fresh, hE, hC, hP, hdE, hM)
 
     (
@@ -587,8 +633,9 @@ def jit_variational_qr_iteration(hf_step):
             "max_iter", "comm_tol", "p_tol", "e_tol",
             "inner_sweeps", "q_sweeps",
             "p_floor", "denom_scale", "max_rot",
-            "bt_tau0", "bt_accept", "bt_shrink", "bt_max",
+            "bt_accept", "bt_shrink", "bt_max",
             "mu_maxiter", "mu_tol",
+            "line_search",
             "rotation_block_sizes",
             "include_hartree", "include_exchange",
             "exchange_block_specs", "exchange_check_offdiag",

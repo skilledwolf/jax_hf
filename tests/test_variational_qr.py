@@ -87,7 +87,8 @@ def test_variational_qr_smoke_conserves_density_and_supports_param_reuse():
     assert history2["E"].shape[0] == 5
 
 
-def test_variational_qr_reduces_occupancy_residual_on_random_system():
+@pytest.mark.parametrize("line_search", [False, True])
+def test_variational_qr_reduces_occupancy_residual_on_random_system(line_search: bool):
     key_h, key_i = jax.random.split(jax.random.PRNGKey(123))
     nk1, nk2, nb = 2, 2, 3
 
@@ -118,6 +119,7 @@ def test_variational_qr_reduces_occupancy_residual_on_random_system():
         max_iter=120,
         comm_tol=1e-6,
         p_tol=1e-6,
+        line_search=line_search,
     )
 
     last = max(int(k_fin) - 1, 0)
@@ -126,6 +128,82 @@ def test_variational_qr_reduces_occupancy_residual_on_random_system():
 
     n_fin = _electron_count(P_fin, weights)
     assert n_fin == pytest.approx(1.7, rel=1e-5, abs=1e-5)
+
+
+def test_variational_qr_updates_occupations_even_when_orbitals_are_stationary():
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+    hamiltonian = jnp.array([[[[-1.0, 0.0], [0.0, 1.0]]]], dtype=jnp.complex64)
+    coulomb_q = (1e-9 * jnp.ones((1, 1, 1, 1), dtype=jnp.float32)).astype(jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.2,
+        include_hartree=False,
+        include_exchange=True,
+    )
+    runner = jax_hf.jit_variational_qr_iteration(kernel)
+
+    P0 = jnp.array([[[[0.9, 0.0], [0.0, 0.1]]]], dtype=jnp.complex64)
+
+    P_fin, _F_fin, _E_fin, _mu_fin, k_fin, history = runner(
+        P0,
+        electrondensity0=1.0,
+        max_iter=8,
+        comm_tol=1e-8,
+        p_tol=1e-8,
+        init_method="identity",
+    )
+
+    p_fin = np.array(jnp.real(jnp.diagonal(P_fin, axis1=-2, axis2=-1)))[0, 0]
+    assert int(k_fin) >= 2
+    assert float(history["dC"][0]) == pytest.approx(0.0, abs=1e-12)
+    assert float(history["dP"][0]) > 1e-2
+    assert p_fin[0] > 0.98
+    assert p_fin[1] < 0.02
+
+
+def test_variational_qr_multisweep_cg_path_runs_with_batched_kmesh():
+    key_h, key_i = jax.random.split(jax.random.PRNGKey(777))
+    nk1, nk2, nb = 2, 2, 3
+
+    a = jax.random.normal(key_h, (nk1, nk2, nb, nb), dtype=jnp.float32)
+    b = jax.random.normal(key_i, (nk1, nk2, nb, nb), dtype=jnp.float32)
+    hamiltonian = (a + 1j * b).astype(jnp.complex64)
+    hamiltonian = 0.5 * (hamiltonian + jnp.conj(jnp.swapaxes(hamiltonian, -1, -2)))
+
+    weights = jnp.ones((nk1, nk2), dtype=jnp.float32)
+    coulomb_q = (0.1 * jnp.ones((nk1, nk2, 1, 1), dtype=jnp.float32)).astype(jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.02,
+        include_hartree=False,
+        include_exchange=True,
+    )
+    runner = jax_hf.jit_variational_qr_iteration(kernel)
+
+    P0 = jnp.eye(nb, dtype=jnp.complex64)[None, None, ...]
+    P0 = jnp.broadcast_to(P0, (nk1, nk2, nb, nb)) * 0.5
+
+    P_fin, _F_fin, _E_fin, _mu_fin, k_fin, history = runner(
+        P0,
+        electrondensity0=1.8,
+        max_iter=80,
+        comm_tol=1e-6,
+        p_tol=1e-6,
+        q_sweeps=2,
+        line_search=True,
+    )
+
+    last = max(int(k_fin) - 1, 0)
+    assert int(k_fin) <= 80
+    assert np.isfinite(np.array(history["dC"][last]))
+    assert np.isfinite(np.array(history["dP"][last]))
+    assert _electron_count(P_fin, weights) == pytest.approx(1.8, rel=1e-5, abs=1e-5)
 
 
 def test_variational_qr_can_break_degenerate_occupancy_symmetry():
