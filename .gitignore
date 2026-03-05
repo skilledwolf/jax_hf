@@ -4,10 +4,15 @@
 
 *.pickle
 
+rsync_to_lonestar.sh
+
+outputs
+backup
 .vscode/*
 *.code-workspace
 playground/*
 examples/*
+playground-*/*
 !examples/contimod_example_meshgrid_offline.py
 
 # Local History for Visual Studio Code

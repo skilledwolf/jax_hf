@@ -42,6 +42,7 @@ def selfenergy_fft(
     check_offdiag: bool | None = None,
     offdiag_atol: float = 1e-12,
     offdiag_rtol: float = 0.0,
+    _apply_ifftshift: bool = True,
 ) -> jax.Array:
     """Exchange self-energy Σ(k) with optional block-diagonal acceleration.
 
@@ -52,32 +53,39 @@ def selfenergy_fft(
       1) check the off-block magnitude of `P` against `(atol + rtol*max|P|)`,
       2) run a reduced set of FFTs for the first compatible block partition,
       3) fall back to the full computation when no spec is compatible.
+
+    When ``_apply_ifftshift=False`` the final ifftshift is skipped.  Use this
+    together with a phase-shifted ``VR`` to avoid the data permutation in hot
+    loops (the shift is absorbed into VR at construction time).
     """
     VR = jnp.asarray(VR)
     P = jnp.asarray(P)
 
     if block_specs is None:
-        return _selfenergy_fft_full(VR, P)
+        result = _selfenergy_fft_full(VR, P)
+    else:
+        specs = normalize_block_specs(block_specs)
+        if not specs:
+            result = _selfenergy_fft_full(VR, P)
+        else:
+            check = bool(check_offdiag) if check_offdiag is not None else True
+            result = _selfenergy_fft_block_specs(
+                VR,
+                P,
+                specs,
+                check_offdiag=check,
+                offdiag_atol=float(offdiag_atol),
+                offdiag_rtol=float(offdiag_rtol),
+            )
 
-    specs = normalize_block_specs(block_specs)
-    if not specs:
-        return _selfenergy_fft_full(VR, P)
-
-    check = bool(check_offdiag) if check_offdiag is not None else True
-    return _selfenergy_fft_block_specs(
-        VR,
-        P,
-        specs,
-        check_offdiag=check,
-        offdiag_atol=float(offdiag_atol),
-        offdiag_rtol=float(offdiag_rtol),
-    )
+    if _apply_ifftshift:
+        return ifftshift(result, axes=(0, 1))
+    return result
 
 
 def _selfenergy_fft_full(VR: jax.Array, P: jax.Array) -> jax.Array:
     P_fft = fftn(P, axes=(0, 1))
-    sigma = -ifftn(P_fft * VR, axes=(0, 1))
-    return ifftshift(sigma, axes=(0, 1))
+    return -ifftn(P_fft * VR, axes=(0, 1))
 
 
 def _mask_from_block_sizes(block_sizes: tuple[int, ...], n: int) -> jax.Array:
@@ -196,13 +204,44 @@ def find_chemical_potential(
     n_electrons: float,
     T: float,
     *,
-    maxiter: int = 80,
+    maxiter: int | None = None,
+    method: str = "bisection",
 ) -> jax.Array:
-    """Robust bracketed bisection that tolerates degenerate bands.
+    """Find μ such that ∑_k w_k Σ_j f(ε_kj − μ) = n_electrons.
 
-    Solves μ such that ∑_k w_k Σ_j f(ε_kj − μ) = n_electrons.
-    Uses a conservative bracket around [min(bands), max(bands)] expanded by 10·T.
+    Parameters
+    ----------
+    method : ``"bisection"`` (default) or ``"newton"``.
+        ``"bisection"`` is a pure bracket bisection — unconditionally stable and
+        deterministic, the safe choice inside DIIS-accelerated SCF loops.
+        ``"newton"`` is a Newton-Raphson solver with bracket safeguards, adapted
+        from the variational solver.  Converges in ~10 iterations instead of
+        ~30–54, but produces slightly different mu values from bisection
+        (~1e-8 difference) which can destabilize DIIS.
+
+    When *maxiter* is ``None``, the iteration count is chosen automatically:
+    bisection uses 30 (f32) / 54 (f64); Newton uses 15 (f32) / 25 (f64).
     """
+    method = str(method).lower()
+    if method == "bisection":
+        return _find_mu_bisection(bands, weights, n_electrons, T, maxiter=maxiter)
+    elif method == "newton":
+        return _find_mu_newton(bands, weights, n_electrons, T, maxiter=maxiter)
+    else:
+        raise ValueError(f"method must be 'bisection' or 'newton', got {method!r}")
+
+
+def _find_mu_bisection(
+    bands: jax.Array,
+    weights: jax.Array,
+    n_electrons: float,
+    T: float,
+    *,
+    maxiter: int | None = None,
+) -> jax.Array:
+    """Pure bracket bisection — unconditionally stable."""
+    if maxiter is None:
+        maxiter = 30 if bands.dtype in (jnp.float32, jnp.complex64) else 54
     bands_min = jnp.min(bands)
     bands_max = jnp.max(bands)
     Tj = jnp.asarray(T, dtype=bands.real.dtype)
@@ -222,6 +261,66 @@ def find_chemical_potential(
 
     (lo_fin, hi_fin), _ = jax.lax.scan(body, (lo, hi), xs=None, length=int(maxiter))
     return 0.5 * (lo_fin + hi_fin)
+
+
+def _find_mu_newton(
+    bands: jax.Array,
+    weights: jax.Array,
+    n_electrons: float,
+    T: float,
+    *,
+    maxiter: int | None = None,
+) -> jax.Array:
+    """Newton-Raphson with bracket safeguards — faster convergence (~10 iters)."""
+    if maxiter is None:
+        maxiter = 15 if bands.dtype in (jnp.float32, jnp.complex64) else 25
+    real_dtype = bands.real.dtype
+    Tj = jnp.asarray(T, dtype=real_dtype)
+    Tj = jnp.maximum(Tj, jnp.asarray(1e-12, dtype=real_dtype))
+    n_target = jnp.asarray(n_electrons, dtype=real_dtype)
+
+    bands_min = jnp.min(bands)
+    bands_max = jnp.max(bands)
+    span = bands_max - bands_min + 10.0 * jnp.maximum(Tj, jnp.asarray(1e-6, dtype=real_dtype))
+    lo = bands_min - span
+    hi = bands_max + span
+    mu = 0.5 * (lo + hi)
+
+    w_b = jnp.asarray(weights)[..., None]
+
+    def count_and_slope(mu_val):
+        x = (mu_val - bands) / Tj
+        p = jax.nn.sigmoid(x)
+        N = jnp.sum(w_b * p)
+        dp = (p * (1.0 - p)) / Tj
+        Z = jnp.sum(w_b * dp)
+        return N, Z
+
+    def body(state, _):
+        mu, lo, hi = state
+        N, Z = count_and_slope(mu)
+        g = N - n_target
+
+        lo = jnp.where(g < 0, mu, lo)
+        hi = jnp.where(g > 0, mu, hi)
+
+        Z_safe = jnp.maximum(Z, jnp.asarray(1e-18, dtype=real_dtype))
+        mu_new = mu - g / Z_safe
+
+        mu_bis = 0.5 * (lo + hi)
+        out_of = jnp.logical_or(mu_new <= lo, mu_new >= hi)
+        mu_new = jnp.where(out_of, mu_bis, mu_new)
+
+        mu_new = jnp.clip(mu_new, lo, hi)
+        mu_new = jnp.where(jnp.isfinite(mu_new), mu_new, mu_bis)
+        return (mu_new, lo, hi), None
+
+    (mu_fin, lo_fin, hi_fin), _ = jax.lax.scan(body, (mu, lo, hi), xs=None, length=int(maxiter))
+
+    # Final check: if residual is still large, return bracket midpoint
+    N_fin, _ = count_and_slope(mu_fin)
+    g_fin = jnp.abs(N_fin - n_target)
+    return jnp.where(g_fin > jnp.asarray(1e-12, dtype=real_dtype), 0.5 * (lo_fin + hi_fin), mu_fin)
 
 
 def density_matrix_from_fock(

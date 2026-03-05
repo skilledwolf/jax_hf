@@ -79,6 +79,109 @@ def test_hartreefock_iteration_converges_on_tiny_model():
     rms = _comm_rms(comm, weights)
     assert rms < 1e-6
 
-    # History stored the last RMS value in the first k_fin slots.
+    # History dC = max(commutator_rms, density_change_rms); at convergence both
+    # components are below the comm_tol used in the loop.
     last_recorded = float(history["dC"][int(k_fin) - 1])
-    assert last_recorded == pytest.approx(rms, rel=1e-3, abs=1e-8)
+    assert last_recorded < 1e-6
+
+
+@pytest.mark.parametrize("method", ["bisection", "newton"])
+def test_find_chemical_potential_hits_target_multiband(method):
+    """Both solvers hit target density on a multi-k, multi-band system."""
+    rng = np.random.RandomState(42)
+    nk1, nk2, nb = 4, 4, 6
+    bands = jnp.array(rng.randn(nk1, nk2, nb).astype(np.float32))
+    weights = jnp.ones((nk1, nk2), dtype=jnp.float32) / (nk1 * nk2)
+    n_target = 3.0
+    T = 0.05
+
+    mu = find_chemical_potential(bands, weights, n_target, T, method=method)
+    occ = fermidirac(bands - mu, T)
+    total = float(jnp.sum(weights[..., None] * occ))
+    assert abs(total - n_target) < 1e-4
+
+
+@pytest.mark.parametrize("method", ["bisection", "newton"])
+def test_find_chemical_potential_cold_limit(method):
+    """At very low T, both solvers must still find the correct mu."""
+    bands = jnp.array([[[0.0, 1.0, 2.0]]], dtype=jnp.float64)
+    weights = jnp.ones((1, 1), dtype=jnp.float64)
+
+    mu = find_chemical_potential(bands, weights, n_electrons=2.0, T=1e-8, method=method)
+    occ = fermidirac(bands - mu, 1e-8)
+    total = float(jnp.sum(weights[..., None] * occ))
+    assert abs(total - 2.0) < 1e-6
+
+
+def test_hartreefock_iteration_converges_with_newton_mu():
+    """SCF converges with mu_method='newton' on the tiny model."""
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+    hamiltonian = jnp.array([[[[-0.5, 0.0], [0.0, 0.5]]]], dtype=jnp.complex64)
+    coulomb_q = jnp.array([[[[0.25]]]], dtype=jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.2,
+        include_hartree=False,
+        include_exchange=True,
+    )
+
+    P0 = jnp.array([[[[0.6, 0.0], [0.0, 0.4]]]], dtype=jnp.complex64)
+    runner = jit_hartreefock_iteration(kernel)
+
+    P_fin, F_fin, E_fin, mu_fin, k_fin, history = runner(
+        P0,
+        electrondensity0=1.0,
+        max_iter=60,
+        comm_tol=1e-6,
+        diis_size=4,
+        precond_mode="diag",
+        mu_method="newton",
+    )
+
+    assert int(k_fin) <= 60
+    assert np.isfinite(np.array(E_fin)).all()
+
+    comm = F_fin @ P_fin - P_fin @ F_fin
+    rms = _comm_rms(comm, weights)
+    assert rms < 1e-6
+
+
+def test_hartreefock_iteration_converges_with_level_shift():
+    """Level shift doesn't break convergence and the final result is self-consistent."""
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+    hamiltonian = jnp.array([[[[-0.5, 0.0], [0.0, 0.5]]]], dtype=jnp.complex64)
+    coulomb_q = jnp.array([[[[0.25]]]], dtype=jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.2,
+        include_hartree=False,
+        include_exchange=True,
+    )
+
+    P0 = jnp.array([[[[0.6, 0.0], [0.0, 0.4]]]], dtype=jnp.complex64)
+    runner = jit_hartreefock_iteration(kernel)
+
+    P_fin, F_fin, E_fin, mu_fin, k_fin, history = runner(
+        P0,
+        electrondensity0=1.0,
+        max_iter=60,
+        comm_tol=1e-6,
+        diis_size=4,
+        precond_mode="diag",
+        level_shift=0.3,
+    )
+
+    assert int(k_fin) <= 60
+    assert np.isfinite(np.array(E_fin)).all()
+
+    # Final result should still be self-consistent (level shift only aids convergence,
+    # not applied at finalization).
+    comm = F_fin @ P_fin - P_fin @ F_fin
+    rms = _comm_rms(comm, weights)
+    assert rms < 1e-5

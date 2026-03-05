@@ -1,6 +1,8 @@
 from functools import partial
 from typing import NamedTuple
 
+import numpy as np
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -35,6 +37,18 @@ class HartreeFockKernel:
         else:
             Vq = Vq.astype(h.real.dtype)
         self.VR = jnp.fft.fftn(self.weights_b * jnp.asarray(Vq, dtype=h.dtype), axes=(0, 1))
+        # Pre-absorb the ifftshift into VR so the hot loop can skip the data
+        # permutation.  phase[k0,k1] = exp(2πi·k0·s0/n0)·exp(2πi·k1·s1/n1)
+        # where s = n//2 is the ifftshift offset.
+        n0, n1 = int(h.shape[0]), int(h.shape[1])
+        s0, s1 = n0 // 2, n1 // 2
+        phase0 = np.exp(2j * np.pi * np.arange(n0) * s0 / n0)
+        phase1 = np.exp(2j * np.pi * np.arange(n1) * s1 / n1)
+        shift_phase = jnp.asarray(
+            (phase0[:, None] * phase1[None, :])[..., None, None],
+            dtype=self.VR.dtype,
+        )
+        self._VR_shifted = self.VR * shift_phase
         self.T = float(T)
         # options
         self.include_hartree = bool(include_hartree)
@@ -82,12 +96,15 @@ class HartreeFockKernel:
     def fock_matrix(self, P: jax.Array) -> jax.Array:
         return _herm(self.h + self._exchange_sigma(P) + self._hartree_shift(P))
 
-    def __call__(self, P: jax.Array, electrondensity: float):
+    def __call__(self, P: jax.Array, electrondensity: float, level_shift: float = 0.0, mu_method: str = "bisection"):
         # one-step HF update (convenience; *not* used by the jitted loop)
         F     = self.fock_matrix(P)
         eps, U = jnp.linalg.eigh(F)
-        mu    = find_chemical_potential(eps, self.w2d, electrondensity, self.T)
-        occ   = fermidirac(eps - mu, self.T)
+        mu_raw = find_chemical_potential(eps, self.w2d, electrondensity, self.T, method=mu_method)
+        occ_raw = fermidirac(eps - mu_raw, self.T)
+        eps_s  = eps + level_shift * (1.0 - occ_raw)
+        mu    = find_chemical_potential(eps_s, self.w2d, electrondensity, self.T, method=mu_method)
+        occ   = fermidirac(eps_s - mu, self.T)
         P_new = _density_from(U, occ)
         # Energy with Σ[P_new] and Hartree shift at P_new
         Sigma_new = self._exchange_sigma(P_new)
@@ -97,12 +114,13 @@ class HartreeFockKernel:
         return HFStepResult(P_new, F_new, E_new, mu)
 
     def as_args(self):
-        # everything the jitted loop needs, as dynamic inputs (no constant capture)
+        # Everything the jitted loop needs, as dynamic inputs (no constant capture).
+        # VR has the ifftshift phase absorbed; callers use _apply_ifftshift=False.
         return dict(
             h=self.h,
             weights_b=self.weights_b,
             weight_sum=self.weight_sum,
-            VR=self.VR,
+            VR=self._VR_shifted,
             T=self.T,
             refP=self.refP,
             HH=self.HH,
@@ -136,7 +154,7 @@ def hartreefock_iteration(
     h: jax.Array,                 # (nk1,nk2,nb,nb), complex
     weights_b: jax.Array,         # (nk1,nk2,1,1), real/complex matching h.dtype
     weight_sum: jax.Array,        # scalar real
-    VR: jax.Array,                # (nk1,nk2,1,1), complex FFT(weights*V)
+    VR: jax.Array,                # (nk1,nk2,1,1), complex FFT(weights*V), ifftshift phase absorbed
     T: float,
     refP: jax.Array,
     HH: jax.Array,
@@ -152,6 +170,8 @@ def hartreefock_iteration(
     precond_delta: float = 5e-3,
     precond_mode: int | str = PRECOND_AUTO,
     precond_auto_nb: int = 128,
+    level_shift: float = 0.0,
+    mu_method: str = "bisection",
 
     # ---- optional block-diagonalization metadata for the Fock diagonalization ----
     # Kept as static args (via jit_hartreefock_iteration) so Python containers work.
@@ -187,28 +207,34 @@ def hartreefock_iteration(
     def body(carry):
         k, P, mix_st, _dC_prev, E_prev, hE, hC = carry
 
-        # ---- 1) Build Fock at INPUT density, diagonalize, make new density
+        # ---- 1) Build Fock at INPUT density P  (single Fock build per iter)
         Sigma_in = (
             selfenergy_fft(
                 VR,
-                _herm(P - refP),
+                P - refP,           # P is Hermitian (enforced at loop entry)
                 block_specs=eigh_block_specs,
                 check_offdiag=eigh_check_offdiag,
                 offdiag_atol=eigh_offdiag_atol,
                 offdiag_rtol=eigh_offdiag_rtol,
+                _apply_ifftshift=False,  # VR has shift phase absorbed
             )
             if include_exchange
             else jnp.zeros_like(h)
         )
         if include_hartree:
-            dP_in = _herm(P) - refP
+            dP_in = P - refP       # P already Hermitian, refP Hermitian by construction
             diag_real_in = jnp.real(jnp.diagonal(dP_in, axis1=-2, axis2=-1))
             n_vec_in = jnp.sum(w2d[..., None] * diag_real_in, axis=(0, 1))
             sigma_diag_in = HH @ n_vec_in
             H_in = jnp.diag(sigma_diag_in.astype(h.real.dtype))[None, None, ...]
         else:
             H_in = jnp.zeros_like(h)
-        F_in     = h + Sigma_in + H_in
+        F_in = h + Sigma_in + H_in
+
+        # ---- 2) Energy E(P)
+        E  = jnp.sum(jnp.real(jnp.einsum("...ij,...ji->...", weights_b * (h + 0.5*(Sigma_in + H_in)), P)))
+
+        # ---- 3) Diagonalize F_in, occupy, make new density
         eps, U   = eigh(
             F_in,
             block_specs=eigh_block_specs,
@@ -216,44 +242,34 @@ def hartreefock_iteration(
             offdiag_atol=eigh_offdiag_atol,
             offdiag_rtol=eigh_offdiag_rtol,
         )
-        mu       = find_chemical_potential(eps, w2d, n_e, T)
-        occ      = fermidirac(eps - mu, T)
+        mu_raw   = find_chemical_potential(eps, w2d, n_e, T, method=mu_method)
+        occ_raw  = fermidirac(eps - mu_raw, T)
+        eps_s    = eps + level_shift * (1.0 - occ_raw)
+        mu       = find_chemical_potential(eps_s, w2d, n_e, T, method=mu_method)
+        occ      = fermidirac(eps_s - mu, T)
         P_new    = _density_from(U, occ)
 
-        # ---- 2) Build Fock at NEW density, energy, and commutator residual
-        Sigma_new = (
-            selfenergy_fft(
-                VR,
-                _herm(P_new - refP),
-                block_specs=eigh_block_specs,
-                check_offdiag=eigh_check_offdiag,
-                offdiag_atol=eigh_offdiag_atol,
-                offdiag_rtol=eigh_offdiag_rtol,
-            )
-            if include_exchange
-            else jnp.zeros_like(h)
-        )
-        if include_hartree:
-            dP_new = _herm(P_new) - refP
-            diag_real_new = jnp.real(jnp.diagonal(dP_new, axis1=-2, axis2=-1))
-            n_vec_new = jnp.sum(w2d[..., None] * diag_real_new, axis=(0, 1))
-            sigma_diag_new = HH @ n_vec_new
-            H_new = jnp.diag(sigma_diag_new.astype(h.real.dtype))[None, None, ...]
-        else:
-            H_new = jnp.zeros_like(h)
-        F_new     = h + Sigma_new + H_new
-        # E = sum_k w_k Tr[(h + 0.5(Σ+H)) P]
-        E_new     = jnp.sum(jnp.real(jnp.einsum("...ij,...ji->...", weights_b * (h + 0.5*(Sigma_new + H_new)), P_new)))
+        # ---- 4) Convergence: max of Pulay commutator and density change
+        #   The commutator [F,P]=0 is necessary but not sufficient for self-consistency
+        #   (P can share eigenvectors with F yet have wrong occupations).
+        #   The density change ||P_new - P|| catches that case.
+        R  = F_in @ P - P @ F_in
+        sq_comm = jnp.abs(R) ** 2
+        per_k_comm = jnp.sum(sq_comm, axis=(-2, -1))
+        dC_comm = jnp.sqrt(jnp.sum(w2d * per_k_comm) / jnp.maximum(weight_sum, jnp.array(1e-30, dtype=real_dtype)))
 
-        R  = F_new @ P_new - P_new @ F_new
-        # weighted RMS(comm): sqrt(sum w ||R||_F^2 / sum w)
-        sq = jnp.abs(R) ** 2
-        per_k = jnp.sum(sq, axis=(-2, -1))
-        dC = jnp.sqrt(jnp.sum(w2d * per_k) / jnp.maximum(weight_sum, jnp.array(1e-30, dtype=real_dtype)))
+        dP = P_new - P
+        sq_dens = jnp.abs(dP) ** 2
+        per_k_dens = jnp.sum(sq_dens, axis=(-2, -1))
+        dC_dens = jnp.sqrt(jnp.sum(w2d * per_k_dens) / jnp.maximum(weight_sum, jnp.array(1e-30, dtype=real_dtype)))
 
-        # ---- 3) DIIS / mixing
+        dC = jnp.maximum(dC_comm, dC_dens)
+
+        # ---- 5) DIIS / mixing  (F_in and E are self-consistent at P)
+        #   Mixer still uses the commutator as residual (not density change),
+        #   but phase transitions are governed by the combined dC.
         mix_st, P_mix = mixer_update(
-            mix_st, P_new, P, F_new, E_new, (jnp.sqrt(jnp.maximum(w2d, 0.0))[..., None, None] * R),
+            mix_st, P_new, P, F_in, E, (jnp.sqrt(jnp.maximum(w2d, 0.0))[..., None, None] * R),
             comm_rms=dC, sqrt_weights=jnp.sqrt(jnp.maximum(w2d, 0.0)),
             to_cdiis=9.0 * comm_tol_r, to_broyden=1.5 * comm_tol_r,
             mixing_alpha=mixing_alpha, precond_delta=precond_delta,
@@ -262,11 +278,11 @@ def hartreefock_iteration(
             cdiis_blend_keep=0.5, cdiis_blend_new=0.5,
         )
 
-        # ---- 4) history
-        hE = hE.at[k].set(jnp.real(E_new))
+        # ---- 6) history
+        hE = hE.at[k].set(jnp.real(E))
         hC = hC.at[k].set(dC)
 
-        return (k + 1, _herm(P_mix), mix_st, dC, jnp.real(E_new), hE, hC)
+        return (k + 1, _herm(P_mix), mix_st, dC, jnp.real(E), hE, hC)
 
     k_fin, P_fin, mix_fin, dC_fin, E_prev, hist_E, hist_dC = lax.while_loop(cond, body, carry0)
 
@@ -274,17 +290,18 @@ def hartreefock_iteration(
     Sigma_fin = (
         selfenergy_fft(
             VR,
-            _herm(P_fin - refP),
+            P_fin - refP,          # P_fin is Hermitian (from _herm in loop return)
             block_specs=eigh_block_specs,
             check_offdiag=eigh_check_offdiag,
             offdiag_atol=eigh_offdiag_atol,
             offdiag_rtol=eigh_offdiag_rtol,
+            _apply_ifftshift=False,  # VR has shift phase absorbed
         )
         if include_exchange
         else jnp.zeros_like(h)
     )
     if include_hartree:
-        dP_fin = _herm(P_fin) - refP
+        dP_fin = P_fin - refP     # P_fin already Hermitian
         diag_real_fin = jnp.real(jnp.diagonal(dP_fin, axis1=-2, axis2=-1))
         n_vec_fin = jnp.sum(w2d[..., None] * diag_real_fin, axis=(0, 1))
         sigma_diag_fin = HH @ n_vec_fin
@@ -300,8 +317,8 @@ def hartreefock_iteration(
         offdiag_atol=eigh_offdiag_atol,
         offdiag_rtol=eigh_offdiag_rtol,
     )
-    mu_fin = find_chemical_potential(eps_f, w2d, n_e, T)
-    E_fin = jnp.real(E_prev)
+    mu_fin = find_chemical_potential(eps_f, w2d, n_e, T, method=mu_method)
+    E_fin = _hf_energy(weights_b, h, Sigma_fin + H_fin, P_fin)
 
     history = dict(E=hist_E, dC=hist_dC)
     return P_fin, F_fin, E_fin, mu_fin, k_fin, history
@@ -321,6 +338,7 @@ def jit_hartreefock_iteration(hf_step: HartreeFockKernel):
             "eigh_check_offdiag",
             "eigh_offdiag_atol",
             "eigh_offdiag_rtol",
+            "mu_method",
         ),
     )
     def run(P0, electrondensity0, **kwargs):
