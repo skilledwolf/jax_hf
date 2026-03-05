@@ -139,7 +139,7 @@ def _adaptive_tau(G: jax.Array, Ft: jax.Array, denom_scale: float, T: float) -> 
     tau = num / (den + tiny)
     return tau
 
-def _qr_retract(Q: jax.Array, Ft: jax.Array, G: jax.Array, tau: jax.Array) -> Tuple[jax.Array, jax.Array]:
+def _qr_retract(Q: jax.Array, Ft: jax.Array, G: jax.Array, tau: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Orbital-basis QR retraction: U = QR(I - tau*G), Q' = Q@U, Ft' = U†FtU.
 
@@ -159,8 +159,7 @@ def _qr_retract(Q: jax.Array, Ft: jax.Array, G: jax.Array, tau: jax.Array) -> Tu
 
     Q_new = Q @ U
     Ft_new = U.conj().swapaxes(-1, -2) @ Ft @ U
-    return Q_new, Ft_new
-
+    return Q_new, Ft_new, U
 
 def _backtracking_qr(
     Q: jax.Array,
@@ -174,16 +173,16 @@ def _backtracking_qr(
     accept_ratio: float,
     shrink: float,
     max_backtrack: int,
-) -> Tuple[jax.Array, jax.Array]:
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Try tau = tau0, tau0*shrink, ... until commutator norm decreases sufficiently.
-
+    
     Unlike the Cayley backtracking, we do NOT enforce frozen-F energy monotonicity
     here. First-order gradient steps (QR retraction) can transiently increase the
     frozen-F energy even when moving in the correct direction; the outer loop's
     full Fock rebuild handles global energy convergence.
 
-    Returns (Q_new, Ft_new). If no step is accepted, returns inputs unchanged.
+    Returns (Q_new, Ft_new, U). If no step is accepted, returns inputs unchanged and U=I.
     """
     real_dtype = p.dtype
     tau0 = jnp.asarray(tau0, dtype=real_dtype)
@@ -194,32 +193,39 @@ def _backtracking_qr(
     norm0 = _comm_norm(Ft, diff, w_norm, offdiag)
 
     def cond(state):
-        i, tau, accepted, Q_best, Ft_best = state
-        del tau, Q_best, Ft_best
+        i, tau, accepted, Q_best, Ft_best, U_best = state
+        del tau, Q_best, Ft_best, U_best
         return jnp.logical_and(i < jnp.int32(max_backtrack), jnp.logical_not(accepted))
 
     def body(state):
-        i, tau, accepted, Q_best, Ft_best = state
+        i, tau, accepted, Q_best, Ft_best, U_best = state
 
-        Q_trial, Ft_trial = _qr_retract(Q, Ft, G, tau)
+        Q_trial, Ft_trial, U_trial = _qr_retract(Q, Ft, G, tau)
 
         norm_trial = _comm_norm(Ft_trial, diff, w_norm, offdiag)
         ok = norm_trial <= accept_ratio * norm0
 
         def accept_step(_):
-            return (Q_trial, Ft_trial, jnp.bool_(True))
+            return (Q_trial, Ft_trial, U_trial, jnp.bool_(True))
 
         def reject_step(_):
-            return (Q_best, Ft_best, accepted)
+            return (Q_best, Ft_best, U_best, accepted)
 
-        Q_best, Ft_best, accepted = lax.cond(ok, accept_step, reject_step, operand=None)
+        Q_best, Ft_best, U_best, accepted = lax.cond(ok, accept_step, reject_step, operand=None)
 
         tau = tau * shrink
-        return (i + 1, tau, accepted, Q_best, Ft_best)
+        return (i + 1, tau, accepted, Q_best, Ft_best, U_best)
 
-    init_state = (jnp.int32(0), tau0, jnp.bool_(False), Q, Ft)
-    _, _, _, Q_out, Ft_out = lax.while_loop(cond, body, init_state)
-    return Q_out, Ft_out
+    n = G.shape[-1]
+    # Initialize U_best to have the exact same shape as the U coming out of _qr_retract.
+    # _qr_retract operates on G which has shape (..., n, n). 
+    # U will also have shape (..., n, n)
+    eye = jnp.zeros_like(G)
+    eye = eye + jnp.eye(n, dtype=G.dtype)
+    
+    init_state = (jnp.int32(0), tau0, jnp.bool_(False), Q, Ft, eye)
+    _, _, _, Q_out, Ft_out, U_out = lax.while_loop(cond, body, init_state)
+    return Q_out, Ft_out, U_out
 
 
 # ----------------------------
@@ -278,35 +284,59 @@ def _frozenF_inner_solve_qr(
         )
         p_s = _occupations_from_eps(eps, mu_s, T).astype(real_dtype)
 
-        # 2) Q sweeps via QR retraction
+        # 2) Q sweeps via QR retraction (with Riemannian PR Conjugate Gradients)
+        H_zero = jnp.zeros_like(Ft_s)
 
-        def q_sweep(_, state2):
-            Q_q, Ft_q = state2
+        def q_sweep(i_q, state2):
+            Q_q, Ft_q, G_prev, H_prev = state2
 
-            G = _orbital_gradient(Ft_q, p_s, offdiag, float(p_floor), T, float(denom_scale))
+            G_new = _orbital_gradient(Ft_q, p_s, offdiag, float(p_floor), T, float(denom_scale))
 
             # Restrict rotations to within symmetry blocks (if requested).
             if rot_mask is not None:
-                G = G * rot_mask
+                G_new = G_new * rot_mask
+
+            # Polak-Ribiere beta
+            def compute_beta():
+                # Re(conj(A)*B) captures the inner product of two complex matrices flattened.
+                num = jnp.sum(jnp.real(jnp.conj(G_new) * (G_new - G_prev)), axis=(-2, -1))
+                den = jnp.sum(jnp.real(jnp.conj(G_prev) * G_prev), axis=(-2, -1)) + tiny_eps
+                return jnp.maximum(0.0, num / den)[..., None, None]
+
+            # If i_q == 0, beta = 0.
+            beta = lax.cond(
+                i_q > 0, 
+                compute_beta, 
+                lambda: jnp.zeros(G_new.shape[:-2] + (1, 1), dtype=real_dtype)
+            )
+            
+            H_new = G_new + beta * H_prev
 
             # Evaluate adaptive step size on the unclipped, masked direction
-            tau = _adaptive_tau(G, Ft_q, float(denom_scale), T)
+            tau = _adaptive_tau(H_new, Ft_q, float(denom_scale), T)
 
             # Per-k clipping on the *effective* generator norm
-            gen_norm = jnp.sqrt(jnp.sum(jnp.abs(G) ** 2, axis=(-2, -1)) + tiny_eps)
+            gen_norm = jnp.sqrt(jnp.sum(jnp.abs(H_new) ** 2, axis=(-2, -1)) + tiny_eps)
             eff_norm = tau * gen_norm
             clip_scale = jnp.minimum(1.0, max_rot_j / (eff_norm + clip_eps))
-            G = G * clip_scale[..., None, None]
+            H_step = H_new * clip_scale[..., None, None]
 
-            Q_new, Ft_new = _backtracking_qr(
-                Q_q, Ft_q, G,
+            Q_new, Ft_new, U = _backtracking_qr(
+                Q_q, Ft_q, H_step,
                 p=p_s, offdiag=offdiag, w_norm=w_norm,
                 tau0=tau, accept_ratio=float(bt_accept),
                 shrink=float(bt_shrink), max_backtrack=int(bt_max)
             )
-            return (Q_new, Ft_new)
+            
+            # Parallel transport G_new and H_new to the new tangent space
+            # H_trans = U^\dagger H U
+            U_dag = U.conj().swapaxes(-1, -2)
+            G_trans = U_dag @ G_new @ U
+            H_trans = U_dag @ H_new @ U
 
-        Q_s, Ft_s = lax.fori_loop(0, int(q_sweeps), q_sweep, (Q_s, Ft_s))
+            return (Q_new, Ft_new, G_trans, H_trans)
+
+        Q_s, Ft_s, _, _ = lax.fori_loop(0, int(q_sweeps), q_sweep, (Q_s, Ft_s, H_zero, H_zero))
         return (Q_s, Ft_s, p_s, mu_s)
 
     Q_out, _, p_out, mu_out = lax.fori_loop(0, int(inner_sweeps), inner_sweep, (Q, Ft0, p, mu))
