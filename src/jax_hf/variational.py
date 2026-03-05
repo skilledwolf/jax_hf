@@ -290,27 +290,49 @@ class VariationalHFParams(NamedTuple):
 # ----------------------------
 
 
-def _comm_norm(Ft: jax.Array, diff: jax.Array, w_norm: jax.Array) -> jax.Array:
-    return _weighted_rms_matrix(diff * Ft, w_norm)
+def _comm_norm(Ft: jax.Array, diff: jax.Array, w_norm: jax.Array, offdiag: jax.Array) -> jax.Array:
+    return _weighted_rms_matrix(diff * Ft * offdiag, w_norm)
 
 
-def _stationarity_norm(Ft: jax.Array, p: jax.Array, w_norm: jax.Array, p_floor: float) -> jax.Array:
+def _stationarity_norm(
+    Ft: jax.Array, p: jax.Array, w_norm: jax.Array,
+    p_floor: float, T: float, denom_scale: float,
+) -> jax.Array:
     """
-    Combined stationarity norm:
-      - commutator term for non-degenerate occupations
-      - off-diagonal F term in near-degenerate occupation subspaces (Jacobi gauge term)
+    Energy-denominator weighted stationarity norm (true Grassmann gradient norm):
+      - gradient term: (p_j - p_i) F_ij / denom  for non-degenerate occupations
+      - Jacobi gauge term: F_ij / denom  in near-degenerate occupation subspaces
+    where denom = sqrt(gap² + λ²), λ = max(T, denom_scale * eps_scale).
     """
     real_dtype = p.dtype
+    tiny_eps = jnp.asarray(1e-30, dtype=real_dtype)
     diff = p[..., None, :] - p[..., :, None]
-    comm = diff * Ft
     occ_scale = jnp.abs(diff) / (jnp.abs(diff) + jnp.asarray(p_floor, dtype=real_dtype))
 
     n = Ft.shape[-1]
     offdiag = (1.0 - jnp.eye(n, dtype=real_dtype))[None, None, ...]
-    jac = (1.0 - occ_scale) * (Ft * offdiag)
+
+    # Energy denominator (same formula as inner solve)
+    eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
+    gap = eps[..., :, None] - eps[..., None, :]
+    eps_scale = jnp.sqrt(jnp.mean(eps ** 2) + tiny_eps)
+    lam = jnp.maximum(
+        jnp.asarray(T, dtype=real_dtype),
+        jnp.asarray(denom_scale, dtype=real_dtype) * eps_scale,
+    )
+    denom = jnp.sqrt(gap ** 2 + lam ** 2)
+
+    comm = (diff * Ft * offdiag) / denom
+    jac = ((1.0 - occ_scale) * Ft * offdiag) / denom
 
     per_k = jnp.sum(jnp.abs(comm) ** 2 + jnp.abs(jac) ** 2, axis=(-2, -1))
-    return jnp.sqrt(jnp.sum(w_norm * per_k) / jnp.maximum(jnp.sum(w_norm), jnp.asarray(1e-30, dtype=real_dtype)))
+    return jnp.sqrt(jnp.sum(w_norm * per_k) / jnp.maximum(jnp.sum(w_norm), tiny_eps))
+
+
+def _frozen_F_energy(Ft: jax.Array, p: jax.Array, w_norm: jax.Array) -> jax.Array:
+    """Frozen-F energy: E = sum_k w_k sum_i p_i Ft_ii."""
+    eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1))
+    return jnp.sum(w_norm[..., None] * p * eps)
 
 
 def _backtracking_cayley_right(
@@ -319,6 +341,8 @@ def _backtracking_cayley_right(
     Omega_dir: jax.Array,     # anti-Hermitian direction in orbital basis
     *,
     diff: jax.Array,
+    p: jax.Array,
+    offdiag: jax.Array,
     cayley_eye: jax.Array,
     w_norm: jax.Array,
     tau0: float,
@@ -327,7 +351,8 @@ def _backtracking_cayley_right(
     max_backtrack: int,
 ) -> Tuple[jax.Array, jax.Array]:
     """
-    Try tau= tau0, tau0*shrink, ... until commutator norm decreases sufficiently.
+    Try tau= tau0, tau0*shrink, ... until commutator norm decreases sufficiently
+    AND frozen-F energy does not increase.
     Returns (Q_new, Ft_new). If no step is accepted, returns inputs unchanged.
     """
     real_dtype = diff.dtype
@@ -335,7 +360,8 @@ def _backtracking_cayley_right(
     shrink = jnp.asarray(shrink, dtype=real_dtype)
     accept_ratio = jnp.asarray(accept_ratio, dtype=real_dtype)
 
-    norm0 = _comm_norm(Ft, diff, w_norm)
+    norm0 = _comm_norm(Ft, diff, w_norm, offdiag)
+    E0 = _frozen_F_energy(Ft, p, w_norm)
 
     def cond(state):
         i, tau, accepted, Q_best, Ft_best = state
@@ -350,8 +376,12 @@ def _backtracking_cayley_right(
         Udag = jnp.conj(jnp.swapaxes(U, -1, -2))
         Ft_trial = Udag @ (Ft @ U)
 
-        norm_trial = _comm_norm(Ft_trial, diff, w_norm)
-        ok = norm_trial <= accept_ratio * norm0
+        norm_trial = _comm_norm(Ft_trial, diff, w_norm, offdiag)
+        E_trial = _frozen_F_energy(Ft_trial, p, w_norm)
+        ok = jnp.logical_and(
+            norm_trial <= accept_ratio * norm0,
+            E_trial <= E0,
+        )
 
         def accept_step(_):
             return (Q @ U, Ft_trial, jnp.bool_(True))
@@ -371,14 +401,13 @@ def _backtracking_cayley_right(
 
 def _rotation_mask_from_block_sizes(block_sizes: tuple[int, ...], n: int, dtype) -> jax.Array:
     """Build binary (nb,nb) mask with 1s inside blocks and 0s between them."""
-    import numpy as _np
-    mask = _np.zeros((n, n), dtype=_np.float64)
+    mask = jnp.zeros((n, n), dtype=dtype)
     start = 0
     for size in block_sizes:
         stop = start + int(size)
-        mask[start:stop, start:stop] = 1.0
+        mask = mask.at[start:stop, start:stop].set(1.0)
         start = stop
-    return jnp.asarray(mask, dtype=dtype)
+    return mask
 
 
 def _frozenF_inner_solve(
@@ -472,7 +501,7 @@ def _frozenF_inner_solve(
                 Tj,
                 denom_scale_j * eps_scale,
             )
-            denom = jnp.abs(gap) + lam_gap
+            denom = jnp.sqrt(gap ** 2 + lam_gap ** 2)
 
             # Jacobi fallback keeps motion in exactly degenerate occupancy subspaces.
             gap_ji = eps_q[..., None, :] - eps_q[..., :, None]
@@ -505,6 +534,8 @@ def _frozenF_inner_solve(
             Q_new, Ft_new = _backtracking_cayley_right(
                 Q_q, Ft_q, Omega_dir,
                 diff=diff,
+                p=p_s,
+                offdiag=offdiag,
                 cayley_eye=cayley_eye,
                 w_norm=w_norm,
                 tau0=float(bt_tau0),
@@ -545,6 +576,7 @@ def variational_hartreefock_optimize(
     max_iter: int = 80,
     comm_tol: float = 5e-4,
     p_tol: float = 5e-6,
+    e_tol: float = 0.0,
 
     # inner loop (frozen-F) controls
     inner_sweeps: int = 2,
@@ -597,10 +629,12 @@ def variational_hartreefock_optimize(
     hist_E = jnp.zeros(int(max_iter), dtype=real_dtype)
     hist_dC = jnp.zeros(int(max_iter), dtype=real_dtype)
     hist_dP = jnp.zeros(int(max_iter), dtype=real_dtype)
+    hist_dE = jnp.zeros(int(max_iter), dtype=real_dtype)
     hist_mu = jnp.zeros(int(max_iter), dtype=real_dtype)
 
     comm_tol_r = jnp.asarray(comm_tol, dtype=real_dtype)
     p_tol_r = jnp.asarray(p_tol, dtype=real_dtype)
+    e_tol_r = jnp.asarray(e_tol, dtype=real_dtype)
 
     # Cache last-built F if we finish on a no-update iteration (avoids a final extra build).
     F_last0 = jnp.zeros_like(h)
@@ -614,20 +648,31 @@ def variational_hartreefock_optimize(
         mu0,
         jnp.asarray(jnp.inf, dtype=real_dtype),  # dC_prev
         jnp.asarray(jnp.inf, dtype=real_dtype),  # dP_prev
+        jnp.asarray(jnp.inf, dtype=real_dtype),  # dE_prev
+        jnp.asarray(jnp.nan, dtype=real_dtype),  # E_prev (for dE computation)
         F_last0,
         E_last0,
         fresh0,
-        hist_E, hist_dC, hist_dP, hist_mu,
+        hist_E, hist_dC, hist_dP, hist_dE, hist_mu,
     )
 
     def cond(carry):
         k = carry[0]
         dC_prev = carry[4]
         dP_prev = carry[5]
-        return jnp.logical_and(k < max_iter, jnp.logical_or(dC_prev > comm_tol_r, dP_prev > p_tol_r))
+        dE_prev = carry[6]
+        not_converged = jnp.logical_or(dC_prev > comm_tol_r, dP_prev > p_tol_r)
+        # When e_tol > 0, also require energy convergence
+        not_converged = jnp.where(
+            e_tol_r > 0,
+            jnp.logical_or(not_converged, dE_prev > e_tol_r),
+            not_converged,
+        )
+        return jnp.logical_and(k < max_iter, not_converged)
 
     def body(carry):
-        k, Q, p, mu, _dC_prev, _dP_prev, _F_last, _E_last, _fresh, hE, hC, hP, hM = carry
+        (k, Q, p, mu, _dC_prev, _dP_prev, _dE_prev, E_prev,
+         _F_last, _E_last, _fresh, hE, hC, hP, hdE, hM) = carry
 
         # Build density and Fock at current state
         P = _project(_density_from_Qp(Q, p))
@@ -643,15 +688,21 @@ def variational_hartreefock_optimize(
         )
         F = _project(F)
         E = _hf_energy(P, h=h, Sigma=Sigma, H=H_shift, weights_b=weights_b)
+        E_real = jnp.real(E)
+
+        # Energy change (inf on first iteration when E_prev is nan)
+        dE = jnp.abs(E_real - E_prev)
+        dE = jnp.where(jnp.isfinite(dE), dE, jnp.asarray(jnp.inf, dtype=real_dtype))
 
         # HF stationarity measure at current state (includes a degenerate-subspace gauge term)
         Ft = _fock_in_orbital_basis(Q, F)
-        dC = _stationarity_norm(Ft, p, w_norm, float(p_floor))
+        dC = _stationarity_norm(Ft, p, w_norm, float(p_floor), T, float(denom_scale))
 
         # Record history for the CURRENT state
-        hE = hE.at[k].set(jnp.real(E))
+        hE = hE.at[k].set(E_real)
         hC = hC.at[k].set(dC)
         hM = hM.at[k].set(mu)
+        hdE = hdE.at[k].set(dE)
 
         # If converged, do not update (prevents post-convergence drift)
         need_update = dC > comm_tol_r
@@ -687,14 +738,15 @@ def variational_hartreefock_optimize(
         # F is fresh only if we didn't change (Q,p) this iteration.
         fresh = jnp.logical_not(need_update)
         F_last = jnp.where(need_update, _F_last, F)
-        E_last = jnp.where(need_update, _E_last, jnp.real(E))
+        E_last = jnp.where(need_update, _E_last, E_real)
 
-        return (k + 1, Q_new, p_new, mu_new, dC, dP, F_last, E_last, fresh, hE, hC, hP, hM)
+        return (k + 1, Q_new, p_new, mu_new, dC, dP, dE, E_real,
+                F_last, E_last, fresh, hE, hC, hP, hdE, hM)
 
     (
-        k_fin, Q_fin, p_fin, mu_fin, _dC_fin, _dP_fin,
+        k_fin, Q_fin, p_fin, mu_fin, _dC_fin, _dP_fin, _dE_fin, _E_prev_fin,
         F_last, E_last, fresh,
-        hist_E, hist_dC, hist_dP, hist_mu,
+        hist_E, hist_dC, hist_dP, hist_dE, hist_mu,
     ) = lax.while_loop(cond, body, carry0)
 
     # Final consistent outputs at returned state.
@@ -720,7 +772,7 @@ def variational_hartreefock_optimize(
 
     P_fin, F_fin, E_fin = lax.cond(fresh, finalize_reuse, finalize_rebuild, operand=None)
 
-    history = dict(E=hist_E, dC=hist_dC, dP=hist_dP, mu=hist_mu)
+    history = dict(E=hist_E, dC=hist_dC, dP=hist_dP, dE=hist_dE, mu=hist_mu)
     params_fin = VariationalHFParams(Q=Q_fin, p=p_fin, mu=mu_fin)
     return P_fin, F_fin, E_fin, mu_fin, k_fin, history, params_fin
 
@@ -820,7 +872,7 @@ def jit_variational_hartreefock_iteration(hf_step):
     compiled = jax.jit(
         variational_hartreefock_optimize,
         static_argnames=(
-            "max_iter", "comm_tol", "p_tol",
+            "max_iter", "comm_tol", "p_tol", "e_tol",
             "inner_sweeps", "q_sweeps",
             "p_floor", "denom_scale", "max_rot",
             "bt_tau0", "bt_accept", "bt_shrink", "bt_max",

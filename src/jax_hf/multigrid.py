@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from .main import HartreeFockKernel, jit_hartreefock_iteration
 from .utils import density_matrix_from_fock, hermitize, resample_kgrid
 from .variational import jit_variational_hartreefock_iteration
+from .variational_qr import jit_variational_qr_iteration
 
 
 class HFRunResult(NamedTuple):
@@ -91,7 +92,7 @@ def coarse_to_fine_scf(
     run_f = jit_hartreefock_iteration(kernel_f)
 
     # ---- no coarse stage requested -> just run fine ----
-    if nk_coarse is None or int(nk_coarse) <= nk_f:
+    if nk_coarse is None or int(nk_coarse) >= nk_f:
         P_fin, F_fin, E_fin, mu_fin, k_fin, hist_fin = run_f(
             P0_f, float(electrondensity0), **fine_scf_kwargs
         )
@@ -224,6 +225,7 @@ def coarse_to_fine_variational(
     hartree_matrix: jax.Array | None = None,
     coarse_var_kwargs: dict[str, Any] | None = None,
     fine_var_kwargs: dict[str, Any] | None = None,
+    solver: str = "cayley",
 ) -> MultigridVariationalResult:
     """Coarse-to-fine continuation using the variational (frozen-F) solver.
 
@@ -254,6 +256,8 @@ def coarse_to_fine_variational(
         Extra keyword arguments forwarded to the variational runner for
         the coarse and fine stages respectively (e.g. ``project_fn``,
         ``exchange_block_specs``, ``max_iter``, ``comm_tol``).
+    solver : str
+        Which variational solver to use: ``"cayley"`` (default) or ``"qr"``.
 
     Returns
     -------
@@ -261,6 +265,13 @@ def coarse_to_fine_variational(
         Named tuple with ``coarse``, ``fine`` (both :class:`VariationalRunResult`),
         and ``P0_seed_f`` (the upsampled seed used for the fine stage).
     """
+    if solver == "cayley":
+        _make_runner = jit_variational_hartreefock_iteration
+    elif solver == "qr":
+        _make_runner = jit_variational_qr_iteration
+    else:
+        raise ValueError(f"Unknown solver {solver!r}; expected 'cayley' or 'qr'")
+
     coarse_var_kwargs = dict(coarse_var_kwargs or {})
     fine_var_kwargs = dict(fine_var_kwargs or {})
 
@@ -283,10 +294,10 @@ def coarse_to_fine_variational(
         reference_density=reference_density_f,
         hartree_matrix=hartree_matrix,
     )
-    run_f = jit_variational_hartreefock_iteration(kernel_f)
+    run_f = _make_runner(kernel_f)
 
     # ---- no coarse stage → fine only ----
-    if nk_coarse is None or int(nk_coarse) <= nk_f:
+    if nk_coarse is None or int(nk_coarse) >= nk_f:
         P_fin, F_fin, E_fin, mu_fin, k_fin, hist_fin, params_fin = run_f(
             P0_f, float(electrondensity0), return_params=True, **fine_var_kwargs,
         )
@@ -319,7 +330,7 @@ def coarse_to_fine_variational(
         reference_density=reference_density_c,
         hartree_matrix=hartree_matrix,
     )
-    run_c = jit_variational_hartreefock_iteration(kernel_c)
+    run_c = _make_runner(kernel_c)
 
     P_c, F_c, E_c, mu_c, k_c, hist_c, params_c = run_c(
         P0_c, float(electrondensity0), return_params=True, **coarse_var_kwargs,

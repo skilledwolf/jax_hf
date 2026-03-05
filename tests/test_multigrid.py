@@ -1,8 +1,9 @@
 import numpy as np
+import pytest
 
 import jax.numpy as jnp
 
-from jax_hf.multigrid import coarse_to_fine_scf
+from jax_hf.multigrid import coarse_to_fine_scf, coarse_to_fine_variational
 from jax_hf.utils import resample_kgrid
 
 
@@ -76,4 +77,69 @@ def test_coarse_to_fine_scf_runs():
     # Hermiticity checks.
     P_fin = np.array(out.fine.density)
     np.testing.assert_allclose(P_fin, np.conj(np.swapaxes(P_fin, -1, -2)), atol=1e-6)
+
+
+def _make_variational_multigrid_inputs():
+    """Shared tiny model for variational multigrid tests."""
+    nk_f, nk_c = 12, 6
+    kmax, T = 0.8, 0.25
+
+    k = np.linspace(-kmax, kmax, nk_f, endpoint=False, dtype=np.float32)
+    KX, KY = np.meshgrid(k, k, indexing="ij")
+
+    d0 = 0.2 * (np.cos(KX) + np.cos(KY))
+    dz = 0.7 + 0.3 * (2.0 - np.cos(KX) - np.cos(KY))
+    f = 1.1 * (np.sin(KX) + 1j * np.sin(KY))
+
+    H = np.zeros((nk_f, nk_f, 2, 2), dtype=np.complex64)
+    H[..., 0, 0] = d0 + dz
+    H[..., 1, 1] = d0 - dz
+    H[..., 0, 1] = f
+    H[..., 1, 0] = np.conj(f)
+
+    weights = np.ones((nk_f, nk_f), dtype=np.float32) / (nk_f * nk_f)
+    q = np.sqrt(KX * KX + KY * KY)
+    Vq = (0.6 / (q + 0.4)).astype(np.float32)[..., None, None]
+
+    P0 = np.zeros((nk_f, nk_f, 2, 2), dtype=np.complex64)
+    P0[..., 0, 0] = 0.6
+    P0[..., 1, 1] = 0.4
+
+    return dict(
+        weights_f=weights,
+        hamiltonian_f=H,
+        coulomb_q_f=Vq,
+        P0_f=P0,
+        electrondensity0=1.0,
+        T=T,
+        nk_coarse=nk_c,
+        include_hartree=False,
+        include_exchange=True,
+    )
+
+
+@pytest.mark.parametrize("solver", ["cayley", "qr"])
+def test_coarse_to_fine_variational_runs(solver):
+    inputs = _make_variational_multigrid_inputs()
+    nk_c = inputs["nk_coarse"]
+    nk_f = inputs["weights_f"].shape[0]
+
+    out = coarse_to_fine_variational(
+        **inputs,
+        solver=solver,
+        coarse_var_kwargs=dict(max_iter=40, comm_tol=1e-3, p_tol=1e-3),
+        fine_var_kwargs=dict(max_iter=40, comm_tol=1e-3, p_tol=1e-3),
+    )
+
+    assert out.coarse is not None
+    assert out.P0_seed_f is not None
+
+    assert out.coarse.density.shape == (nk_c, nk_c, 2, 2)
+    assert out.fine.density.shape == (nk_f, nk_f, 2, 2)
+
+    P_fin = np.array(out.fine.density)
+    np.testing.assert_allclose(
+        P_fin, np.conj(np.swapaxes(P_fin, -1, -2)), atol=1e-6,
+    )
+    assert np.isfinite(np.array(out.fine.energy)).all()
 

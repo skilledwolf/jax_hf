@@ -21,6 +21,10 @@ from .variational import (  # noqa: F401
     jit_variational_hartreefock_iteration,
     variational_hartreefock_optimize,
 )
+from .variational_qr import (  # noqa: F401
+    jit_variational_qr_iteration,
+    variational_qr_optimize,
+)
 
 # Minimal utils shim to aid migration
 from . import utils  # noqa: F401
@@ -51,4 +55,6 @@ __all__ = [
     "VariationalRunResult",
     "coarse_to_fine_scf",
     "coarse_to_fine_variational",
+    "jit_variational_qr_iteration",
+    "variational_qr_optimize",
 ]
