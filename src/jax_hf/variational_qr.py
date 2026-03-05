@@ -111,6 +111,34 @@ def _orbital_gradient(
     return occ_scale * G_comm - (1.0 - occ_scale) * G_jac
 
 
+def _adaptive_tau(G: jax.Array, Ft: jax.Array, denom_scale: float, T: float) -> jax.Array:
+    """Rayleigh quotient step size for orbital minimization."""
+    real_dtype = jnp.real(Ft).dtype
+
+    eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
+    gap = eps[..., :, None] - eps[..., None, :]
+
+    tiny = jnp.asarray(1e-30, dtype=real_dtype)
+    eps_scale = jnp.sqrt(jnp.mean(eps**2) + tiny)
+
+    lam = jnp.maximum(
+        jnp.asarray(T, dtype=real_dtype),
+        jnp.asarray(denom_scale, dtype=real_dtype) * eps_scale,
+    )
+
+    G2 = jnp.abs(G)**2
+
+    # G is the preconditioned gradient (D = G_raw / denom).
+    # The true directional gradient evaluated along D is sum(G_raw * D) = sum(|D|^2 * denom).
+    denom = jnp.sqrt(gap**2 + lam**2)
+    num = jnp.sum(G2 * denom)
+    
+    # The curvature evaluated along D is sum(|D|^2 * (|gap| + lam))
+    den = jnp.sum(G2 * (jnp.abs(gap) + lam))
+
+    tau = num / (den + tiny)
+    return tau
+
 def _qr_retract(Q: jax.Array, Ft: jax.Array, G: jax.Array, tau: jax.Array) -> Tuple[jax.Array, jax.Array]:
     """
     Orbital-basis QR retraction: U = QR(I - tau*G), Q' = Q@U, Ft' = U†FtU.
@@ -251,7 +279,6 @@ def _frozenF_inner_solve_qr(
         p_s = _occupations_from_eps(eps, mu_s, T).astype(real_dtype)
 
         # 2) Q sweeps via QR retraction
-        tau = jnp.asarray(bt_tau0, dtype=real_dtype)
 
         def q_sweep(_, state2):
             Q_q, Ft_q = state2
@@ -262,12 +289,21 @@ def _frozenF_inner_solve_qr(
             if rot_mask is not None:
                 G = G * rot_mask
 
-            # Per-k clipping on generator norm
+            # Evaluate adaptive step size on the unclipped, masked direction
+            tau = _adaptive_tau(G, Ft_q, float(denom_scale), T)
+
+            # Per-k clipping on the *effective* generator norm
             gen_norm = jnp.sqrt(jnp.sum(jnp.abs(G) ** 2, axis=(-2, -1)) + tiny_eps)
-            clip_scale = jnp.minimum(1.0, max_rot_j / (gen_norm + clip_eps))
+            eff_norm = tau * gen_norm
+            clip_scale = jnp.minimum(1.0, max_rot_j / (eff_norm + clip_eps))
             G = G * clip_scale[..., None, None]
 
-            Q_new, Ft_new = _qr_retract(Q_q, Ft_q, G, tau)
+            Q_new, Ft_new = _backtracking_qr(
+                Q_q, Ft_q, G,
+                p=p_s, offdiag=offdiag, w_norm=w_norm,
+                tau0=tau, accept_ratio=float(bt_accept),
+                shrink=float(bt_shrink), max_backtrack=int(bt_max)
+            )
             return (Q_new, Ft_new)
 
         Q_s, Ft_s = lax.fori_loop(0, int(q_sweeps), q_sweep, (Q_s, Ft_s))
