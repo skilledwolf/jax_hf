@@ -2,18 +2,24 @@
 QR-retraction variational Hartree-Fock solver.
 
 Uses the same frozen-F alternating minimization as variational.py, but replaces
-Cayley/Jacobi orbital updates with a simpler QR-retraction Riemannian gradient
-descent on the unitary manifold:
+Cayley/Jacobi orbital updates with a QR-retraction Riemannian gradient descent
+on the unitary manifold.  The update stays entirely in the orbital basis:
 
-    Q_new = QR(Q - τ Q G)
+    U  = QR(I - τ G)
+    Q' = Q U
+    Ft'= U† Ft U
 
-where G = skew((p_j - p_i) F_ij) is the orbital gradient.
+where G = skew((p_j - p_i) Ft_ij / denom) is the preconditioned orbital
+gradient, and Ft = Q†FQ is the Fock matrix in the orbital basis.
+
+Because only the small nb×nb unitary U is factored and both Q and Ft are
+updated via right-multiplication, the inner loop avoids recomputing Q†FQ
+from the Hilbert-basis Fock matrix each step.
 
 Advantages over Cayley:
   - No nb×nb linear solves (QR is cheaper for nb > ~12)
-  - No Jacobi fallback or generator clipping needed
+  - Orbital-basis updates avoid the cost of Q†FQ recomputation
   - More stable near degeneracies (gradient vanishes when p_i == p_j)
-  - Simpler code (~200 lines vs ~400 for Cayley variant)
 """
 
 from __future__ import annotations
@@ -105,23 +111,26 @@ def _orbital_gradient(
     return occ_scale * G_comm - (1.0 - occ_scale) * G_jac
 
 
-def _qr_retract(Q: jax.Array, G: jax.Array, tau: jax.Array, F: jax.Array) -> Tuple[jax.Array, jax.Array]:
+def _qr_retract(Q: jax.Array, Ft: jax.Array, G: jax.Array, tau: jax.Array) -> Tuple[jax.Array, jax.Array]:
     """
-    QR retraction: Q_new = QR(Q - tau * Q @ G), then Ft_new = Q_new† F Q_new.
+    Orbital-basis QR retraction: U = QR(I - tau*G), Q' = Q@U, Ft' = U†FtU.
 
-    Sign convention: multiply columns of Q by sign(diag(R)) so the retraction
-    is a smooth map (standard QR sign fix).
+    Stays entirely in the orbital basis — avoids recomputing Q†FQ from the
+    Hilbert-basis Fock matrix.  Sign convention: multiply columns of U by
+    sign(diag(R)) so the retraction is a smooth map.
     """
-    Q_trial = Q - tau * (Q @ G)
-    Q_new, R = jnp.linalg.qr(Q_trial)
+    n = G.shape[-1]
+    eye = jnp.eye(n, dtype=G.dtype)
+    U_trial = eye - tau * G
+    U, R = jnp.linalg.qr(U_trial)
 
     # Fix sign ambiguity: ensure diag(R) > 0
     signs = jnp.sign(jnp.real(jnp.diagonal(R, axis1=-2, axis2=-1)))
-    # Handle exact zeros in diag(R) (shouldn't happen in practice)
     signs = jnp.where(signs == 0, 1.0, signs)
-    Q_new = Q_new * signs[..., None, :]
+    U = U * signs[..., None, :]
 
-    Ft_new = _fock_in_orbital_basis(Q_new, F)
+    Q_new = Q @ U
+    Ft_new = U.conj().swapaxes(-1, -2) @ Ft @ U
     return Q_new, Ft_new
 
 
@@ -133,7 +142,6 @@ def _backtracking_qr(
     p: jax.Array,
     offdiag: jax.Array,
     w_norm: jax.Array,
-    F: jax.Array,
     tau0: float,
     accept_ratio: float,
     shrink: float,
@@ -165,7 +173,7 @@ def _backtracking_qr(
     def body(state):
         i, tau, accepted, Q_best, Ft_best = state
 
-        Q_trial, Ft_trial = _qr_retract(Q, G, tau, F)
+        Q_trial, Ft_trial = _qr_retract(Q, Ft, G, tau)
 
         norm_trial = _comm_norm(Ft_trial, diff, w_norm, offdiag)
         ok = norm_trial <= accept_ratio * norm0
@@ -196,7 +204,6 @@ def _frozenF_inner_solve_qr(
     p: jax.Array,
     mu: jax.Array,
     *,
-    F: jax.Array,
     Ft: jax.Array,
     w_norm: jax.Array,
     n_target_norm: jax.Array,
@@ -260,7 +267,7 @@ def _frozenF_inner_solve_qr(
             clip_scale = jnp.minimum(1.0, max_rot_j / (gen_norm + clip_eps))
             G = G * clip_scale[..., None, None]
 
-            Q_new, Ft_new = _qr_retract(Q_q, G, tau, F)
+            Q_new, Ft_new = _qr_retract(Q_q, Ft_q, G, tau)
             return (Q_new, Ft_new)
 
         Q_s, Ft_s = lax.fori_loop(0, int(q_sweeps), q_sweep, (Q_s, Ft_s))
@@ -431,7 +438,7 @@ def variational_qr_optimize(
             Q_u, p_u, mu_u = args
             Q1, p1, mu1 = _frozenF_inner_solve_qr(
                 Q_u, p_u, mu_u,
-                F=F, Ft=Ft, w_norm=w_norm, n_target_norm=n_target_norm, T=T,
+                Ft=Ft, w_norm=w_norm, n_target_norm=n_target_norm, T=T,
                 inner_sweeps=int(inner_sweeps),
                 q_sweeps=int(q_sweeps),
                 p_floor=float(p_floor),

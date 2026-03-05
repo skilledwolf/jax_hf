@@ -14,7 +14,6 @@ except metadata.PackageNotFoundError:  # pragma: no cover - package not installe
 # Export mixing (kept intact) and expose skeleton API
 from . import mixing  # noqa: F401
 from .main import HartreeFockKernel, jit_hartreefock_iteration  # noqa: F401
-from .symmetry import make_project_fn, make_svp_project_fn, make_svp_symmetry_group  # noqa: F401
 from .variational import (  # noqa: F401
     VariationalHFParams,
     init_variational_params_from_density,
@@ -45,10 +44,7 @@ __all__ = [
     "init_variational_params_from_density",
     "variational_hartreefock_optimize",
     "jit_variational_hartreefock_iteration",
-    "make_project_fn",
-    "make_svp_project_fn",
-    "make_svp_symmetry_group",
-    "utils",
+"utils",
     "HFRunResult",
     "MultigridHFResult",
     "MultigridVariationalResult",
