@@ -85,6 +85,23 @@ def test_hartreefock_iteration_converges_on_tiny_model():
     assert last_recorded < 1e-6
 
 
+def test_hartreefock_kernel_auto_enables_hermitian_channel_packing_for_real_scalar_coulomb():
+    weights = jnp.ones((2, 2), dtype=jnp.float32)
+    hamiltonian = jnp.zeros((2, 2, 3, 3), dtype=jnp.complex64)
+    coulomb_q = jnp.ones((2, 2, 1, 1), dtype=jnp.float32)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.1,
+        include_hartree=False,
+        include_exchange=True,
+    )
+
+    assert kernel.exchange_hermitian_channel_packing is True
+
+
 @pytest.mark.parametrize("method", ["bisection", "newton"])
 def test_find_chemical_potential_hits_target_multiband(method):
     """Both solvers hit target density on a multi-k, multi-band system."""
@@ -185,3 +202,54 @@ def test_hartreefock_iteration_converges_with_level_shift():
     comm = F_fin @ P_fin - P_fin @ F_fin
     rms = _comm_rms(comm, weights)
     assert rms < 1e-5
+
+
+def test_hartreefock_iteration_project_fn_enforces_symmetry():
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+    hamiltonian = jnp.zeros((1, 1, 2, 2), dtype=jnp.complex64)
+    coulomb_q = jnp.array([[[[0.6]]]], dtype=jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.05,
+        include_hartree=False,
+        include_exchange=True,
+    )
+
+    P0 = jnp.array([[[[0.9, 0.0], [0.0, 0.1]]]], dtype=jnp.complex64)
+    runner = jit_hartreefock_iteration(kernel)
+
+    P_unproj, _, _, _, _, _ = runner(
+        P0,
+        electrondensity0=1.0,
+        max_iter=60,
+        comm_tol=1e-7,
+        diis_size=4,
+        precond_mode="diag",
+    )
+
+    def project_fn(A):
+        swap = jnp.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=A.dtype)
+        return 0.5 * (A + swap @ A @ jnp.conj(swap.T))
+
+    P_fin, F_fin, *_ = runner(
+        P0,
+        electrondensity0=1.0,
+        max_iter=60,
+        comm_tol=1e-7,
+        diis_size=4,
+        precond_mode="diag",
+        project_fn=project_fn,
+    )
+
+    assert float(abs(P_unproj[0, 0, 0, 0] - P_unproj[0, 0, 1, 1])) > 1e-3
+    np.testing.assert_allclose(np.array(P_fin), np.array(project_fn(P_fin)), atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(np.array(F_fin), np.array(project_fn(F_fin)), atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(
+        np.array(P_fin[0, 0, 0, 0]),
+        np.array(P_fin[0, 0, 1, 1]),
+        atol=1e-6,
+        rtol=1e-6,
+    )

@@ -48,6 +48,69 @@ def test_selfenergy_fft_block_specs_matches_full_when_block_diagonal():
     np.testing.assert_allclose(np.array(sigma_block), np.array(sigma_full), rtol=1e-6, atol=1e-6)
 
 
+def test_selfenergy_fft_hermitian_channel_packing_matches_full_for_scalar_real_kernel():
+    rng = np.random.default_rng(123)
+    nk = 8
+    nb = 6
+
+    raw = rng.normal(size=(nk, nk, nb, nb)) + 1j * rng.normal(size=(nk, nk, nb, nb))
+    P = 0.5 * (raw + np.conj(np.swapaxes(raw, -1, -2)))
+    Pj = jnp.asarray(P.astype(np.complex64))
+
+    Vq = rng.normal(size=(nk, nk, 1, 1)).astype(np.float32)
+    VR = jnp.fft.fftn(jnp.asarray(Vq, dtype=jnp.complex64), axes=(0, 1))
+
+    sigma_full = selfenergy_fft(VR, Pj)
+    sigma_packed = selfenergy_fft(
+        VR,
+        Pj,
+        hermitian_channel_packing=True,
+    )
+
+    np.testing.assert_allclose(
+        np.array(sigma_packed),
+        np.array(sigma_full),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_selfenergy_fft_block_specs_works_with_hermitian_channel_packing():
+    rng = np.random.default_rng(7)
+    nk = 8
+    block_sizes = (2, 2, 2)
+    nb = sum(block_sizes)
+
+    P = np.zeros((nk, nk, nb, nb), dtype=np.complex64)
+    start = 0
+    for size in block_sizes:
+        stop = start + size
+        raw = rng.normal(size=(nk, nk, size, size)) + 1j * rng.normal(size=(nk, nk, size, size))
+        block = 0.5 * (raw + np.conj(np.swapaxes(raw, -1, -2)))
+        P[..., start:stop, start:stop] = block.astype(np.complex64)
+        start = stop
+    Pj = jnp.asarray(P)
+
+    Vq = rng.normal(size=(nk, nk, 1, 1)).astype(np.float32)
+    VR = jnp.fft.fftn(jnp.asarray(Vq, dtype=jnp.complex64), axes=(0, 1))
+
+    sigma_full = selfenergy_fft(VR, Pj)
+    sigma_block = selfenergy_fft(
+        VR,
+        Pj,
+        block_specs=[{"block_sizes": list(block_sizes)}],
+        check_offdiag=True,
+        hermitian_channel_packing=True,
+    )
+
+    np.testing.assert_allclose(
+        np.array(sigma_block),
+        np.array(sigma_full),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
 def test_selfenergy_fft_block_specs_falls_back_to_full_when_coupled():
     nk = 4
     n0 = 2

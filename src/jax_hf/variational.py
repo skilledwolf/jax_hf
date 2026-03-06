@@ -221,6 +221,7 @@ def _build_sigma_hartree(
     w2d: jax.Array,                 # (nk1,nk2) real physical weights
     include_exchange: bool,
     include_hartree: bool,
+    exchange_hermitian_channel_packing: bool,
     exchange_block_specs: Any | None = None,
     exchange_check_offdiag: bool | None = None,
     exchange_offdiag_atol: float = 1e-12,
@@ -236,6 +237,7 @@ def _build_sigma_hartree(
             offdiag_atol=exchange_offdiag_atol,
             offdiag_rtol=exchange_offdiag_rtol,
             _apply_ifftshift=False,  # VR has shift phase absorbed
+            hermitian_channel_packing=exchange_hermitian_channel_packing,
         )
         if include_exchange
         else jnp.zeros_like(h)
@@ -571,6 +573,7 @@ def variational_hartreefock_optimize(
     HH: jax.Array,
     include_hartree: bool,
     include_exchange: bool,
+    exchange_hermitian_channel_packing: bool,
 
     # outer loop controls
     max_iter: int = 80,
@@ -681,6 +684,7 @@ def variational_hartreefock_optimize(
             h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange,
             include_hartree=include_hartree,
+            exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
             exchange_block_specs=exchange_block_specs,
             exchange_check_offdiag=exchange_check_offdiag,
             exchange_offdiag_atol=exchange_offdiag_atol,
@@ -757,6 +761,7 @@ def variational_hartreefock_optimize(
             h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange,
             include_hartree=include_hartree,
+            exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
             exchange_block_specs=exchange_block_specs,
             exchange_check_offdiag=exchange_check_offdiag,
             exchange_offdiag_atol=exchange_offdiag_atol,
@@ -879,6 +884,7 @@ def jit_variational_hartreefock_iteration(hf_step):
             "mu_maxiter", "mu_tol",
             "rotation_block_sizes",
             "include_hartree", "include_exchange",
+            "exchange_hermitian_channel_packing",
             "exchange_block_specs", "exchange_check_offdiag",
             "exchange_offdiag_atol", "exchange_offdiag_rtol",
             "project_fn",

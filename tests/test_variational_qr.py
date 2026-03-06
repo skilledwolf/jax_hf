@@ -12,6 +12,11 @@ from jax_hf.variational import (
     VariationalHFParams,
     init_variational_params_from_density,
 )
+from jax_hf.variational_qr import _adaptive_tau
+from jax_hf.variational_qr import _apply_orbital_basis_update
+from jax_hf.variational_qr import _block_slices_from_sizes
+from jax_hf.variational_qr import _orbital_gradient
+from jax_hf.variational_qr import _qr_retraction_unitary
 
 
 def _electron_count(P: jax.Array, weights: jax.Array) -> float:
@@ -164,7 +169,7 @@ def test_variational_qr_updates_occupations_even_when_orbitals_are_stationary():
     assert p_fin[1] < 0.02
 
 
-def test_variational_qr_multisweep_cg_path_runs_with_batched_kmesh():
+def test_variational_qr_multisweep_path_runs_with_batched_kmesh():
     key_h, key_i = jax.random.split(jax.random.PRNGKey(777))
     nk1, nk2, nb = 2, 2, 3
 
@@ -204,6 +209,38 @@ def test_variational_qr_multisweep_cg_path_runs_with_batched_kmesh():
     assert np.isfinite(np.array(history["dC"][last]))
     assert np.isfinite(np.array(history["dP"][last]))
     assert _electron_count(P_fin, weights) == pytest.approx(1.8, rel=1e-5, abs=1e-5)
+
+
+def test_orbital_gradient_uses_jacobi_fallback_for_equal_occupations():
+    Ft = jnp.array([[[[0.0, 0.3], [0.3, 0.0]]]], dtype=jnp.complex64)
+    eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(jnp.float32)
+    gap = eps[..., :, None] - eps[..., None, :]
+    p = jnp.array([[[0.5, 0.5]]], dtype=jnp.float32)
+    offdiag = jnp.reshape(1.0 - jnp.eye(2, dtype=jnp.float32), (1, 1, 2, 2))
+
+    G = _orbital_gradient(Ft, eps, gap, p, offdiag, p_floor=0.1, T=0.02, denom_scale=1e-3)
+
+    G_arr = np.array(G)
+    assert np.max(np.abs(G_arr)) > 1e-3
+    np.testing.assert_allclose(G_arr, -np.swapaxes(np.conj(G_arr), -1, -2), atol=1e-7)
+
+
+def test_orbital_gradient_preconditioner_is_per_k():
+    Ft = jnp.array(
+        [
+            [[[0.0, 0.2], [0.2, 0.0]]],
+            [[[100.0, 0.2], [0.2, 100.0]]],
+        ],
+        dtype=jnp.complex64,
+    )
+    eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(jnp.float32)
+    gap = eps[..., :, None] - eps[..., None, :]
+    p = jnp.array([[[1.0, 0.0]], [[1.0, 0.0]]], dtype=jnp.float32)
+    offdiag = jnp.reshape(1.0 - jnp.eye(2, dtype=jnp.float32), (1, 1, 2, 2))
+
+    G = _orbital_gradient(Ft, eps, gap, p, offdiag, p_floor=0.1, T=0.02, denom_scale=1e-3)
+
+    assert float(jnp.abs(G[1, 0, 0, 1])) < float(jnp.abs(G[0, 0, 0, 1]))
 
 
 def test_variational_qr_can_break_degenerate_occupancy_symmetry():
@@ -319,3 +356,69 @@ def test_variational_qr_rotation_block_sizes():
         f"rotation_block_sizes should prevent inter-block mixing; "
         f"max off-block |P| = {np.max(np.abs(offblock)):.2e}"
     )
+
+
+def test_adaptive_tau_is_per_k():
+    eps = jnp.array(
+        [
+            [[0.0, 1.0], [0.0, 4.0]],
+            [[0.0, 2.0], [0.0, 8.0]],
+        ],
+        dtype=jnp.float32,
+    )
+    gap = eps[..., :, None] - eps[..., None, :]
+
+    base = jnp.array([[0.0, 1.0], [-1.0, 0.0]], dtype=jnp.complex64)
+    scales = jnp.array([[1.0, 0.5], [2.0, 1.5]], dtype=jnp.float32)
+    G = scales[..., None, None] * base
+
+    tau = _adaptive_tau(G, eps, gap, denom_scale=1e-3, T=0.05)
+
+    assert tau.shape == eps.shape[:-1]
+    assert np.isfinite(np.array(tau)).all()
+    assert len(np.unique(np.round(np.array(tau).ravel(), 6))) > 1
+
+
+def test_blocked_qr_retraction_matches_dense_qr_for_block_diagonal_generator():
+    key = jax.random.PRNGKey(0)
+    a = jax.random.normal(key, (1, 1, 4, 4), dtype=jnp.float32)
+    b = jax.random.normal(jax.random.fold_in(key, 1), (1, 1, 4, 4), dtype=jnp.float32)
+    raw = (a + 1j * b).astype(jnp.complex64)
+
+    G = jnp.zeros_like(raw)
+    G = G.at[..., :2, :2].set(raw[..., :2, :2])
+    G = G.at[..., 2:, 2:].set(raw[..., 2:, 2:])
+    G = 0.5 * (G - jnp.conj(jnp.swapaxes(G, -1, -2)))
+
+    tau = jnp.array([[0.2]], dtype=jnp.float32)
+    block_slices = _block_slices_from_sizes((2, 2), 4)
+
+    U_dense = _qr_retraction_unitary(G, tau)
+    U_block = _qr_retraction_unitary(G, tau, block_slices=block_slices)
+
+    np.testing.assert_allclose(np.array(U_block), np.array(U_dense), rtol=1e-6, atol=1e-6)
+
+
+def test_blocked_orbital_basis_update_matches_dense_similarity():
+    key = jax.random.PRNGKey(1)
+    a = jax.random.normal(key, (1, 1, 4, 4), dtype=jnp.float32)
+    b = jax.random.normal(jax.random.fold_in(key, 1), (1, 1, 4, 4), dtype=jnp.float32)
+    Ft = (a + 1j * b).astype(jnp.complex64)
+    Ft = 0.5 * (Ft + jnp.conj(jnp.swapaxes(Ft, -1, -2)))
+
+    g_a = jax.random.normal(jax.random.fold_in(key, 2), (1, 1, 4, 4), dtype=jnp.float32)
+    g_b = jax.random.normal(jax.random.fold_in(key, 3), (1, 1, 4, 4), dtype=jnp.float32)
+    raw = (g_a + 1j * g_b).astype(jnp.complex64)
+    G = jnp.zeros_like(raw)
+    G = G.at[..., :2, :2].set(raw[..., :2, :2])
+    G = G.at[..., 2:, 2:].set(raw[..., 2:, 2:])
+    G = 0.5 * (G - jnp.conj(jnp.swapaxes(G, -1, -2)))
+
+    tau = jnp.array([[0.15]], dtype=jnp.float32)
+    block_slices = _block_slices_from_sizes((2, 2), 4)
+    U = _qr_retraction_unitary(G, tau, block_slices=block_slices)
+
+    Ft_dense = _apply_orbital_basis_update(Ft, U)
+    Ft_block = _apply_orbital_basis_update(Ft, U, block_slices=block_slices)
+
+    np.testing.assert_allclose(np.array(Ft_block), np.array(Ft_dense), rtol=1e-6, atol=1e-6)

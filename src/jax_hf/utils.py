@@ -43,6 +43,7 @@ def selfenergy_fft(
     offdiag_atol: float = 1e-12,
     offdiag_rtol: float = 0.0,
     _apply_ifftshift: bool = True,
+    hermitian_channel_packing: bool = False,
 ) -> jax.Array:
     """Exchange self-energy Σ(k) with optional block-diagonal acceleration.
 
@@ -57,16 +58,39 @@ def selfenergy_fft(
     When ``_apply_ifftshift=False`` the final ifftshift is skipped.  Use this
     together with a phase-shifted ``VR`` to avoid the data permutation in hot
     loops (the shift is absorbed into VR at construction time).
+
+    When ``hermitian_channel_packing=True``, the function assumes:
+      1) ``VR`` is scalar in orbital space with shape ``(..., 1, 1)``, and
+      2) ``P`` is Hermitian in its last two axes.
+
+    In that case only the diagonal plus upper-triangular orbital channels are
+    transformed, and the lower half is reconstructed by conjugation.  This is
+    exact for the real-scalar Coulomb kernels used by ``HartreeFockKernel`` and
+    roughly halves the FFT batch count.
     """
     VR = jnp.asarray(VR)
     P = jnp.asarray(P)
 
+    if hermitian_channel_packing and VR.shape[-2:] != (1, 1):
+        raise ValueError(
+            "hermitian_channel_packing requires a scalar interaction kernel "
+            "with shape (..., 1, 1)."
+        )
+
     if block_specs is None:
-        result = _selfenergy_fft_full(VR, P)
+        result = _selfenergy_fft_full(
+            VR,
+            P,
+            hermitian_channel_packing=hermitian_channel_packing,
+        )
     else:
         specs = normalize_block_specs(block_specs)
         if not specs:
-            result = _selfenergy_fft_full(VR, P)
+            result = _selfenergy_fft_full(
+                VR,
+                P,
+                hermitian_channel_packing=hermitian_channel_packing,
+            )
         else:
             check = bool(check_offdiag) if check_offdiag is not None else True
             result = _selfenergy_fft_block_specs(
@@ -76,6 +100,7 @@ def selfenergy_fft(
                 check_offdiag=check,
                 offdiag_atol=float(offdiag_atol),
                 offdiag_rtol=float(offdiag_rtol),
+                hermitian_channel_packing=hermitian_channel_packing,
             )
 
     if _apply_ifftshift:
@@ -83,7 +108,38 @@ def selfenergy_fft(
     return result
 
 
-def _selfenergy_fft_full(VR: jax.Array, P: jax.Array) -> jax.Array:
+def _selfenergy_fft_scalar_hermitian_channels(VR: jax.Array, P: jax.Array) -> jax.Array:
+    n = int(P.shape[-1])
+    tri_i_np, tri_j_np = np.triu_indices(n)
+    offdiag_np = tri_i_np != tri_j_np
+    flat_idx = jnp.asarray(tri_i_np * n + tri_j_np, dtype=jnp.int32)
+    P_flat = P.reshape(P.shape[:-2] + (n * n,))
+    packed = jnp.take(P_flat, flat_idx, axis=-1)
+    packed_fft = fftn(packed, axes=(0, 1))
+    VR_scalar = VR[..., 0, 0][..., None]
+    sigma_packed = -ifftn(packed_fft * VR_scalar, axes=(0, 1))
+
+    out_flat = jnp.zeros_like(P_flat)
+    out_flat = out_flat.at[..., flat_idx].set(sigma_packed)
+
+    lower_flat_idx = jnp.asarray(
+        tri_j_np[offdiag_np] * n + tri_i_np[offdiag_np],
+        dtype=jnp.int32,
+    )
+    out_flat = out_flat.at[..., lower_flat_idx].set(
+        jnp.conj(sigma_packed[..., offdiag_np])
+    )
+    return out_flat.reshape(P.shape)
+
+
+def _selfenergy_fft_full(
+    VR: jax.Array,
+    P: jax.Array,
+    *,
+    hermitian_channel_packing: bool = False,
+) -> jax.Array:
+    if hermitian_channel_packing:
+        return _selfenergy_fft_scalar_hermitian_channels(VR, P)
     P_fft = fftn(P, axes=(0, 1))
     return -ifftn(P_fft * VR, axes=(0, 1))
 
@@ -122,6 +178,8 @@ def _selfenergy_fft_block_sizes(
     VR: jax.Array,
     P: jax.Array,
     block_sizes: tuple[int, ...],
+    *,
+    hermitian_channel_packing: bool = False,
 ) -> jax.Array:
     n = int(P.shape[-1])
     if sum(int(s) for s in block_sizes) != n:
@@ -132,7 +190,11 @@ def _selfenergy_fft_block_sizes(
     for size in block_sizes:
         stop = start + int(size)
         s = slice(start, stop)
-        sigma_block = _selfenergy_fft_full(_slice_interaction(VR, s), P[..., s, s])
+        sigma_block = _selfenergy_fft_full(
+            _slice_interaction(VR, s),
+            P[..., s, s],
+            hermitian_channel_packing=hermitian_channel_packing,
+        )
         out = out.at[..., s, s].set(sigma_block)
         start = stop
     return out
@@ -142,12 +204,18 @@ def _selfenergy_fft_block_indices(
     VR: jax.Array,
     P: jax.Array,
     block_indices: tuple[tuple[int, ...], ...],
+    *,
+    hermitian_channel_packing: bool = False,
 ) -> jax.Array:
     out = jnp.zeros_like(P)
     for idx in block_indices:
         idx_j = jnp.asarray(idx, dtype=jnp.int32)
         sub = jnp.take(jnp.take(P, idx_j, axis=-2), idx_j, axis=-1)
-        sigma_block = _selfenergy_fft_full(_take_interaction(VR, idx_j), sub)
+        sigma_block = _selfenergy_fft_full(
+            _take_interaction(VR, idx_j),
+            sub,
+            hermitian_channel_packing=hermitian_channel_packing,
+        )
         out = out.at[..., idx_j[:, None], idx_j[None, :]].set(sigma_block)
     return out
 
@@ -160,6 +228,7 @@ def _selfenergy_fft_block_specs(
     check_offdiag: bool,
     offdiag_atol: float,
     offdiag_rtol: float,
+    hermitian_channel_packing: bool = False,
 ) -> jax.Array:
     n = int(P.shape[-1])
     abs_P = jnp.abs(P)
@@ -167,7 +236,11 @@ def _selfenergy_fft_block_specs(
     tol = jnp.asarray(offdiag_atol, dtype=abs_P.dtype) + jnp.asarray(offdiag_rtol, dtype=abs_P.dtype) * scale
 
     def do_full(_):
-        return _selfenergy_fft_full(VR, P)
+        return _selfenergy_fft_full(
+            VR,
+            P,
+            hermitian_channel_packing=hermitian_channel_packing,
+        )
 
     fn = do_full
 
@@ -179,7 +252,12 @@ def _selfenergy_fft_block_specs(
             ok = (jnp.max(abs_P * mask) <= tol) if check_offdiag else jnp.array(True)
 
             def do_block(_, *, _sizes=sizes):
-                return _selfenergy_fft_block_sizes(VR, P, _sizes)
+                return _selfenergy_fft_block_sizes(
+                    VR,
+                    P,
+                    _sizes,
+                    hermitian_channel_packing=hermitian_channel_packing,
+                )
 
         elif kind == "indices":
             blocks = tuple(tuple(int(i) for i in b) for b in data)
@@ -187,7 +265,12 @@ def _selfenergy_fft_block_specs(
             ok = (jnp.max(abs_P * mask) <= tol) if check_offdiag else jnp.array(True)
 
             def do_block(_, *, _blocks=blocks):
-                return _selfenergy_fft_block_indices(VR, P, _blocks)
+                return _selfenergy_fft_block_indices(
+                    VR,
+                    P,
+                    _blocks,
+                    hermitian_channel_packing=hermitian_channel_packing,
+                )
 
         else:
             raise ValueError("block_specs kind must be 'sizes' or 'indices'.")

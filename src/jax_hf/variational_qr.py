@@ -81,11 +81,11 @@ def _orbital_gradient(
     occ_scale = abs_diff / (abs_diff + p_floor)
 
     # Energy denominator preconditioning (same formula as inner solve / stationarity norm)
-    eps_scale = jnp.sqrt(jnp.mean(eps ** 2) + tiny_eps)
+    eps_scale = jnp.sqrt(jnp.mean(eps ** 2, axis=-1) + tiny_eps)
     lam = jnp.maximum(
         jnp.asarray(T, dtype=real_dtype),
         jnp.asarray(denom_scale, dtype=real_dtype) * eps_scale,
-    )
+    )[..., None, None]
     denom = jnp.sqrt(gap ** 2 + lam ** 2)
 
     G_comm = _skew_hermitian(diff * Ft / denom) * offdiag
@@ -112,36 +112,58 @@ def _adaptive_tau(
     G: jax.Array,
     eps: jax.Array,
     gap: jax.Array,
-    w_norm: jax.Array,
     denom_scale: float,
     T: float,
+    w_norm: jax.Array | None = None,
 ) -> jax.Array:
     """Rayleigh quotient step size for orbital minimization."""
     real_dtype = jnp.real(eps).dtype
 
     tiny = jnp.asarray(1e-30, dtype=real_dtype)
-    eps_scale = jnp.sqrt(jnp.mean(eps**2) + tiny)
+    eps_scale = jnp.sqrt(jnp.mean(eps**2, axis=-1) + tiny)
 
     lam = jnp.maximum(
         jnp.asarray(T, dtype=real_dtype),
         jnp.asarray(denom_scale, dtype=real_dtype) * eps_scale,
-    )
+    )[..., None, None]
 
     G2 = jnp.abs(G)**2
-    pair_weights = w_norm[..., None, None]
+    if w_norm is None:
+        pair_weights = jnp.asarray(1.0, dtype=real_dtype)
+    else:
+        pair_weights = w_norm[..., None, None]
 
     # G is the preconditioned gradient (D = G_raw / denom).
     # The true directional gradient evaluated along D is sum(G_raw * D) = sum(|D|^2 * denom).
     denom = jnp.sqrt(gap**2 + lam**2)
-    num = jnp.sum(pair_weights * G2 * denom)
+    num = jnp.sum(pair_weights * G2 * denom, axis=(-2, -1))
 
     # The curvature evaluated along D is sum(|D|^2 * (|gap| + lam))
-    den = jnp.sum(pair_weights * G2 * (jnp.abs(gap) + lam))
+    den = jnp.sum(pair_weights * G2 * (jnp.abs(gap) + lam), axis=(-2, -1))
 
     tau = num / (den + tiny)
     return tau
 
-def _qr_retraction_unitary(G: jax.Array, tau: jax.Array) -> jax.Array:
+
+def _block_slices_from_sizes(block_sizes: tuple[int, ...], n: int) -> tuple[slice, ...]:
+    if sum(int(size) for size in block_sizes) != int(n):
+        raise ValueError(f"rotation_block_sizes must sum to {n}, got {block_sizes!r}.")
+
+    start = 0
+    slices: list[slice] = []
+    for size in block_sizes:
+        stop = start + int(size)
+        slices.append(slice(start, stop))
+        start = stop
+    return tuple(slices)
+
+
+def _qr_retraction_unitary(
+    G: jax.Array,
+    tau: jax.Array,
+    *,
+    block_slices: tuple[slice, ...] | None = None,
+) -> jax.Array:
     """
     Orbital-basis QR retraction unitary U = QR(I - tau*G).
 
@@ -149,19 +171,52 @@ def _qr_retraction_unitary(G: jax.Array, tau: jax.Array) -> jax.Array:
     Normalize the column phases so diag(R) is real and non-negative.
     """
     tiny = jnp.asarray(1e-30, dtype=jnp.real(G).dtype)
+    tau_bc = jnp.asarray(tau, dtype=jnp.real(G).dtype)[..., None, None]
     n = G.shape[-1]
-    eye = jnp.eye(n, dtype=G.dtype)
-    U_trial = eye - tau * G
-    U, R = jnp.linalg.qr(U_trial)
 
-    phases = jnp.diagonal(R, axis1=-2, axis2=-1)
-    phase_norm = jnp.where(jnp.abs(phases) > tiny, phases / jnp.abs(phases), jnp.ones_like(phases))
-    return U * phase_norm[..., None, :]
+    def _normalize_qr_columns(U: jax.Array, R: jax.Array) -> jax.Array:
+        phases = jnp.diagonal(R, axis1=-2, axis2=-1)
+        phase_norm = jnp.where(
+            jnp.abs(phases) > tiny,
+            phases / jnp.abs(phases),
+            jnp.ones_like(phases),
+        )
+        return U * phase_norm[..., None, :]
 
-def _apply_orbital_basis_update(Ft: jax.Array, U: jax.Array) -> jax.Array:
+    if block_slices is None or len(block_slices) <= 1:
+        U_trial = jnp.eye(n, dtype=G.dtype) - tau_bc * G
+        U, R = jnp.linalg.qr(U_trial)
+        return _normalize_qr_columns(U, R)
+
+    out = jnp.zeros_like(G)
+    for s in block_slices:
+        size = int(s.stop - s.start)
+        U_block, R_block = jnp.linalg.qr(
+            jnp.eye(size, dtype=G.dtype) - tau_bc * G[..., s, s]
+        )
+        out = out.at[..., s, s].set(_normalize_qr_columns(U_block, R_block))
+    return out
+
+
+def _apply_orbital_basis_update(
+    Ft: jax.Array,
+    U: jax.Array,
+    *,
+    block_slices: tuple[slice, ...] | None = None,
+) -> jax.Array:
     """Update Ft in orbital basis under the right-unitary rotation U."""
-    U_dag = U.conj().swapaxes(-1, -2)
-    return U_dag @ Ft @ U
+    if block_slices is None or len(block_slices) <= 1:
+        U_dag = U.conj().swapaxes(-1, -2)
+        return U_dag @ Ft @ U
+
+    out = jnp.zeros_like(Ft)
+    for s_row in block_slices:
+        U_row_dag = U[..., s_row, s_row].conj().swapaxes(-1, -2)
+        for s_col in block_slices:
+            out = out.at[..., s_row, s_col].set(
+                U_row_dag @ Ft[..., s_row, s_col] @ U[..., s_col, s_col]
+            )
+    return out
 
 def _backtracking_qr_energy(
     Ft: jax.Array,
@@ -304,7 +359,7 @@ def _frozenF_inner_solve_qr(
             if rot_mask is not None:
                 G_step = G_step * rot_mask
 
-            tau = _adaptive_tau(G_step, eps_q, gap_q, w_norm, float(denom_scale), T)
+            tau = _adaptive_tau(G_step, eps_q, gap_q, float(denom_scale), T, w_norm)
 
             gen_norm = jnp.sqrt(jnp.sum(jnp.abs(G_step) ** 2, axis=(-2, -1)) + tiny_eps)
             eff_norm = tau * gen_norm
@@ -341,7 +396,7 @@ def _frozenF_inner_solve_qr(
 
             H_new = G_new + beta * H_prev
 
-            tau = _adaptive_tau(H_new, eps_q, gap_q, w_norm, float(denom_scale), T)
+            tau = _adaptive_tau(H_new, eps_q, gap_q, float(denom_scale), T, w_norm)
 
             gen_norm = jnp.sqrt(jnp.sum(jnp.abs(H_new) ** 2, axis=(-2, -1)) + tiny_eps)
             eff_norm = tau * gen_norm
@@ -384,6 +439,7 @@ def variational_qr_optimize(
     HH: jax.Array,
     include_hartree: bool,
     include_exchange: bool,
+    exchange_hermitian_channel_packing: bool,
 
     # outer loop controls
     max_iter: int = 80,
@@ -401,7 +457,7 @@ def variational_qr_optimize(
     bt_shrink: float = 0.5,
     bt_max: int = 5,
     mu_maxiter: int = 25,
-    mu_tol: float = 1e-12,
+    mu_tol: float = 1e-9,
     line_search: bool = False,
 
     # rotation constraint (optional)
@@ -496,6 +552,7 @@ def variational_qr_optimize(
             h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange,
             include_hartree=include_hartree,
+            exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
             exchange_block_specs=exchange_block_specs,
             exchange_check_offdiag=exchange_check_offdiag,
             exchange_offdiag_atol=exchange_offdiag_atol,
@@ -596,6 +653,7 @@ def variational_qr_optimize(
             h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange,
             include_hartree=include_hartree,
+            exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
             exchange_block_specs=exchange_block_specs,
             exchange_check_offdiag=exchange_check_offdiag,
             exchange_offdiag_atol=exchange_offdiag_atol,
@@ -638,6 +696,7 @@ def jit_variational_qr_iteration(hf_step):
             "line_search",
             "rotation_block_sizes",
             "include_hartree", "include_exchange",
+            "exchange_hermitian_channel_packing",
             "exchange_block_specs", "exchange_check_offdiag",
             "exchange_offdiag_atol", "exchange_offdiag_rtol",
             "project_fn",
