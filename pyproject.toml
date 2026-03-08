@@ -54,3 +54,6 @@ license-files = [
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

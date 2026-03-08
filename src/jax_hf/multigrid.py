@@ -35,6 +35,7 @@ def coarse_to_fine_scf(
     P0_f: jax.Array,
     electrondensity0: float,
     T: float,
+    T_coarse: float | None = None,
     nk_coarse: int | None = None,
     resample_method: str = "linear",
     include_hartree: bool = False,
@@ -122,11 +123,12 @@ def coarse_to_fine_scf(
         else None
     )
 
+    T_c = float(T_coarse) if T_coarse is not None else float(T)
     kernel_c = HartreeFockKernel(
         weights=weights_c,
         hamiltonian=hamiltonian_c,
         coulomb_q=coulomb_q_c,
-        T=float(T),
+        T=T_c,
         include_hartree=bool(include_hartree),
         include_exchange=bool(include_exchange),
         reference_density=reference_density_c,
@@ -217,6 +219,7 @@ def coarse_to_fine_variational(
     P0_f: jax.Array,
     electrondensity0: float,
     T: float,
+    T_coarse: float | None = None,
     nk_coarse: int | None = None,
     resample_method: str = "linear",
     include_hartree: bool = False,
@@ -320,11 +323,12 @@ def coarse_to_fine_variational(
         resample_method=resample_method,
     )
 
+    T_c = float(T_coarse) if T_coarse is not None else float(T)
     kernel_c = HartreeFockKernel(
         weights=weights_c,
         hamiltonian=hamiltonian_c,
         coulomb_q=coulomb_q_c,
-        T=float(T),
+        T=T_c,
         include_hartree=bool(include_hartree),
         include_exchange=bool(include_exchange),
         reference_density=reference_density_c,
@@ -359,4 +363,3 @@ def coarse_to_fine_variational(
         fine=fine,
         P0_seed_f=P0_seed_f,
     )
-

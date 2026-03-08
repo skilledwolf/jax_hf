@@ -443,8 +443,8 @@ def variational_qr_optimize(
 
     # outer loop controls
     max_iter: int = 80,
-    comm_tol: float = 5e-4,
-    p_tol: float = 5e-6,
+    comm_tol: float = 1e-5,
+    p_tol: float = 1e-2,
     e_tol: float = 0.0,
 
     # inner loop (frozen-F) controls
