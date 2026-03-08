@@ -30,7 +30,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .linalg import normalize_block_specs
 from .variational import (
     VariationalHFParams,
     _adjust_params_particle_number,
@@ -147,7 +146,7 @@ def _adaptive_tau(
 
 def _block_slices_from_sizes(block_sizes: tuple[int, ...], n: int) -> tuple[slice, ...]:
     if sum(int(size) for size in block_sizes) != int(n):
-        raise ValueError(f"rotation_block_sizes must sum to {n}, got {block_sizes!r}.")
+        raise ValueError(f"block_sizes must sum to {n}, got {block_sizes!r}.")
 
     start = 0
     slices: list[slice] = []
@@ -156,6 +155,15 @@ def _block_slices_from_sizes(block_sizes: tuple[int, ...], n: int) -> tuple[slic
         slices.append(slice(start, stop))
         start = stop
     return tuple(slices)
+
+
+def _exchange_block_specs_from_block_sizes(
+    block_sizes: tuple[int, ...] | None,
+) -> tuple[tuple[str, tuple[Any, ...]], ...] | None:
+    """Build the exchange FFT block spec corresponding to the shared QR block sizes."""
+    if block_sizes is None:
+        return None
+    return (("sizes", tuple(int(size) for size in block_sizes)),)
 
 
 def _qr_retraction_unitary(
@@ -218,6 +226,22 @@ def _apply_orbital_basis_update(
             )
     return out
 
+
+def _apply_right_unitary(
+    X: jax.Array,
+    U: jax.Array,
+    *,
+    block_slices: tuple[slice, ...] | None = None,
+) -> jax.Array:
+    """Apply a right-unitary update X' = X U, exploiting block-diagonal U when available."""
+    if block_slices is None or len(block_slices) <= 1:
+        return X @ U
+
+    out = jnp.zeros_like(X)
+    for s in block_slices:
+        out = out.at[..., :, s].set(X[..., :, s] @ U[..., s, s])
+    return out
+
 def _backtracking_qr_energy(
     Ft: jax.Array,
     G: jax.Array,
@@ -228,6 +252,7 @@ def _backtracking_qr_energy(
     accept_ratio: float,
     shrink: float,
     max_backtrack: int,
+    block_slices: tuple[slice, ...] | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """
     Try tau = tau0, tau0*shrink, ... until the frozen-F energy does not increase.
@@ -250,8 +275,8 @@ def _backtracking_qr_energy(
     def body(state):
         i, tau, accepted, Ft_best, U_best = state
 
-        U_trial = _qr_retraction_unitary(G, tau)
-        Ft_trial = _apply_orbital_basis_update(Ft, U_trial)
+        U_trial = _qr_retraction_unitary(G, tau, block_slices=block_slices)
+        Ft_trial = _apply_orbital_basis_update(Ft, U_trial, block_slices=block_slices)
 
         E_trial = _frozen_F_energy(Ft_trial, p, w_norm)
         ok = E_trial <= E0 + energy_tol
@@ -301,7 +326,7 @@ def _frozenF_inner_solve_qr(
     mu_maxiter: int,
     mu_tol: float,
     line_search: bool,
-    rotation_block_sizes: tuple[int, ...] | None = None,
+    block_sizes: tuple[int, ...] | None = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Cheap inner solve with F frozen, using QR-retraction orbital updates.
@@ -320,8 +345,10 @@ def _frozenF_inner_solve_qr(
 
     # Build rotation block mask (None → unrestricted).
     rot_mask: jax.Array | None = None
-    if rotation_block_sizes is not None:
-        rot_mask = _rotation_mask_from_block_sizes(rotation_block_sizes, n, real_dtype)
+    block_slices: tuple[slice, ...] | None = None
+    if block_sizes is not None:
+        rot_mask = _rotation_mask_from_block_sizes(block_sizes, n, real_dtype)
+        block_slices = _block_slices_from_sizes(block_sizes, n)
 
     def take_step(Ft_q: jax.Array, direction: jax.Array, p_q: jax.Array, tau: jax.Array) -> Tuple[jax.Array, jax.Array]:
         if line_search and bt_max > 0:
@@ -334,10 +361,11 @@ def _frozenF_inner_solve_qr(
                 accept_ratio=float(bt_accept),
                 shrink=float(bt_shrink),
                 max_backtrack=int(bt_max),
+                block_slices=block_slices,
             )
         else:
-            U = _qr_retraction_unitary(direction, tau)
-            Ft_new = _apply_orbital_basis_update(Ft_q, U)
+            U = _qr_retraction_unitary(direction, tau, block_slices=block_slices)
+            Ft_new = _apply_orbital_basis_update(Ft_q, U, block_slices=block_slices)
         return Ft_new, U
 
     def inner_sweep(_, state):
@@ -367,7 +395,7 @@ def _frozenF_inner_solve_qr(
             G_step = G_step * clip_scale[..., None, None]
 
             Ft_s, U_step = take_step(Ft_s, G_step, p_s, tau)
-            return (Q_s @ U_step, Ft_s, p_s, mu_s)
+            return (_apply_right_unitary(Q_s, U_step, block_slices=block_slices), Ft_s, p_s, mu_s)
 
         # 2) Q sweeps via QR retraction (with optional Riemannian PR conjugate gradients)
         H_zero = jnp.zeros_like(Ft_s)
@@ -404,16 +432,15 @@ def _frozenF_inner_solve_qr(
             H_step = H_new * clip_scale[..., None, None]
 
             Ft_new, U = take_step(Ft_q, H_step, p_s, tau)
-            U_total = U_total @ U
+            U_total = _apply_right_unitary(U_total, U, block_slices=block_slices)
 
-            U_dag = U.conj().swapaxes(-1, -2)
-            G_trans = U_dag @ G_new @ U
-            H_trans = U_dag @ H_new @ U
+            G_trans = _apply_orbital_basis_update(G_new, U, block_slices=block_slices)
+            H_trans = _apply_orbital_basis_update(H_new, U, block_slices=block_slices)
 
             return (Ft_new, U_total, G_trans, H_trans)
 
         Ft_s, U_total, _, _ = lax.fori_loop(0, int(q_sweeps), q_sweep, (Ft_s, eye_u, H_zero, H_zero))
-        Q_s = Q_s @ U_total
+        Q_s = _apply_right_unitary(Q_s, U_total, block_slices=block_slices)
         return (Q_s, Ft_s, p_s, mu_s)
 
     Q_out, _, p_out, mu_out = lax.fori_loop(0, int(inner_sweeps), inner_sweep, (Q, Ft0, p, mu))
@@ -460,11 +487,10 @@ def variational_qr_optimize(
     mu_tol: float = 1e-9,
     line_search: bool = False,
 
-    # rotation constraint (optional)
-    rotation_block_sizes: tuple[int, ...] | None = None,
+    # shared QR/exchange block structure (optional)
+    block_sizes: tuple[int, ...] | None = None,
 
     # exchange knobs (optional)
-    exchange_block_specs: Any | None = None,
     exchange_check_offdiag: bool | None = None,
     exchange_offdiag_atol: float = 1e-12,
     exchange_offdiag_rtol: float = 0.0,
@@ -481,6 +507,7 @@ def variational_qr_optimize(
     Returns:
       P_fin, F_fin, E_fin, mu_fin, n_iter, history, params_fin
     """
+    exchange_block_specs = _exchange_block_specs_from_block_sizes(block_sizes)
     target_dtype = h.dtype
     real_dtype = jnp.zeros((), dtype=target_dtype).real.dtype
 
@@ -609,7 +636,7 @@ def variational_qr_optimize(
                     mu_maxiter=int(mu_maxiter),
                     mu_tol=float(mu_tol),
                     line_search=bool(line_search),
-                    rotation_block_sizes=rotation_block_sizes,
+                    block_sizes=block_sizes,
                 )
 
             def occ_only_update(inner_args):
@@ -694,10 +721,10 @@ def jit_variational_qr_iteration(hf_step):
             "bt_accept", "bt_shrink", "bt_max",
             "mu_maxiter", "mu_tol",
             "line_search",
-            "rotation_block_sizes",
+            "block_sizes",
             "include_hartree", "include_exchange",
             "exchange_hermitian_channel_packing",
-            "exchange_block_specs", "exchange_check_offdiag",
+            "exchange_check_offdiag",
             "exchange_offdiag_atol", "exchange_offdiag_rtol",
             "project_fn",
         ),
@@ -737,8 +764,16 @@ def jit_variational_qr_iteration(hf_step):
                 weight_sum=hf_step.weight_sum,
             )
 
-        if kwargs.get("exchange_block_specs") is not None:
-            kwargs["exchange_block_specs"] = normalize_block_specs(kwargs["exchange_block_specs"])
+        legacy_block_kwargs = tuple(
+            key for key in ("rotation_block_sizes", "exchange_block_specs") if key in kwargs
+        )
+        if legacy_block_kwargs:
+            raise TypeError(
+                "The QR solver now uses a single shared `block_sizes` kwarg; "
+                f"remove legacy kwargs {legacy_block_kwargs!r}."
+            )
+        if kwargs.get("block_sizes") is not None:
+            kwargs["block_sizes"] = tuple(int(size) for size in kwargs["block_sizes"])
 
         P_fin, F_fin, E_fin, mu_fin, n_iter, history, params_fin = compiled(
             params0_local,

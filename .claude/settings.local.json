@@ -48,7 +48,8 @@
       "Bash(pip install joblib multiprocess)",
       "Bash(python -c \"import contimod; print\\(''OK''\\)\")",
       "Bash(/Users/wolft/anaconda3/envs/contimod_env/bin/python -c \"import contimod; print\\(''contimod OK''\\); from jax_hf.variational_qr import jit_variational_qr_iteration; print\\(''qr OK''\\)\")",
-      "Bash(/Users/wolft/anaconda3/envs/contimod_env/bin/python test_quotr2.py)"
+      "Bash(/Users/wolft/anaconda3/envs/contimod_env/bin/python test_quotr2.py)",
+      "Bash(ls test_*.py /Users/wolft/Dev/jax_hf/)"
     ]
   }
 }

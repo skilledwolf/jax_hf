@@ -14,7 +14,9 @@ from jax_hf.variational import (
 )
 from jax_hf.variational_qr import _adaptive_tau
 from jax_hf.variational_qr import _apply_orbital_basis_update
+from jax_hf.variational_qr import _apply_right_unitary
 from jax_hf.variational_qr import _block_slices_from_sizes
+from jax_hf.variational_qr import _exchange_block_specs_from_block_sizes
 from jax_hf.variational_qr import _orbital_gradient
 from jax_hf.variational_qr import _qr_retraction_unitary
 
@@ -49,7 +51,7 @@ def test_variational_qr_smoke_conserves_density_and_supports_param_reuse():
         p_tol=1e-6,
         return_params=True,
         init_method="identity",
-        exchange_block_specs=[{"block_sizes": [1, 1]}],
+        block_sizes=(1, 1),
         exchange_check_offdiag=True,
     )
 
@@ -319,8 +321,8 @@ def test_variational_qr_stops_before_max_iter():
     assert float(history["dP"][last]) <= p_tol
 
 
-def test_variational_qr_rotation_block_sizes():
-    """rotation_block_sizes=(2,2) must keep P block-diagonal if started so."""
+def test_variational_qr_block_sizes():
+    """block_sizes=(2,2) must keep P block-diagonal if started so."""
     nk1, nk2, nb = 1, 1, 4
     h_block = np.zeros((nk1, nk2, nb, nb), dtype=np.complex64)
     h_block[0, 0, :2, :2] = np.array([[-1.0, 0.3], [0.3, 1.0]])
@@ -348,12 +350,12 @@ def test_variational_qr_rotation_block_sizes():
         max_iter=60,
         comm_tol=1e-6,
         p_tol=1e-6,
-        rotation_block_sizes=(2, 2),
+        block_sizes=(2, 2),
     )
     P_arr = np.array(P_fin[0, 0])
     offblock = np.concatenate([P_arr[:2, 2:].ravel(), P_arr[2:, :2].ravel()])
     assert np.max(np.abs(offblock)) < 1e-10, (
-        f"rotation_block_sizes should prevent inter-block mixing; "
+        f"block_sizes should prevent inter-block mixing; "
         f"max off-block |P| = {np.max(np.abs(offblock)):.2e}"
     )
 
@@ -377,6 +379,34 @@ def test_adaptive_tau_is_per_k():
     assert tau.shape == eps.shape[:-1]
     assert np.isfinite(np.array(tau)).all()
     assert len(np.unique(np.round(np.array(tau).ravel(), 6))) > 1
+
+
+def test_qr_exchange_block_specs_follow_block_sizes():
+    specs = _exchange_block_specs_from_block_sizes((2, 2))
+    assert specs == (("sizes", (2, 2)),)
+
+
+def test_variational_qr_rejects_legacy_duplicate_block_kwargs():
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+    hamiltonian = jnp.array([[[[-0.5, 0.0], [0.0, 0.5]]]], dtype=jnp.complex64)
+    coulomb_q = jnp.array([[[[0.25]]]], dtype=jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.2,
+        include_hartree=False,
+        include_exchange=True,
+    )
+    runner = jax_hf.jit_variational_qr_iteration(kernel)
+    P0 = jnp.array([[[[0.6, 0.0], [0.0, 0.4]]]], dtype=jnp.complex64)
+
+    with pytest.raises(TypeError, match="single shared `block_sizes` kwarg"):
+        runner(P0, electrondensity0=1.0, rotation_block_sizes=(1, 1))
+
+    with pytest.raises(TypeError, match="single shared `block_sizes` kwarg"):
+        runner(P0, electrondensity0=1.0, exchange_block_specs=[{"block_sizes": [1, 1]}])
 
 
 def test_blocked_qr_retraction_matches_dense_qr_for_block_diagonal_generator():
@@ -422,3 +452,27 @@ def test_blocked_orbital_basis_update_matches_dense_similarity():
     Ft_block = _apply_orbital_basis_update(Ft, U, block_slices=block_slices)
 
     np.testing.assert_allclose(np.array(Ft_block), np.array(Ft_dense), rtol=1e-6, atol=1e-6)
+
+
+def test_blocked_right_unitary_matches_dense_product():
+    key = jax.random.PRNGKey(4)
+    a = jax.random.normal(key, (1, 1, 6, 4), dtype=jnp.float32)
+    b = jax.random.normal(jax.random.fold_in(key, 1), (1, 1, 6, 4), dtype=jnp.float32)
+    X = (a + 1j * b).astype(jnp.complex64)
+
+    g_a = jax.random.normal(jax.random.fold_in(key, 2), (1, 1, 4, 4), dtype=jnp.float32)
+    g_b = jax.random.normal(jax.random.fold_in(key, 3), (1, 1, 4, 4), dtype=jnp.float32)
+    raw = (g_a + 1j * g_b).astype(jnp.complex64)
+    G = jnp.zeros_like(raw)
+    G = G.at[..., :2, :2].set(raw[..., :2, :2])
+    G = G.at[..., 2:, 2:].set(raw[..., 2:, 2:])
+    G = 0.5 * (G - jnp.conj(jnp.swapaxes(G, -1, -2)))
+
+    tau = jnp.array([[0.1]], dtype=jnp.float32)
+    block_slices = _block_slices_from_sizes((2, 2), 4)
+    U = _qr_retraction_unitary(G, tau, block_slices=block_slices)
+
+    X_dense = _apply_right_unitary(X, U)
+    X_block = _apply_right_unitary(X, U, block_slices=block_slices)
+
+    np.testing.assert_allclose(np.array(X_block), np.array(X_dense), rtol=1e-6, atol=1e-6)
