@@ -273,7 +273,9 @@ def coarse_to_fine_variational(
     elif solver == "qr":
         _make_runner = jit_variational_qr_iteration
     else:
-        raise ValueError(f"Unknown solver {solver!r}; expected 'cayley' or 'qr'")
+        raise ValueError(
+            f"Unknown solver {solver!r}; expected 'cayley' or 'qr'"
+        )
 
     coarse_var_kwargs = dict(coarse_var_kwargs or {})
     fine_var_kwargs = dict(fine_var_kwargs or {})

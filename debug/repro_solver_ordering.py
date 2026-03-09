@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 
 import contimod as cm
+import contimod_graphene.symmetry as cg_symmetry
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,7 +17,7 @@ from contimod.utils.spectrum_fermi import FermiParams
 from jax import config
 
 from jax_hf.main import HartreeFockKernel
-from jax_hf.symmetry import make_project_fn, make_svp_project_fn
+from jax_hf.symmetry import make_project_fn
 from jax_hf.variational import jit_variational_hartreefock_iteration
 
 config.update("jax_enable_x64", True)
@@ -47,7 +48,7 @@ Vq = np.asarray(Vq.magnitude)[..., None, None]
 identity_op = np.asarray(H.identity)
 s1, s2, s3 = [np.asarray(H.spin_op(i)) for i in (1, 2, 3)]
 v1, v3 = np.asarray(H.valley_op(1)), np.asarray(H.valley_op(3))
-U_tr = v1 @ (1j * s2)
+U_tr = cg_symmetry.make_time_reversal_U(s2, v1)
 
 projector_sv = 0.25 * (identity_op + s3) @ (identity_op + v3)
 sv_contrast = -projector_sv + 3.0 * (identity_op - projector_sv)
@@ -58,16 +59,13 @@ seeds = {
 }
 
 # ---- Projections ----
-G_pm = jnp.stack(
-    [jnp.asarray(S @ V) for S in [identity_op, s1, s2, s3] for V in [identity_op, v3]],
-    axis=0,
-)
+G_pm = cg_symmetry.make_pm_group(identity_op, s1, s2, s3, v3)
 project_fn_pm = make_project_fn(
     unitary_group=G_pm,
     time_reversal_U=jnp.asarray(U_tr),
     time_reversal_k_convention="flip",
 )
-project_fn_svp = make_svp_project_fn(
+project_fn_svp = cg_symmetry.make_svp_project_fn(
     s3=jnp.asarray(s3),
     v3=jnp.asarray(v3),
     n_orb=4,

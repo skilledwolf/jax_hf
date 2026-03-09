@@ -24,7 +24,6 @@ from .variational_qr import (  # noqa: F401
     jit_variational_qr_iteration,
     variational_qr_optimize,
 )
-
 # Minimal utils shim to aid migration
 from . import utils  # noqa: F401
 from .multigrid import (  # noqa: F401
@@ -44,7 +43,7 @@ __all__ = [
     "init_variational_params_from_density",
     "variational_hartreefock_optimize",
     "jit_variational_hartreefock_iteration",
-"utils",
+    "utils",
     "HFRunResult",
     "MultigridHFResult",
     "MultigridVariationalResult",

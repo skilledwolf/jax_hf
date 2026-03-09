@@ -142,4 +142,3 @@ def test_coarse_to_fine_variational_runs(solver):
         P_fin, np.conj(np.swapaxes(P_fin, -1, -2)), atol=1e-6,
     )
     assert np.isfinite(np.array(out.fine.energy)).all()
-
