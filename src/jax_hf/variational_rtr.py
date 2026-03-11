@@ -35,6 +35,7 @@ from .variational import (
     _rotation_mask_from_block_sizes,
     _skew_hermitian,
     _solve_mu_fd_newton_bracket,
+    _stationarity_norm,
     _weighted_rms_vec,
     init_variational_params_from_density,
 )
@@ -274,6 +275,7 @@ def variational_rtr_optimize(
     max_cg_iter: int = 3,
     cg_tol: float = 1e-2,
     max_rot: float = 0.60,
+    p_floor: float = 0.10,
     denom_scale: float = 1e-3,
     mu_maxiter: int = 25,
     mu_tol: float = 1e-9,
@@ -317,17 +319,23 @@ def variational_rtr_optimize(
     rot_mask = _rotation_mask_from_block_sizes(block_sizes, n, real_dtype) if block_sizes else None
     block_slices = _block_slices_from_sizes(block_sizes, n) if block_sizes else None
 
-    # Pre-step: diagonalize Fock matrix in the orbital basis to break
-    # degenerate-occupation symmetry.  When all p_i are equal, P = p*I is
-    # rotation-invariant, so the RTR gradient is zero.  Rotating Q into the
-    # Fock eigenbasis makes the orbital energies distinct and allows the
-    # subsequent occupation update to lift the degeneracy.
-    #
-    # IMPORTANT: skip the pre-step when a symmetry projection is active.
-    # The global eigh reorders eigenvectors by eigenvalue, which mixes
-    # symmetry sectors when eigenvalues are degenerate across flavors
-    # (e.g. 3 identical flavors in SVP).  The inner-loop preconditioned
-    # gradient already handles the degenerate-occupation case smoothly.
+    # Jacobi-fallback constants: when occupations are (nearly) degenerate,
+    # the commutator gradient (p_j - p_i) * Ft_ij vanishes.  A Jacobi-angle
+    # direction drives Q toward diagonalising Ft in those subspaces,
+    # mirroring the QR solver's _orbital_gradient interpolation.
+    p_floor_r = jnp.asarray(p_floor, dtype=real_dtype)
+    tiny_jac = jnp.asarray(1e-16, dtype=real_dtype)
+    tiny_gap = jnp.asarray(1e-12, dtype=real_dtype)
+    orb_idx = jnp.arange(n, dtype=real_dtype)
+    pair_sign = jnp.sign(orb_idx[None, :] - orb_idx[:, None])
+    pair_sign = jnp.where(pair_sign == 0.0, 1.0, pair_sign)
+    offdiag_mask = 1.0 - jnp.eye(n, dtype=real_dtype)
+
+    # Pre-step: diagonalise Fock in the orbital basis to break degenerate-
+    # occupation symmetry.  Only used when no symmetry projection is active;
+    # with project_fn the global eigh reorders eigenvectors by eigenvalue,
+    # mixing symmetry sectors (e.g. 3 identical flavors in SVP).  In that
+    # case the Jacobi fallback in the inner loop handles the degeneracy.
     if project_fn is None:
         P_pre = _project(_density_from_Qp(Q0, p0))
         _Sig_pre, _H_pre, F_pre = _build_sigma_hartree(
@@ -419,9 +427,11 @@ def variational_rtr_optimize(
         Ft_cur = _fock_in_orbital_basis(Q, F_cur)
         eps_cur = jnp.real(jnp.diagonal(Ft_cur, axis1=-2, axis2=-1)).astype(real_dtype)
 
-        # Commutator-only self-consistency metric (excludes the Jacobi-gauge
-        # term for degenerate subspaces that the RTR gradient cannot address).
-        dC = _commutator_norm(Ft_cur, p, w_norm, T, float(denom_scale))
+        # Self-consistency metric including both commutator gradient and
+        # Jacobi-gauge term for degenerate-occupation subspaces.
+        dC = _stationarity_norm(
+            Ft_cur, p, w_norm, float(p_floor), T, float(denom_scale),
+        )
 
         # ----- Occupation update at fixed orbitals -----
         mu_work = _solve_mu_fd_newton_bracket(
@@ -451,21 +461,36 @@ def variational_rtr_optimize(
         else:
             Ft_diag = Ft_cur
 
-        # Analytical Riemannian gradient.
+        # Analytical Riemannian gradient with Jacobi fallback.
+        # Non-degenerate pairs use the commutator gradient G = (p_j-p_i)*Ft,
+        # preconditioned by the Hessian diagonal.  Degenerate pairs (p_i≈p_j)
+        # use the Jacobi rotation angle that drives Q toward diagonalising Ft.
+        # Interpolated via occ_scale = |diff_p|/(|diff_p|+p_floor).
         diff_p = p_work[..., None, :] - p_work[..., :, None]
+        abs_diff_p = jnp.abs(diff_p)
+        occ_scale = abs_diff_p / (abs_diff_p + p_floor_r)
+
+        # Commutator gradient norm (for outer-loop dC metric, unchanged).
         G0 = _project_tangent(diff_p * Ft_diag, rot_mask=rot_mask)
         grad_norm = jnp.sqrt(jnp.maximum(0.0, _inner_product_w(G0, G0, w_norm)))
 
+        # Jacobi contribution norm: off-diagonal |Ft| in degenerate subspaces.
+        jac_contrib = (1.0 - occ_scale) * jnp.abs(Ft_diag) * offdiag_mask
+        jac_norm = jnp.sqrt(jnp.maximum(
+            0.0, jnp.sum(w_norm[..., None, None] * jac_contrib ** 2),
+        ))
+        total_grad_norm = grad_norm + jac_norm
+
         def do_tr_step(_):
             # Inner preconditioned-gradient loop on the frozen-Fock
-            # energy at fixed occupations p_work.  Each step uses the
-            # diagonal Newton direction s = -G/|h| ≈ Jacobi rotation
-            # angle, which typically converges in 1-2 steps.
-            inner_tol = jnp.asarray(cg_tol, dtype=real_dtype) * grad_norm
+            # energy at fixed occupations p_work.  Each step interpolates
+            # the preconditioned commutator direction (non-degenerate pairs)
+            # with the Jacobi rotation angle (degenerate pairs).
+            inner_tol = jnp.asarray(cg_tol, dtype=real_dtype) * total_grad_norm
 
             def inner_cond(carry):
-                i, _Q_i, _Ft_i, g_norm_i = carry
-                return jnp.logical_and(i < max_cg_iter, g_norm_i > inner_tol)
+                i, _Q_i, _Ft_i, s_norm_prev = carry
+                return jnp.logical_and(i < max_cg_iter, s_norm_prev > inner_tol)
 
             def inner_body(carry):
                 i, Q_i, Ft_i, _ = carry
@@ -479,15 +504,8 @@ def variational_rtr_optimize(
                             Ft_i[..., sl, sl]
                         )
 
-                # Analytical gradient: G_ij = (p_j - p_i) Ft_ij.
-                G_i = _project_tangent(diff_p * Ft_work_i, rot_mask=rot_mask)
-                g_sq_i = _inner_product_w(G_i, G_i, w_norm)
-                g_norm_i = jnp.sqrt(jnp.maximum(0.0, g_sq_i))
-
-                # Preconditioned gradient (diagonal Newton step).
-                # d_ij = |diff_p * gap| is the Hessian diagonal;
-                # s = -G/d gives the Jacobi rotation angle per element,
-                # converging the frozen-F in very few steps.
+                # --- Commutator step (non-degenerate pairs) ---
+                G_comm_i = diff_p * Ft_work_i
                 eps_i = jnp.real(
                     jnp.diagonal(Ft_i, axis1=-2, axis2=-1)
                 )
@@ -496,12 +514,39 @@ def variational_rtr_optimize(
                 d_i = jnp.maximum(
                     jnp.abs(diff_p * gap_i), T_reg * T_reg
                 )
-                s_i = _project_tangent(-G_i / d_i, rot_mask=rot_mask)
+                s_comm_i = _project_tangent(
+                    -G_comm_i / d_i, rot_mask=rot_mask
+                )
 
-                # Clamp step norm to max_rot.
+                # --- Jacobi step (degenerate pairs) ---
+                gap_ji = -gap_i
+                abs_Ft_i = jnp.abs(Ft_work_i)
+                safe_gap_ji = jnp.where(
+                    jnp.abs(gap_ji) < tiny_gap,
+                    tiny_gap * pair_sign,
+                    gap_ji,
+                )
+                theta_i = 0.5 * jnp.arctan(
+                    2.0 * abs_Ft_i / safe_gap_ji
+                )
+                phase_i = jnp.where(
+                    abs_Ft_i > tiny_jac,
+                    Ft_work_i / abs_Ft_i,
+                    jnp.zeros_like(Ft_work_i),
+                )
+                s_jac_i = _project_tangent(
+                    theta_i * phase_i, rot_mask=rot_mask
+                )
+
+                # --- Interpolated step ---
+                s_i = occ_scale * s_comm_i + (1.0 - occ_scale) * s_jac_i
+
+                # Unclamped step norm (for convergence check).
                 s_norm_i = jnp.sqrt(
                     jnp.maximum(0.0, _inner_product_w(s_i, s_i, w_norm))
                 )
+
+                # Clamp step norm to max_rot.
                 alpha = jnp.minimum(
                     1.0,
                     max_rot_r / jnp.maximum(1e-30, s_norm_i),
@@ -531,9 +576,9 @@ def variational_rtr_optimize(
                         @ U_i
                     )
 
-                return (i + 1, Q_new, Ft_new, g_norm_i)
+                return (i + 1, Q_new, Ft_new, s_norm_i)
 
-            init_inner = (jnp.int32(0), Q, Ft_cur, grad_norm)
+            init_inner = (jnp.int32(0), Q, Ft_cur, total_grad_norm)
             _, Q_next, _, _ = lax.while_loop(
                 inner_cond, inner_body, init_inner
             )
@@ -542,9 +587,10 @@ def variational_rtr_optimize(
         def no_tr_step(_):
             return Q, delta
 
-        # Occupations are always updated; the orbital RTR step is only needed
-        # when the orbital gradient at (Q, p_work) is non-negligible.
-        need_tr = grad_norm > 1e-14
+        # Occupations are always updated; the orbital step is only needed
+        # when there is a non-negligible commutator gradient OR off-diagonal
+        # Fock elements in degenerate-occupation subspaces (Jacobi).
+        need_tr = total_grad_norm > 1e-14
         Q_next, delta_next = lax.cond(need_tr, do_tr_step, no_tr_step, operand=None)
 
         dE = jnp.where(jnp.isfinite(E_prev_iter), jnp.abs(E_cur - E_prev_iter), jnp.inf)
@@ -624,6 +670,7 @@ def jit_variational_rtr_iteration(hf_step):
             "max_cg_iter",
             "cg_tol",
             "max_rot",
+            "p_floor",
             "denom_scale",
             "mu_maxiter",
             "mu_tol",
