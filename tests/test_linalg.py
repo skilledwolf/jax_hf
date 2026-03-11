@@ -21,6 +21,33 @@ def test_block_eigh_falls_back_to_full_when_coupled():
     np.testing.assert_allclose(np.array(h_rec), np.array(h), rtol=1e-6, atol=1e-6)
 
 
+def test_block_eigh_forced_matches_full_when_exactly_block_diagonal():
+    h0 = jnp.array(
+        [
+            [-1.0 + 0.0j, 0.2 + 0.1j],
+            [0.2 - 0.1j, -0.3 + 0.0j],
+        ],
+        dtype=jnp.complex64,
+    )
+    h1 = jnp.array(
+        [
+            [0.4 + 0.0j, -0.15j],
+            [0.15j, 1.1 + 0.0j],
+        ],
+        dtype=jnp.complex64,
+    )
+    h = jnp.zeros((4, 4), dtype=jnp.complex64)
+    h = h.at[:2, :2].set(h0)
+    h = h.at[2:, 2:].set(h1)
+
+    w_ref, _v_ref = jnp.linalg.eigh(h)
+    w, v = eigh(h, block_sizes=(2, 2), check_offdiag=False)
+
+    np.testing.assert_allclose(np.array(w), np.array(w_ref), rtol=1e-6, atol=1e-6)
+    h_rec = v @ jnp.diag(w) @ jnp.conj(jnp.swapaxes(v, -1, -2))
+    np.testing.assert_allclose(np.array(h_rec), np.array(h), rtol=1e-6, atol=1e-6)
+
+
 def test_selfenergy_fft_block_specs_matches_full_when_block_diagonal():
     rng = np.random.default_rng(0)
     nk = 4

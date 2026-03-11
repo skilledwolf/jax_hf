@@ -231,9 +231,10 @@ def _selfenergy_fft_block_specs(
     hermitian_channel_packing: bool = False,
 ) -> jax.Array:
     n = int(P.shape[-1])
-    abs_P = jnp.abs(P)
-    scale = jnp.max(abs_P)
-    tol = jnp.asarray(offdiag_atol, dtype=abs_P.dtype) + jnp.asarray(offdiag_rtol, dtype=abs_P.dtype) * scale
+    if check_offdiag:
+        abs_P = jnp.abs(P)
+        scale = jnp.max(abs_P)
+        tol = jnp.asarray(offdiag_atol, dtype=abs_P.dtype) + jnp.asarray(offdiag_rtol, dtype=abs_P.dtype) * scale
 
     def do_full(_):
         return _selfenergy_fft_full(

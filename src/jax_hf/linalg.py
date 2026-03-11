@@ -287,9 +287,10 @@ def _eigh_block_specs(
 ) -> tuple[jax.Array, jax.Array]:
     n = int(array.shape[-1])
 
-    abs_array = jnp.abs(array)
-    scale = jnp.max(abs_array)
-    tol = jnp.asarray(offdiag_atol, dtype=abs_array.dtype) + jnp.asarray(offdiag_rtol, dtype=abs_array.dtype) * scale
+    if check_offdiag:
+        abs_array = jnp.abs(array)
+        scale = jnp.max(abs_array)
+        tol = jnp.asarray(offdiag_atol, dtype=abs_array.dtype) + jnp.asarray(offdiag_rtol, dtype=abs_array.dtype) * scale
 
     def do_full(_):
         w, v = jnp.linalg.eigh(array, **kwargs)
