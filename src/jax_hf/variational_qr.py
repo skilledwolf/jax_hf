@@ -144,6 +144,101 @@ def _adaptive_tau(
     return tau
 
 
+def _frobenius_ip(a: jax.Array, b: jax.Array) -> jax.Array:
+    """Per-k-point Frobenius inner product: Re(Tr(a† b)), reducing over (nb, nb)."""
+    return jnp.sum(jnp.real(jnp.conj(a) * b), axis=(-2, -1))
+
+
+def _lbfgs_direction(
+    G: jax.Array,
+    S_hist: jax.Array,
+    Y_hist: jax.Array,
+    count: jax.Array,
+    m: int,
+) -> jax.Array:
+    """
+    L-BFGS two-loop recursion on anti-Hermitian matrices, per k-point.
+
+    All inner products reduce over (nb, nb), preserving batch dims.
+    Returns a search direction in the gradient (ascent) direction;
+    the QR retraction ``U = QR(I - tau H)`` handles the sign flip.
+
+    Parameters
+    ----------
+    G : (..., nb, nb) current gradient (anti-Hermitian).
+    S_hist : (m, ..., nb, nb) ring buffer of tangent-space steps.
+    Y_hist : (m, ..., nb, nb) ring buffer of gradient differences.
+    count : scalar int, total (s, y) pairs stored so far.
+    m : int, history size (static).
+    """
+    real_dtype = jnp.real(G).dtype
+    eps = jnp.asarray(1e-30, dtype=real_dtype)
+    curv_eps = jnp.asarray(1e-8, dtype=real_dtype)
+
+    # -- forward loop (most-recent pair first) --
+    q = G
+    alphas = []
+    rhos = []
+    for i in range(m):
+        valid = count > i
+        idx = (count - 1 - i) % m
+        si = S_hist[idx]
+        yi = Y_hist[idx]
+
+        sy = _frobenius_ip(si, yi)
+        yy = _frobenius_ip(yi, yi)
+        good = jnp.logical_and(valid, sy > curv_eps * yy)
+        rho_i = jnp.where(good, 1.0 / (sy + eps), jnp.zeros_like(sy))
+
+        alpha_i = rho_i * _frobenius_ip(si, q)
+        alpha_i = jnp.where(valid, alpha_i, jnp.zeros_like(alpha_i))
+
+        q = q - alpha_i[..., None, None] * yi
+        alphas.append(alpha_i)
+        rhos.append(rho_i)
+
+    # -- initial Hessian scaling (gamma I) --
+    idx_newest = (count - 1) % m
+    s_n = S_hist[idx_newest]
+    y_n = Y_hist[idx_newest]
+    sy_n = _frobenius_ip(s_n, y_n)
+    yy_n = _frobenius_ip(y_n, y_n) + eps
+    good_gamma = jnp.logical_and(count > 0, sy_n > curv_eps * yy_n)
+    gamma = jnp.where(good_gamma, sy_n / yy_n, jnp.ones_like(sy_n))
+
+    r = gamma[..., None, None] * q
+
+    # -- backward loop (oldest valid pair first) --
+    for i in range(m - 1, -1, -1):
+        valid = count > i
+        idx = (count - 1 - i) % m
+        yi = Y_hist[idx]
+        si = S_hist[idx]
+
+        beta_i = rhos[i] * _frobenius_ip(yi, r)
+        corr = jnp.where(valid, alphas[i] - beta_i, jnp.zeros_like(beta_i))
+        r = r + corr[..., None, None] * si
+
+    return r
+
+
+def _transport_history(
+    hist: jax.Array,
+    U: jax.Array,
+    block_slices: tuple[slice, ...] | None,
+) -> jax.Array:
+    """Parallel-transport all history vectors to the new tangent space via U† hist_i U."""
+    if block_slices is None or len(block_slices) <= 1:
+        U_dag = U.conj().swapaxes(-1, -2)
+        return U_dag[None, ...] @ hist @ U[None, ...]
+    # For block-diagonal U, loop over history vectors (m is small).
+    return jnp.stack(
+        [_apply_orbital_basis_update(hist[i], U, block_slices=block_slices)
+         for i in range(hist.shape[0])],
+        axis=0,
+    )
+
+
 def _block_slices_from_sizes(block_sizes: tuple[int, ...], n: int) -> tuple[slice, ...]:
     if sum(int(size) for size in block_sizes) != int(n):
         raise ValueError(f"block_sizes must sum to {n}, got {block_sizes!r}.")
@@ -368,9 +463,17 @@ def _frozenF_inner_solve_qr(
     mu_tol: float,
     line_search: bool,
     block_sizes: tuple[int, ...] | None = None,
+    optimizer: str = "cg",
+    lbfgs_m: int = 5,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     """
     Cheap inner solve with F frozen, using QR-retraction orbital updates.
+
+    Parameters
+    ----------
+    optimizer : ``"cg"`` (default) for Polak-Ribière CG, or ``"lbfgs"``
+        for Riemannian L-BFGS with history persisting across inner sweeps.
+    lbfgs_m : history depth for L-BFGS (ignored when optimizer is ``"cg"``).
     """
     real_dtype = p.dtype
     max_rot_j = jnp.asarray(max_rot, dtype=real_dtype)
@@ -409,8 +512,84 @@ def _frozenF_inner_solve_qr(
             Ft_new = _apply_orbital_basis_update(Ft_q, U, block_slices=block_slices)
         return Ft_new, U
 
-    def inner_sweep(_, state):
-        Q_s, Ft_s, p_s, mu_s = state
+    def _compute_gradient_and_step(Ft_q, p_q):
+        """Shared gradient → clipped direction → tau computation."""
+        eps_q = jnp.real(jnp.diagonal(Ft_q, axis1=-2, axis2=-1)).astype(real_dtype)
+        gap_q = eps_q[..., :, None] - eps_q[..., None, :]
+        G = _orbital_gradient(Ft_q, eps_q, gap_q, p_q, offdiag, float(p_floor), T, float(denom_scale))
+        if rot_mask is not None:
+            G = G * rot_mask
+        return G, eps_q, gap_q
+
+    def _clip_and_tau(H, eps_q, gap_q):
+        tau = _adaptive_tau(H, eps_q, gap_q, float(denom_scale), T, w_norm)
+        gen_norm = jnp.sqrt(jnp.sum(jnp.abs(H) ** 2, axis=(-2, -1)) + tiny_eps)
+        eff_norm = tau * gen_norm
+        clip_scale = jnp.minimum(1.0, max_rot_j / (eff_norm + clip_eps))
+        return H * clip_scale[..., None, None], tau
+
+    # ---- CG path (default, unchanged) ----
+    if optimizer == "cg":
+        def inner_sweep(_, state):
+            Q_s, Ft_s, p_s, mu_s = state
+
+            eps = jnp.real(jnp.diagonal(Ft_s, axis1=-2, axis2=-1)).astype(real_dtype)
+            mu_s = _solve_mu_fd_newton_bracket(
+                eps, w_norm, n_target_norm, mu_s, T,
+                maxiter=int(mu_maxiter), tol=float(mu_tol),
+            )
+            p_s = _occupations_from_eps(eps, mu_s, T).astype(real_dtype)
+
+            if q_sweeps == 1:
+                G_step, eps_q, gap_q = _compute_gradient_and_step(Ft_s, p_s)
+                G_step, tau = _clip_and_tau(G_step, eps_q, gap_q)
+                Ft_s, U_step = take_step(Ft_s, G_step, p_s, tau)
+                return (_apply_right_unitary(Q_s, U_step, block_slices=block_slices), Ft_s, p_s, mu_s)
+
+            H_zero = jnp.zeros_like(Ft_s)
+
+            def q_sweep(i_q, state2):
+                Ft_q, U_total, G_prev, H_prev = state2
+                G_new, eps_q, gap_q = _compute_gradient_and_step(Ft_q, p_s)
+
+                def compute_beta():
+                    num = jnp.sum(jnp.real(jnp.conj(G_new) * (G_new - G_prev)), axis=(-2, -1))
+                    den = jnp.sum(jnp.real(jnp.conj(G_prev) * G_prev), axis=(-2, -1)) + tiny_eps
+                    return jnp.maximum(0.0, num / den)[..., None, None]
+
+                beta = lax.cond(
+                    i_q > 0,
+                    compute_beta,
+                    lambda: jnp.zeros(G_new.shape[:-2] + (1, 1), dtype=real_dtype),
+                )
+                H_new = G_new + beta * H_prev
+
+                H_step, tau = _clip_and_tau(H_new, eps_q, gap_q)
+                Ft_new, U = take_step(Ft_q, H_step, p_s, tau)
+                U_total = _apply_right_unitary(U_total, U, block_slices=block_slices)
+                G_trans = _apply_orbital_basis_update(G_new, U, block_slices=block_slices)
+                H_trans = _apply_orbital_basis_update(H_new, U, block_slices=block_slices)
+                return (Ft_new, U_total, G_trans, H_trans)
+
+            Ft_s, U_total, _, _ = lax.fori_loop(0, int(q_sweeps), q_sweep, (Ft_s, eye_u, H_zero, H_zero))
+            Q_s = _apply_right_unitary(Q_s, U_total, block_slices=block_slices)
+            return (Q_s, Ft_s, p_s, mu_s)
+
+        Q_out, _, p_out, mu_out = lax.fori_loop(0, int(inner_sweeps), inner_sweep, (Q, Ft0, p, mu))
+        return Q_out, p_out, mu_out
+
+    # ---- L-BFGS path ----
+    if optimizer != "lbfgs":
+        raise ValueError(f"Unknown optimizer {optimizer!r}; expected 'cg' or 'lbfgs'.")
+
+    m = int(lbfgs_m)
+    S0 = jnp.zeros((m,) + Ft0.shape, dtype=Ft0.dtype)
+    Y0 = jnp.zeros((m,) + Ft0.shape, dtype=Ft0.dtype)
+    G0 = jnp.zeros_like(Ft0)
+    count0 = jnp.int32(0)
+
+    def inner_sweep_lbfgs(_, state):
+        Q_s, Ft_s, p_s, mu_s, S_h, Y_h, G_prev, lcount = state
 
         # 1) occupations from diagonal energies
         eps = jnp.real(jnp.diagonal(Ft_s, axis1=-2, axis2=-1)).astype(real_dtype)
@@ -420,71 +599,57 @@ def _frozenF_inner_solve_qr(
         )
         p_s = _occupations_from_eps(eps, mu_s, T).astype(real_dtype)
 
-        if q_sweeps == 1:
-            eps_q = jnp.real(jnp.diagonal(Ft_s, axis1=-2, axis2=-1)).astype(real_dtype)
-            gap_q = eps_q[..., :, None] - eps_q[..., None, :]
-            G_step = _orbital_gradient(Ft_s, eps_q, gap_q, p_s, offdiag, float(p_floor), T, float(denom_scale))
+        # 2) Q sweeps with L-BFGS direction
+        def q_sweep_lbfgs(_, state2):
+            Ft_q, U_total, S_h2, Y_h2, G_prev2, lc = state2
 
-            if rot_mask is not None:
-                G_step = G_step * rot_mask
+            G_new, eps_q, gap_q = _compute_gradient_and_step(Ft_q, p_s)
 
-            tau = _adaptive_tau(G_step, eps_q, gap_q, float(denom_scale), T, w_norm)
-
-            gen_norm = jnp.sqrt(jnp.sum(jnp.abs(G_step) ** 2, axis=(-2, -1)) + tiny_eps)
-            eff_norm = tau * gen_norm
-            clip_scale = jnp.minimum(1.0, max_rot_j / (eff_norm + clip_eps))
-            G_step = G_step * clip_scale[..., None, None]
-
-            Ft_s, U_step = take_step(Ft_s, G_step, p_s, tau)
-            return (_apply_right_unitary(Q_s, U_step, block_slices=block_slices), Ft_s, p_s, mu_s)
-
-        # 2) Q sweeps via QR retraction (with optional Riemannian PR conjugate gradients)
-        H_zero = jnp.zeros_like(Ft_s)
-
-        def q_sweep(i_q, state2):
-            Ft_q, U_total, G_prev, H_prev = state2
-
-            eps_q = jnp.real(jnp.diagonal(Ft_q, axis1=-2, axis2=-1)).astype(real_dtype)
-            gap_q = eps_q[..., :, None] - eps_q[..., None, :]
-
-            G_new = _orbital_gradient(Ft_q, eps_q, gap_q, p_s, offdiag, float(p_floor), T, float(denom_scale))
-
-            if rot_mask is not None:
-                G_new = G_new * rot_mask
-
-            def compute_beta():
-                num = jnp.sum(jnp.real(jnp.conj(G_new) * (G_new - G_prev)), axis=(-2, -1))
-                den = jnp.sum(jnp.real(jnp.conj(G_prev) * G_prev), axis=(-2, -1)) + tiny_eps
-                return jnp.maximum(0.0, num / den)[..., None, None]
-
-            beta = lax.cond(
-                i_q > 0,
-                compute_beta,
-                lambda: jnp.zeros(G_new.shape[:-2] + (1, 1), dtype=real_dtype),
+            # Store y = G_new - G_prev (gradient difference from previous step).
+            y = G_new - G_prev2
+            idx_y = (lc - 1) % m
+            Y_h2 = lax.cond(
+                lc > 0,
+                lambda _: Y_h2.at[idx_y].set(y),
+                lambda _: Y_h2,
+                operand=None,
             )
 
-            H_new = G_new + beta * H_prev
+            # L-BFGS search direction
+            H_new = _lbfgs_direction(G_new, S_h2, Y_h2, lc, m)
 
-            tau = _adaptive_tau(H_new, eps_q, gap_q, float(denom_scale), T, w_norm)
+            H_step, tau = _clip_and_tau(H_new, eps_q, gap_q)
 
-            gen_norm = jnp.sqrt(jnp.sum(jnp.abs(H_new) ** 2, axis=(-2, -1)) + tiny_eps)
-            eff_norm = tau * gen_norm
-            clip_scale = jnp.minimum(1.0, max_rot_j / (eff_norm + clip_eps))
-            H_step = H_new * clip_scale[..., None, None]
+            # Store s = displacement in the descent direction.
+            # The retraction U = QR(I - tau*H) steps opposite to H,
+            # so the tangent-space displacement is -tau*H.
+            s = -(tau[..., None, None] * H_step)
+            idx_s = lc % m
+            S_h2 = S_h2.at[idx_s].set(s)
+            lc = lc + 1
 
+            # Take step
             Ft_new, U = take_step(Ft_q, H_step, p_s, tau)
             U_total = _apply_right_unitary(U_total, U, block_slices=block_slices)
 
+            # Transport history + gradient to new tangent space
+            S_h2 = _transport_history(S_h2, U, block_slices)
+            Y_h2 = _transport_history(Y_h2, U, block_slices)
             G_trans = _apply_orbital_basis_update(G_new, U, block_slices=block_slices)
-            H_trans = _apply_orbital_basis_update(H_new, U, block_slices=block_slices)
 
-            return (Ft_new, U_total, G_trans, H_trans)
+            return (Ft_new, U_total, S_h2, Y_h2, G_trans, lc)
 
-        Ft_s, U_total, _, _ = lax.fori_loop(0, int(q_sweeps), q_sweep, (Ft_s, eye_u, H_zero, H_zero))
+        init_qs = (Ft_s, eye_u, S_h, Y_h, G_prev, lcount)
+        Ft_s, U_total, S_h, Y_h, G_prev, lcount = lax.fori_loop(
+            0, int(q_sweeps), q_sweep_lbfgs, init_qs,
+        )
         Q_s = _apply_right_unitary(Q_s, U_total, block_slices=block_slices)
-        return (Q_s, Ft_s, p_s, mu_s)
+        return (Q_s, Ft_s, p_s, mu_s, S_h, Y_h, G_prev, lcount)
 
-    Q_out, _, p_out, mu_out = lax.fori_loop(0, int(inner_sweeps), inner_sweep, (Q, Ft0, p, mu))
+    init_state = (Q, Ft0, p, mu, S0, Y0, G0, count0)
+    Q_out, _, p_out, mu_out, _, _, _, _ = lax.fori_loop(
+        0, int(inner_sweeps), inner_sweep_lbfgs, init_state,
+    )
     return Q_out, p_out, mu_out
 
 
@@ -530,6 +695,10 @@ def variational_qr_optimize(
 
     # shared QR/exchange block structure (optional)
     block_sizes: tuple[int, ...] | None = None,
+
+    # orbital optimizer selection
+    optimizer: str = "cg",
+    lbfgs_m: int = 5,
 
     # exchange knobs (optional)
     exchange_check_offdiag: bool | None = None,
@@ -678,6 +847,8 @@ def variational_qr_optimize(
                     mu_tol=float(mu_tol),
                     line_search=bool(line_search),
                     block_sizes=block_sizes,
+                    optimizer=optimizer,
+                    lbfgs_m=int(lbfgs_m),
                 )
 
             def occ_only_update(inner_args):
@@ -763,6 +934,7 @@ def jit_variational_qr_iteration(hf_step):
             "mu_maxiter", "mu_tol",
             "line_search",
             "block_sizes",
+            "optimizer", "lbfgs_m",
             "include_hartree", "include_exchange",
             "exchange_hermitian_channel_packing",
             "exchange_check_offdiag",

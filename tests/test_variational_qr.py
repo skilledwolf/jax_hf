@@ -17,6 +17,8 @@ from jax_hf.variational_qr import _apply_orbital_basis_update
 from jax_hf.variational_qr import _apply_right_unitary
 from jax_hf.variational_qr import _block_slices_from_sizes
 from jax_hf.variational_qr import _exchange_block_specs_from_block_sizes
+from jax_hf.variational_qr import _frobenius_ip
+from jax_hf.variational_qr import _lbfgs_direction
 from jax_hf.variational_qr import _orbital_gradient
 from jax_hf.variational_qr import _qr_retraction_unitary
 
@@ -476,3 +478,185 @@ def test_blocked_right_unitary_matches_dense_product():
     X_block = _apply_right_unitary(X, U, block_slices=block_slices)
 
     np.testing.assert_allclose(np.array(X_block), np.array(X_dense), rtol=1e-6, atol=1e-6)
+
+
+# -------------------------------------------------------
+# L-BFGS unit tests
+# -------------------------------------------------------
+
+
+def test_lbfgs_direction_returns_gradient_when_no_history():
+    """With count=0, L-BFGS should return a scaled copy of the gradient."""
+    G = jnp.array([[[[0.0, 0.3], [-0.3, 0.0]]]], dtype=jnp.complex64)
+    m = 3
+    S = jnp.zeros((m,) + G.shape, dtype=G.dtype)
+    Y = jnp.zeros((m,) + G.shape, dtype=G.dtype)
+    count = jnp.int32(0)
+
+    H = _lbfgs_direction(G, S, Y, count, m)
+
+    # gamma=1 when count=0, so H should equal G
+    np.testing.assert_allclose(np.array(H), np.array(G), atol=1e-6)
+
+
+def test_lbfgs_direction_uses_curvature_from_history():
+    """With valid history, L-BFGS direction should differ from steepest descent."""
+    key = jax.random.PRNGKey(42)
+    nk1, nk2, nb = 2, 2, 3
+    m = 3
+
+    def make_skew(k):
+        a = jax.random.normal(k, (nk1, nk2, nb, nb), dtype=jnp.float32)
+        b = jax.random.normal(jax.random.fold_in(k, 1), (nk1, nk2, nb, nb), dtype=jnp.float32)
+        raw = (a + 1j * b).astype(jnp.complex64)
+        return 0.5 * (raw - jnp.conj(jnp.swapaxes(raw, -1, -2)))
+
+    S = jnp.stack([make_skew(jax.random.fold_in(key, i)) * 0.1 for i in range(m)])
+    Y = jnp.stack([make_skew(jax.random.fold_in(key, i + 10)) for i in range(m)])
+    G = make_skew(jax.random.fold_in(key, 99))
+    count = jnp.int32(m)
+
+    H = _lbfgs_direction(G, S, Y, count, m)
+
+    # Direction should be anti-Hermitian
+    np.testing.assert_allclose(
+        np.array(H), -np.conj(np.swapaxes(np.array(H), -1, -2)), atol=1e-5,
+    )
+    # Should differ from raw gradient (curvature correction applied)
+    assert not np.allclose(np.array(H), np.array(G), atol=1e-3)
+
+
+def test_frobenius_ip_matches_trace():
+    a = jnp.array([[[[1.0, 2.0], [3.0, 4.0]]]], dtype=jnp.complex64)
+    b = jnp.array([[[[5.0, 6.0], [7.0, 8.0]]]], dtype=jnp.complex64)
+    ip = _frobenius_ip(a, b)
+    expected = jnp.real(jnp.trace(a.conj().swapaxes(-1, -2) @ b, axis1=-2, axis2=-1))
+    np.testing.assert_allclose(np.array(ip), np.array(expected), atol=1e-6)
+
+
+# -------------------------------------------------------
+# L-BFGS integration tests (full solver)
+# -------------------------------------------------------
+
+
+def test_variational_qr_lbfgs_smoke():
+    """L-BFGS optimizer converges and conserves density."""
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+    hamiltonian = jnp.array([[[[-0.5, 0.0], [0.0, 0.5]]]], dtype=jnp.complex64)
+    coulomb_q = jnp.array([[[[0.25]]]], dtype=jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.2,
+        include_hartree=False,
+        include_exchange=True,
+    )
+    runner = jax_hf.jit_variational_qr_iteration(kernel)
+
+    P0 = jnp.array([[[[0.6, 0.0], [0.0, 0.4]]]], dtype=jnp.complex64)
+
+    P_fin, F_fin, E_fin, mu_fin, k_fin, history = runner(
+        P0,
+        electrondensity0=1.0,
+        max_iter=80,
+        comm_tol=1e-6,
+        p_tol=1e-6,
+        optimizer="lbfgs",
+        lbfgs_m=3,
+        inner_sweeps=3,
+        q_sweeps=2,
+    )
+
+    assert int(k_fin) <= 80
+    assert np.isfinite(np.array(E_fin)).all()
+    n_fin = _electron_count(P_fin, weights)
+    assert n_fin == pytest.approx(1.0, rel=1e-5, abs=1e-5)
+
+
+def test_variational_qr_lbfgs_matches_cg_energy():
+    """L-BFGS and CG should converge to the same energy on a random system."""
+    key_h, key_i = jax.random.split(jax.random.PRNGKey(456))
+    nk1, nk2, nb = 2, 2, 3
+
+    a = jax.random.normal(key_h, (nk1, nk2, nb, nb), dtype=jnp.float32)
+    b = jax.random.normal(key_i, (nk1, nk2, nb, nb), dtype=jnp.float32)
+    hamiltonian = (a + 1j * b).astype(jnp.complex64)
+    hamiltonian = 0.5 * (hamiltonian + jnp.conj(jnp.swapaxes(hamiltonian, -1, -2)))
+
+    weights = jnp.ones((nk1, nk2), dtype=jnp.float32)
+    coulomb_q = (0.1 * jnp.ones((nk1, nk2, 1, 1), dtype=jnp.float32)).astype(jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.01,
+        include_hartree=False,
+        include_exchange=True,
+    )
+
+    P0 = jnp.eye(nb, dtype=jnp.complex64)[None, None, ...]
+    P0 = jnp.broadcast_to(P0, (nk1, nk2, nb, nb)) * 0.5
+
+    shared = dict(
+        electrondensity0=1.7,
+        max_iter=200,
+        comm_tol=1e-5,
+        p_tol=1e-5,
+        inner_sweeps=4,
+        q_sweeps=3,
+    )
+
+    runner_cg = jax_hf.jit_variational_qr_iteration(kernel)
+    runner_lbfgs = jax_hf.jit_variational_qr_iteration(kernel)
+
+    _, _, E_cg, _, k_cg, _ = runner_cg(P0, optimizer="cg", **shared)
+    _, _, E_lbfgs, _, k_lbfgs, _ = runner_lbfgs(P0, optimizer="lbfgs", lbfgs_m=5, **shared)
+
+    # Both should converge
+    assert int(k_cg) < 200
+    assert int(k_lbfgs) < 200
+    # Energies should agree
+    np.testing.assert_allclose(float(E_lbfgs), float(E_cg), atol=1e-4)
+
+
+def test_variational_qr_lbfgs_with_block_sizes():
+    """L-BFGS respects block-diagonal structure."""
+    nk1, nk2, nb = 1, 1, 4
+    h_block = np.zeros((nk1, nk2, nb, nb), dtype=np.complex64)
+    h_block[0, 0, :2, :2] = np.array([[-1.0, 0.3], [0.3, 1.0]])
+    h_block[0, 0, 2:, 2:] = np.array([[-0.5, 0.2], [0.2, 0.8]])
+    hamiltonian = jnp.asarray(h_block)
+
+    weights = jnp.ones((nk1, nk2), dtype=jnp.float32)
+    coulomb_q = (0.1 * jnp.ones((nk1, nk2, 1, 1), dtype=jnp.float32)).astype(jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.1,
+        include_hartree=False,
+        include_exchange=True,
+    )
+    runner = jax_hf.jit_variational_qr_iteration(kernel)
+
+    P0 = 0.5 * jnp.eye(nb, dtype=jnp.complex64)[None, None, ...]
+
+    P_fin, _F, _E, _mu, _k, _hist = runner(
+        P0,
+        electrondensity0=2.0,
+        max_iter=60,
+        comm_tol=1e-6,
+        p_tol=1e-6,
+        block_sizes=(2, 2),
+        optimizer="lbfgs",
+        lbfgs_m=3,
+        inner_sweeps=3,
+        q_sweeps=2,
+    )
+    P_arr = np.array(P_fin[0, 0])
+    offblock = np.concatenate([P_arr[:2, 2:].ravel(), P_arr[2:, :2].ravel()])
+    assert np.max(np.abs(offblock)) < 1e-10

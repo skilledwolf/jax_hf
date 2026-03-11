@@ -73,6 +73,46 @@ P_fin, F_fin, E_fin, mu_fin, n_iter, history = hf_iter(
 print("iters:", int(n_iter), "mu:", float(mu_fin), "E:", float(E_fin))
 ```
 
+## Prepared-problem API
+
+If you want a stable public surface above the low-level JIT wrappers, use the
+prepared-problem API:
+
+```python
+import jax_hf
+import jax.numpy as jnp
+
+problem = jax_hf.HFProblem(
+    weights=weights,
+    hamiltonian=H,
+    coulomb_q=Vq,
+    T=0.5,
+)
+
+result = jax_hf.solve(
+    problem,
+    solver="scf",
+    P0=jnp.zeros_like(H),
+    n_electrons_per_degeneracy=float(ne_target),
+    config=jax_hf.SCFRunConfig(max_iter=50, comm_tol=1e-3, diis_size=6),
+)
+print(result.fine.n_iter, float(result.mu))
+
+qr = jax_hf.solve(
+    problem,
+    solver="qr",
+    P0=jnp.zeros_like(H),
+    n_electrons_per_degeneracy=float(ne_target),
+    config=jax_hf.QRRunConfig(max_iter=80, comm_tol=1e-5, p_tol=1e-3),
+)
+```
+
+`solve(...)` returns a standardized `SolveResult` with `fine` and optional
+`coarse` stage results. The convenience wrappers `run_scf(...)`,
+`run_variational_qr(...)`, and `run_variational_rtr(...)` call the same path.
+The legacy `electrondensity0` argument is still accepted as an alias for
+`n_electrons_per_degeneracy`, but new code should prefer the latter.
+
 ## Coarse-to-fine continuation (`nk_coarse`)
 
 For large k-grids it can be helpful to converge on a smaller coarse grid and use
@@ -83,16 +123,14 @@ grids:
 ```python
 import jax_hf
 
-out = jax_hf.coarse_to_fine_scf(
-    weights_f=weights,
-    hamiltonian_f=H,
-    coulomb_q_f=Vq,
-    P0_f=P0,
-    electrondensity0=float(ne_target),
-    T=0.5,
+out = jax_hf.solve(
+    problem,
+    solver="scf",
+    P0=P0,
+    n_electrons_per_degeneracy=float(ne_target),
     nk_coarse=64,
-    coarse_scf_kwargs=dict(max_iter=80, comm_tol=1e-3, diis_size=6),
-    fine_scf_kwargs=dict(max_iter=50, comm_tol=1e-4, diis_size=6),
+    coarse_config=jax_hf.SCFRunConfig(max_iter=80, comm_tol=1e-3, diis_size=6),
+    fine_config=jax_hf.SCFRunConfig(max_iter=50, comm_tol=1e-4, diis_size=6),
 )
 print("coarse iters:", int(out.coarse.n_iter) if out.coarse else None)
 print("fine iters:", int(out.fine.n_iter))
