@@ -232,10 +232,40 @@ class SolveResult:
         return self.fine.params
 
 
+@dataclass(frozen=True)
+class DensityMatrixSeed:
+    """Explicit density-matrix warm start for a solve."""
+
+    density_matrix: Any
+
+
+@dataclass(frozen=True)
+class VariationalSeed:
+    """Explicit variational-parameter warm start for a solve."""
+
+    params: VariationalHFParams
+
+
+@dataclass(frozen=True)
+class ContinuationConfig:
+    """Explicit coarse-to-fine continuation controls."""
+
+    nk_coarse: int
+    coarse_problem: HFProblem | None = None
+    coarse_seed: DensityMatrixSeed | None = None
+    coarse_n_electrons_per_degeneracy: float | None = None
+    coarse_config: Any | None = None
+    fine_config: Any | None = None
+    T_coarse: float | None = None
+    resample_method: str = "linear"
+
+
 def solve(
     problem: HFProblem,
     *,
     solver: str = "scf",
+    seed: DensityMatrixSeed | VariationalSeed | None = None,
+    continuation: ContinuationConfig | None = None,
     P0: Any | None = None,
     params0: VariationalHFParams | None = None,
     n_electrons_per_degeneracy: float | None = None,
@@ -259,17 +289,17 @@ def solve(
     solver
         One of ``"scf"``, ``"qr"``, or ``"rtr"``. Common aliases such as
         ``"jax"`` and ``"variational_qr"`` are accepted.
-    P0, params0
-        Initial density matrix or variational warm-start parameters. ``params0``
-        is only valid for variational solvers.
+    seed
+        Explicit density-matrix or variational warm start. The legacy ``P0`` and
+        ``params0`` inputs are still accepted.
     n_electrons_per_degeneracy
         Target electron density integrated over mesh weights, divided by any
         external degeneracy handled by the caller.
     config
         Solver-specific config object or a dict of fields for the selected solver.
-    nk_coarse, coarse_problem, coarse_P0, coarse_config, fine_config
-        Optional coarse-to-fine continuation controls. If ``coarse_problem`` is
-        omitted, the fine-grid problem is downsampled automatically.
+    continuation
+        Explicit coarse-to-fine continuation controls. The legacy
+        ``nk_coarse``/``coarse_*`` inputs are still accepted.
     """
 
     solver_key = _normalize_solver(solver)
@@ -277,17 +307,41 @@ def solve(
         n_electrons_per_degeneracy=n_electrons_per_degeneracy,
         electrondensity0=electrondensity0,
     )
+    P0, params0 = _normalize_seed_inputs(seed=seed, P0=P0, params0=params0)
+    continuation_cfg = _normalize_continuation(
+        continuation=continuation,
+        nk_coarse=nk_coarse,
+        coarse_problem=coarse_problem,
+        coarse_P0=coarse_P0,
+        coarse_n_electrons_per_degeneracy=coarse_n_electrons_per_degeneracy,
+        coarse_config=coarse_config,
+        fine_config=fine_config,
+        T_coarse=T_coarse,
+        resample_method=resample_method,
+    )
     base_config = _normalize_config(solver_key, config)
+    coarse_config_input = (
+        continuation_cfg.coarse_config
+        if continuation_cfg is not None and continuation_cfg.coarse_config is not None
+        else coarse_config
+    )
+    fine_config_input = (
+        continuation_cfg.fine_config
+        if continuation_cfg is not None and continuation_cfg.fine_config is not None
+        else fine_config
+    )
     coarse_cfg = _normalize_config(
         solver_key,
-        coarse_config if coarse_config is not None else _default_coarse_config(solver_key, base_config),
+        coarse_config_input
+        if coarse_config_input is not None
+        else _default_coarse_config(solver_key, base_config),
     )
     fine_cfg = _normalize_config(
         solver_key,
-        fine_config if fine_config is not None else base_config,
+        fine_config_input if fine_config_input is not None else base_config,
     )
 
-    if nk_coarse is None:
+    if continuation_cfg is None:
         fine = _solve_stage(
             problem,
             solver=solver_key,
@@ -298,9 +352,9 @@ def solve(
         )
         return SolveResult(solver=solver_key, fine=fine)
 
-    nk_coarse = int(nk_coarse)
+    nk_coarse = int(continuation_cfg.nk_coarse)
     nk_f = int(np.asarray(problem.hamiltonian).shape[0])
-    if nk_coarse >= nk_f and coarse_problem is None:
+    if nk_coarse >= nk_f and continuation_cfg.coarse_problem is None:
         fine = _solve_stage(
             problem,
             solver=solver_key,
@@ -314,25 +368,28 @@ def solve(
         raise ValueError("nk_coarse must be a positive integer or None.")
 
     P0_f = _density_seed_from_inputs(problem, P0=P0, params0=params0)
-    if coarse_problem is None:
+    if continuation_cfg.coarse_problem is None:
         coarse_problem = _resample_problem(
             problem,
             nk_coarse=nk_coarse,
-            T_coarse=T_coarse,
-            method=resample_method,
+            T_coarse=continuation_cfg.T_coarse,
+            method=continuation_cfg.resample_method,
         )
     else:
-        coarse_problem = _prepared_coarse_problem(coarse_problem, T_coarse=T_coarse)
+        coarse_problem = _prepared_coarse_problem(
+            continuation_cfg.coarse_problem,
+            T_coarse=continuation_cfg.T_coarse,
+        )
 
     P0_c = (
-        _resample_density_seed(P0_f, nk_coarse=nk_coarse, method=resample_method)
-        if coarse_P0 is None
-        else hermitize(jnp.asarray(coarse_P0))
+        _resample_density_seed(P0_f, nk_coarse=nk_coarse, method=continuation_cfg.resample_method)
+        if continuation_cfg.coarse_seed is None
+        else hermitize(jnp.asarray(continuation_cfg.coarse_seed.density_matrix))
     )
 
     coarse_target = (
-        float(coarse_n_electrons_per_degeneracy)
-        if coarse_n_electrons_per_degeneracy is not None
+        float(continuation_cfg.coarse_n_electrons_per_degeneracy)
+        if continuation_cfg.coarse_n_electrons_per_degeneracy is not None
         else n_target
     )
 
@@ -346,7 +403,7 @@ def solve(
     )
 
     Sigma_c = hermitize(jnp.asarray(coarse.fock) - jnp.asarray(coarse_problem.hamiltonian))
-    Sigma_seed_f = hermitize(resample_kgrid(Sigma_c, nk_f, method=resample_method))
+    Sigma_seed_f = hermitize(resample_kgrid(Sigma_c, nk_f, method=continuation_cfg.resample_method))
     P0_seed_f, _mu_seed = density_matrix_from_fock(
         hermitize(jnp.asarray(problem.hamiltonian) + Sigma_seed_f),
         jnp.asarray(problem.weights),
@@ -532,6 +589,72 @@ def _normalize_solver(solver: str) -> SolverName:
     if key in ("rtr", "variational_rtr", "rtr_variational"):
         return "rtr"
     raise ValueError(f"Unknown solver {solver!r}. Expected one of 'scf', 'qr', or 'rtr'.")
+
+
+def _normalize_seed_inputs(
+    *,
+    seed: DensityMatrixSeed | VariationalSeed | None,
+    P0: Any | None,
+    params0: VariationalHFParams | None,
+) -> tuple[Any | None, VariationalHFParams | None]:
+    if seed is None:
+        return P0, params0
+    if P0 is not None or params0 is not None:
+        raise ValueError("Use either seed=... or legacy P0/params0 inputs, not both.")
+    if isinstance(seed, DensityMatrixSeed):
+        return seed.density_matrix, None
+    if isinstance(seed, VariationalSeed):
+        return None, seed.params
+    raise TypeError(f"Unsupported seed type {type(seed).__name__}.")
+
+
+def _normalize_continuation(
+    *,
+    continuation: ContinuationConfig | None,
+    nk_coarse: int | None,
+    coarse_problem: HFProblem | None,
+    coarse_P0: Any | None,
+    coarse_n_electrons_per_degeneracy: float | None,
+    coarse_config: Any | None,
+    fine_config: Any | None,
+    T_coarse: float | None,
+    resample_method: str,
+) -> ContinuationConfig | None:
+    legacy_requested = any(
+        value is not None
+        for value in (
+            nk_coarse,
+            coarse_problem,
+            coarse_P0,
+            coarse_n_electrons_per_degeneracy,
+            coarse_config,
+            fine_config,
+            T_coarse,
+        )
+    ) or resample_method != "linear"
+    if continuation is None:
+        if nk_coarse is None:
+            if legacy_requested:
+                raise ValueError(
+                    "Legacy coarse-to-fine inputs require nk_coarse to be set."
+                )
+            return None
+        coarse_seed = None if coarse_P0 is None else DensityMatrixSeed(coarse_P0)
+        return ContinuationConfig(
+            nk_coarse=int(nk_coarse),
+            coarse_problem=coarse_problem,
+            coarse_seed=coarse_seed,
+            coarse_n_electrons_per_degeneracy=coarse_n_electrons_per_degeneracy,
+            coarse_config=coarse_config,
+            fine_config=fine_config,
+            T_coarse=T_coarse,
+            resample_method=resample_method,
+        )
+    if legacy_requested:
+        raise ValueError(
+            "Use either continuation=ContinuationConfig(...) or legacy nk_coarse/coarse_* inputs, not both."
+        )
+    return continuation
 
 
 def _resolve_density_target(
@@ -794,6 +917,9 @@ __all__ = [
     "SCFRunConfig",
     "QRRunConfig",
     "RTRRunConfig",
+    "DensityMatrixSeed",
+    "VariationalSeed",
+    "ContinuationConfig",
     "SolveStageResult",
     "SolveResult",
     "solve",
