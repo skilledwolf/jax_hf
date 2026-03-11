@@ -14,12 +14,15 @@ except metadata.PackageNotFoundError:  # pragma: no cover - package not installe
 # Export mixing (kept intact) and expose skeleton API
 from . import mixing  # noqa: F401
 from .api import (  # noqa: F401
+    ContinuationConfig,
+    DensityMatrixSeed,
     HFProblem,
     QRRunConfig,
     RTRRunConfig,
     SCFRunConfig,
     SolveResult,
     SolveStageResult,
+    VariationalSeed,
     solve,
     run_scf,
     run_scf_coarse_to_fine,
@@ -60,6 +63,9 @@ __all__ = [
     "SCFRunConfig",
     "QRRunConfig",
     "RTRRunConfig",
+    "DensityMatrixSeed",
+    "VariationalSeed",
+    "ContinuationConfig",
     "SolveStageResult",
     "SolveResult",
     "HartreeFockKernel",

@@ -92,7 +92,7 @@ problem = jax_hf.HFProblem(
 result = jax_hf.solve(
     problem,
     solver="scf",
-    P0=jnp.zeros_like(H),
+    seed=jax_hf.DensityMatrixSeed(jnp.zeros_like(H)),
     n_electrons_per_degeneracy=float(ne_target),
     config=jax_hf.SCFRunConfig(max_iter=50, comm_tol=1e-3, diis_size=6),
 )
@@ -101,7 +101,7 @@ print(result.fine.n_iter, float(result.mu))
 qr = jax_hf.solve(
     problem,
     solver="qr",
-    P0=jnp.zeros_like(H),
+    seed=jax_hf.DensityMatrixSeed(jnp.zeros_like(H)),
     n_electrons_per_degeneracy=float(ne_target),
     config=jax_hf.QRRunConfig(max_iter=80, comm_tol=1e-5, p_tol=1e-3),
 )
@@ -112,6 +112,8 @@ qr = jax_hf.solve(
 `run_variational_qr(...)`, and `run_variational_rtr(...)` call the same path.
 The legacy `electrondensity0` argument is still accepted as an alias for
 `n_electrons_per_degeneracy`, but new code should prefer the latter.
+Likewise, the legacy `P0` / `params0` / `nk_coarse` inputs still work, but the
+preferred interface is `seed=...` plus `continuation=ContinuationConfig(...)`.
 
 ## Coarse-to-fine continuation (`nk_coarse`)
 
@@ -126,11 +128,13 @@ import jax_hf
 out = jax_hf.solve(
     problem,
     solver="scf",
-    P0=P0,
+    seed=jax_hf.DensityMatrixSeed(P0),
     n_electrons_per_degeneracy=float(ne_target),
-    nk_coarse=64,
-    coarse_config=jax_hf.SCFRunConfig(max_iter=80, comm_tol=1e-3, diis_size=6),
-    fine_config=jax_hf.SCFRunConfig(max_iter=50, comm_tol=1e-4, diis_size=6),
+    continuation=jax_hf.ContinuationConfig(
+        nk_coarse=64,
+        coarse_config=jax_hf.SCFRunConfig(max_iter=80, comm_tol=1e-3, diis_size=6),
+        fine_config=jax_hf.SCFRunConfig(max_iter=50, comm_tol=1e-4, diis_size=6),
+    ),
 )
 print("coarse iters:", int(out.coarse.n_iter) if out.coarse else None)
 print("fine iters:", int(out.fine.n_iter))
