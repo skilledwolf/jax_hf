@@ -56,6 +56,8 @@ def _orbital_preconditioner_diag(comm: jax.Array,
 
 
 def _reuse_available(F: jax.Array, eps: jax.Array, C: jax.Array) -> bool:
+    if eps is None or C is None:
+        return False
     if eps.ndim != F.ndim - 1:
         return False
     if C.ndim != F.ndim:
@@ -76,8 +78,8 @@ def orbital_preconditioner(comm: jax.Array,
                            delta: float = 1e-3,
                            *,
                            mode: int = PRECOND_EIGH,
-                           eps: jax.Array = jnp.zeros(()),
-                           C: jax.Array = jnp.zeros(()),
+                           eps: jax.Array | None = None,
+                           C: jax.Array | None = None,
                            auto_nb: int = 128) -> jax.Array:
     """
     Precondition the AO-basis commutator using an orbital-Hessian approximation.
@@ -449,19 +451,21 @@ def cdiis_update(state: DIISState,
 # -------------------------------------------------------------------------
 # 5) Mixer dispatcher with preconditioning (EDIIS → CDIIS → Broyden)
 # -------------------------------------------------------------------------
-PHASE_EDIIS = jnp.int32(0)
-PHASE_CDIIS = jnp.int32(1)
-PHASE_BROYDEN = jnp.int32(2)
+PHASE_EDIIS = 0
+PHASE_CDIIS = 1
+PHASE_BROYDEN = 2
 
 
 class MixerState(NamedTuple):
     ediis:   EDIISState
     cdiis:   DIISState
     broyden: BroydenState
-    phase:   jnp.int32
+    phase:   int
 
 
 def mixer_init(max_vecs: int, P_shape: Tuple[int, ...], dtype=jnp.complex128) -> MixerState:
+    if int(max_vecs) <= 0:
+        raise ValueError(f"diis_size must be a positive integer, got {max_vecs}.")
     return MixerState(
         ediis=ediis_init(max_vecs, P_shape, dtype=dtype),
         cdiis=diis_init(max_vecs, P_shape, dtype=dtype),
@@ -490,8 +494,8 @@ def mixer_update(state: MixerState,
                  precond_delta: float = 5e-3,
                  precond_mode: int = PRECOND_EIGH,
                  precond_auto_nb: int = 128,
-                 precond_eps: jax.Array = jnp.zeros(()),
-                 precond_C: jax.Array = jnp.zeros(()),
+                 precond_eps: jax.Array | None = None,
+                 precond_C: jax.Array | None = None,
                  cdiis_blend_keep: float = 0.5,
                  cdiis_blend_new: float = 0.5
                 ) -> tuple[MixerState, jax.Array]:

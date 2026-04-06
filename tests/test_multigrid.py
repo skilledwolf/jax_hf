@@ -79,6 +79,20 @@ def test_coarse_to_fine_scf_runs():
     np.testing.assert_allclose(P_fin, np.conj(np.swapaxes(P_fin, -1, -2)), atol=1e-6)
 
 
+def test_coarse_to_fine_variational_rejects_mismatched_seed_shape():
+    inputs = _make_variational_multigrid_inputs()
+    bad_seed = np.zeros((10, 10, 2, 2), dtype=np.complex64)
+    inputs["P0_f"] = bad_seed
+
+    with pytest.raises(ValueError, match="P0_f must have shape"):
+        coarse_to_fine_variational(
+            **inputs,
+            solver="qr",
+            coarse_var_kwargs=dict(max_iter=20, comm_tol=1e-3, p_tol=1e-3),
+            fine_var_kwargs=dict(max_iter=20, comm_tol=1e-3, p_tol=1e-3),
+        )
+
+
 def _make_variational_multigrid_inputs():
     """Shared tiny model for variational multigrid tests."""
     nk_f, nk_c = 12, 6

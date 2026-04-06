@@ -4,6 +4,7 @@ import pytest
 
 from jax_hf import (
     ContinuationConfig,
+    DEFAULT_SOLVER,
     DensityMatrixSeed,
     HFProblem,
     QRRunConfig,
@@ -71,6 +72,33 @@ def test_solve_accepts_explicit_density_seed():
     assert result.solver == "scf"
     assert result.fock.shape == problem.hamiltonian.shape
     assert result.history["n_iter"] == result.n_iter
+
+
+def test_solve_defaults_to_scf():
+    problem = _two_band_problem()
+    result = solve(
+        problem,
+        seed=DensityMatrixSeed(jnp.zeros_like(problem.hamiltonian)),
+        n_electrons_per_degeneracy=1.0,
+        config=SCFRunConfig(max_iter=12, comm_tol=1e-8, diis_size=2),
+    )
+
+    assert DEFAULT_SOLVER == "scf"
+    assert isinstance(result, SolveResult)
+    assert result.solver == "scf"
+    assert result.params is None
+
+
+def test_run_scf_rejects_unreachable_density_target():
+    problem = _two_band_problem()
+
+    with pytest.raises(ValueError, match="physically reachable range"):
+        run_scf(
+            problem,
+            P0=jnp.zeros_like(problem.hamiltonian),
+            n_electrons_per_degeneracy=3.0,
+            config=SCFRunConfig(max_iter=12, comm_tol=1e-8, diis_size=2),
+        )
 
 
 def test_solve_rejects_mismatched_config_type():

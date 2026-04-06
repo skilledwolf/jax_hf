@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from .utils import validate_electron_count
 from .variational import (
     VariationalHFParams,
     _adjust_params_particle_number,
@@ -699,6 +700,12 @@ def jit_variational_rtr_iteration(hf_step):
         return_params: bool = False,
         **kwargs,
     ):
+        validate_electron_count(
+            hf_step.w2d,
+            hf_step.h.shape[-1],
+            electrondensity0,
+            context="electrondensity0",
+        )
         if params0 is None:
             if P0 is None:
                 raise ValueError("Either P0 or params0 must be provided")

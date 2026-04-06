@@ -15,6 +15,7 @@ except metadata.PackageNotFoundError:  # pragma: no cover - package not installe
 from . import mixing  # noqa: F401
 from .api import (  # noqa: F401
     ContinuationConfig,
+    DEFAULT_SOLVER,
     DensityMatrixSeed,
     HFProblem,
     QRRunConfig,
@@ -31,7 +32,7 @@ from .api import (  # noqa: F401
     run_variational_rtr,
     run_variational_rtr_coarse_to_fine,
 )
-from .main import HartreeFockKernel, jit_hartreefock_iteration  # noqa: F401
+from .main import HartreeFockKernel, hartreefock_iteration, jit_hartreefock_iteration  # noqa: F401
 from .variational import (  # noqa: F401
     VariationalHFParams,
     init_variational_params_from_density,
@@ -60,6 +61,7 @@ from .multigrid import (  # noqa: F401
 __all__ = [
     "mixing",
     "HFProblem",
+    "DEFAULT_SOLVER",
     "SCFRunConfig",
     "QRRunConfig",
     "RTRRunConfig",
@@ -69,6 +71,7 @@ __all__ = [
     "SolveStageResult",
     "SolveResult",
     "HartreeFockKernel",
+    "hartreefock_iteration",
     "jit_hartreefock_iteration",
     "solve",
     "run_scf",

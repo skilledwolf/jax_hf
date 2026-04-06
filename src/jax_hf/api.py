@@ -8,13 +8,14 @@ import jax.numpy as jnp
 
 from .main import HartreeFockKernel, jit_hartreefock_iteration
 from .mixing import PRECOND_AUTO
-from .utils import density_matrix_from_fock, hermitize, resample_kgrid
+from .utils import density_matrix_from_fock, hermitize, resample_kgrid, validate_electron_count
 from .variational import VariationalHFParams
 from .variational_qr import jit_variational_qr_iteration
 from .variational_rtr import jit_variational_rtr_iteration
 
 
 SolverName = Literal["scf", "qr", "rtr"]
+DEFAULT_SOLVER: SolverName = "scf"
 
 
 @dataclass(frozen=True)
@@ -263,7 +264,7 @@ class ContinuationConfig:
 def solve(
     problem: HFProblem,
     *,
-    solver: str = "scf",
+    solver: str | None = None,
     seed: DensityMatrixSeed | VariationalSeed | None = None,
     continuation: ContinuationConfig | None = None,
     P0: Any | None = None,
@@ -287,8 +288,9 @@ def solve(
     problem
         Fine-grid problem definition.
     solver
-        One of ``"scf"``, ``"qr"``, or ``"rtr"``. Common aliases such as
-        ``"jax"`` and ``"variational_qr"`` are accepted.
+        One of ``"scf"``, ``"qr"``, or ``"rtr"``. If omitted, defaults to
+        ``"scf"``. Common aliases such as ``"jax"`` and ``"variational_qr"``
+        are accepted.
     seed
         Explicit density-matrix or variational warm start. The legacy ``P0`` and
         ``params0`` inputs are still accepted.
@@ -306,6 +308,11 @@ def solve(
     n_target = _resolve_density_target(
         n_electrons_per_degeneracy=n_electrons_per_degeneracy,
         electrondensity0=electrondensity0,
+    )
+    _validate_problem_density_target(
+        problem,
+        n_target,
+        context="n_electrons_per_degeneracy",
     )
     P0, params0 = _normalize_seed_inputs(seed=seed, P0=P0, params0=params0)
     continuation_cfg = _normalize_continuation(
@@ -391,6 +398,11 @@ def solve(
         float(continuation_cfg.coarse_n_electrons_per_degeneracy)
         if continuation_cfg.coarse_n_electrons_per_degeneracy is not None
         else n_target
+    )
+    _validate_problem_density_target(
+        coarse_problem,
+        coarse_target,
+        context="coarse_n_electrons_per_degeneracy",
     )
 
     coarse = _solve_stage(
@@ -580,7 +592,9 @@ def run_variational_rtr_coarse_to_fine(
     )
 
 
-def _normalize_solver(solver: str) -> SolverName:
+def _normalize_solver(solver: str | None) -> SolverName:
+    if solver is None:
+        return DEFAULT_SOLVER
     key = str(solver).strip().lower().replace("-", "_")
     if key in ("scf", "jax", "jax_hf", "jaxhf"):
         return "scf"
@@ -671,6 +685,15 @@ def _resolve_density_target(
             "Received both n_electrons_per_degeneracy and electrondensity0 with different values."
         )
     return float(n_electrons_per_degeneracy)
+
+
+def _validate_problem_density_target(problem: HFProblem, n_target: float, *, context: str) -> None:
+    validate_electron_count(
+        problem.weights,
+        np.asarray(problem.hamiltonian).shape[-1],
+        n_target,
+        context=context,
+    )
 
 
 def _normalize_config(solver: SolverName, config: Any | None):
@@ -914,6 +937,7 @@ def _compute_dE(energies: np.ndarray) -> np.ndarray:
 
 __all__ = [
     "HFProblem",
+    "DEFAULT_SOLVER",
     "SCFRunConfig",
     "QRRunConfig",
     "RTRRunConfig",

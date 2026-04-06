@@ -9,7 +9,7 @@ from jax import lax
 
 from .linalg import eigh, normalize_block_specs
 from .mixing import PRECOND_AUTO, mixer_init_like, mixer_update, normalize_precond_mode
-from .utils import fermidirac, find_chemical_potential, selfenergy_fft
+from .utils import fermidirac, find_chemical_potential, selfenergy_fft, validate_electron_count
 
 
 class HartreeFockKernel:
@@ -107,6 +107,12 @@ class HartreeFockKernel:
 
     def __call__(self, P: jax.Array, electrondensity: float, level_shift: float = 0.0, mu_method: str = "bisection"):
         # one-step HF update (convenience; *not* used by the jitted loop)
+        validate_electron_count(
+            self.w2d,
+            self.h.shape[-1],
+            electrondensity,
+            context="electrondensity",
+        )
         F     = self.fock_matrix(P)
         eps, U = jnp.linalg.eigh(F)
         mu_raw = find_chemical_potential(eps, self.w2d, electrondensity, self.T, method=mu_method)
@@ -376,6 +382,12 @@ def jit_hartreefock_iteration(hf_step: HartreeFockKernel):
         ),
     )
     def run(P0, electrondensity0, **kwargs):
+        validate_electron_count(
+            hf_step.w2d,
+            hf_step.h.shape[-1],
+            electrondensity0,
+            context="electrondensity0",
+        )
         if "precond_mode" in kwargs:
             kwargs["precond_mode"] = normalize_precond_mode(kwargs["precond_mode"])
         if "eigh_block_specs" in kwargs:

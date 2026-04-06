@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 from .main import HartreeFockKernel, jit_hartreefock_iteration
-from .utils import density_matrix_from_fock, hermitize, resample_kgrid
+from .utils import density_matrix_from_fock, hermitize, resample_kgrid, validate_electron_count
 from .variational import jit_variational_hartreefock_iteration
 from .variational_qr import jit_variational_qr_iteration
 
@@ -78,6 +78,12 @@ def coarse_to_fine_scf(
         raise ValueError(f"reference_density_f must have shape {hamiltonian_f.shape}, got {reference_density_f.shape}")
     if coulomb_q_f.shape[0] != nk_f or coulomb_q_f.shape[1] != nk_f:
         raise ValueError("coulomb_q_f first two axes must match weights_f grid.")
+    validate_electron_count(
+        weights_f,
+        hamiltonian_f.shape[-1],
+        electrondensity0,
+        context="electrondensity0",
+    )
 
     # ---- fine kernel/runner (always needed) ----
     kernel_f = HartreeFockKernel(
@@ -286,7 +292,28 @@ def coarse_to_fine_variational(
     P0_f = hermitize(jnp.asarray(P0_f))
     reference_density_f = hermitize(jnp.asarray(reference_density_f)) if reference_density_f is not None else None
 
+    if weights_f.ndim != 2:
+        raise ValueError(f"weights_f must have shape (nk,nk), got {weights_f.shape}")
     nk_f = int(weights_f.shape[0])
+    if weights_f.shape[1] != nk_f:
+        raise ValueError(f"weights_f must be square (nk,nk), got {weights_f.shape}")
+    if hamiltonian_f.ndim < 4:
+        raise ValueError(f"hamiltonian_f must have shape (nk,nk,nb,nb), got {hamiltonian_f.shape}")
+    if hamiltonian_f.shape[0] != nk_f or hamiltonian_f.shape[1] != nk_f:
+        raise ValueError("hamiltonian_f first two axes must match weights_f grid.")
+    if P0_f.shape != hamiltonian_f.shape:
+        raise ValueError(f"P0_f must have shape {hamiltonian_f.shape}, got {P0_f.shape}")
+    if reference_density_f is not None and reference_density_f.shape != hamiltonian_f.shape:
+        raise ValueError(f"reference_density_f must have shape {hamiltonian_f.shape}, got {reference_density_f.shape}")
+    if coulomb_q_f.shape[0] != nk_f or coulomb_q_f.shape[1] != nk_f:
+        raise ValueError("coulomb_q_f first two axes must match weights_f grid.")
+    validate_electron_count(
+        weights_f,
+        hamiltonian_f.shape[-1],
+        electrondensity0,
+        context="electrondensity0",
+    )
+
 
     # ---- fine kernel/runner ----
     kernel_f = HartreeFockKernel(

@@ -4,7 +4,7 @@ import pytest
 import jax.numpy as jnp
 
 from jax_hf.main import HartreeFockKernel, jit_hartreefock_iteration
-from jax_hf.utils import fermidirac, find_chemical_potential, selfenergy_fft
+from jax_hf.utils import density_matrix_from_fock, fermidirac, find_chemical_potential, selfenergy_fft
 
 
 def _comm_rms(R: jnp.ndarray, weights_2d: jnp.ndarray) -> float:
@@ -24,6 +24,22 @@ def test_find_chemical_potential_hits_target_density():
     occ = fermidirac(bands - mu, 0.1)
     total = float(jnp.sum(weights[..., None] * occ))
     assert abs(total - 1.0) < 1e-4
+
+
+def test_find_chemical_potential_rejects_unreachable_density():
+    bands = jnp.array([[[0.0]]], dtype=jnp.float32)
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="physically reachable range"):
+        find_chemical_potential(bands, weights, n_electrons=2.0, T=0.1)
+
+
+def test_density_matrix_from_fock_rejects_unreachable_density():
+    F = jnp.array([[[[0.0]]]], dtype=jnp.complex64)
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="physically reachable range"):
+        density_matrix_from_fock(F, weights, n_electrons=2.0, T=0.1)
 
 
 def test_selfenergy_fft_single_point_matches_definition():
@@ -83,6 +99,34 @@ def test_hartreefock_iteration_converges_on_tiny_model():
     # components are below the comm_tol used in the loop.
     last_recorded = float(history["dC"][int(k_fin) - 1])
     assert last_recorded < 1e-6
+
+
+def test_hartreefock_iteration_rejects_nonpositive_diis_size():
+    weights = jnp.ones((1, 1), dtype=jnp.float32)
+    hamiltonian = jnp.array([[[[-0.5, 0.0], [0.0, 0.5]]]], dtype=jnp.complex64)
+    coulomb_q = jnp.array([[[[0.25]]]], dtype=jnp.complex64)
+
+    kernel = HartreeFockKernel(
+        weights=weights,
+        hamiltonian=hamiltonian,
+        coulomb_q=coulomb_q,
+        T=0.2,
+        include_hartree=False,
+        include_exchange=True,
+    )
+
+    runner = jit_hartreefock_iteration(kernel)
+    P0 = jnp.array([[[[0.6, 0.0], [0.0, 0.4]]]], dtype=jnp.complex64)
+
+    with pytest.raises(ValueError, match="diis_size must be a positive integer"):
+        runner(
+            P0,
+            electrondensity0=1.0,
+            max_iter=60,
+            comm_tol=1e-6,
+            diis_size=0,
+            precond_mode="diag",
+        )
 
 
 def test_hartreefock_kernel_auto_enables_hermitian_channel_packing_for_real_scalar_coulomb():

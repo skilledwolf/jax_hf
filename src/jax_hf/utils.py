@@ -14,6 +14,35 @@ from jax.scipy.special import expit
 from .linalg import eigh, normalize_block_specs
 
 
+def _has_tracer(value: Any) -> bool:
+    return isinstance(value, jax.core.Tracer)
+
+
+def validate_electron_count(
+    weights: Any,
+    nbands: int,
+    n_electrons: Any,
+    *,
+    context: str = "n_electrons",
+) -> None:
+    """Validate a requested particle count when concrete values are available."""
+    if _has_tracer(weights) or _has_tracer(n_electrons):
+        return
+
+    total_weight = float(np.real(np.asarray(weights)).sum())
+    target = float(np.asarray(n_electrons))
+    max_electrons = total_weight * int(nbands)
+    tol = max(1e-8, 1e-6 * max(1.0, abs(max_electrons)))
+
+    if not np.isfinite(target):
+        raise ValueError(f"{context} must be finite, got {target!r}.")
+    if target < -tol or target > max_electrons + tol:
+        raise ValueError(
+            f"{context}={target} is outside the physically reachable range "
+            f"[0, {max_electrons}] for {int(nbands)} bands and weights.sum()={total_weight}."
+        )
+
+
 def hermitize(X: jax.Array) -> jax.Array:
     """Hermitize the last two axes: 0.5*(X + X†)."""
     return 0.5 * (X + jnp.conj(jnp.swapaxes(X, -1, -2)))
@@ -306,6 +335,12 @@ def find_chemical_potential(
     When *maxiter* is ``None``, the iteration count is chosen automatically:
     bisection uses 30 (f32) / 54 (f64); Newton uses 15 (f32) / 25 (f64).
     """
+    validate_electron_count(
+        weights,
+        bands.shape[-1],
+        n_electrons,
+        context="n_electrons",
+    )
     method = str(method).lower()
     if method == "bisection":
         return _find_mu_bisection(bands, weights, n_electrons, T, maxiter=maxiter)
@@ -420,6 +455,12 @@ def density_matrix_from_fock(
 ) -> tuple[jax.Array, jax.Array]:
     """Build a physical density matrix P(k) from a (Hermitian) Fock matrix F(k)."""
     F = hermitize(jnp.asarray(F))
+    validate_electron_count(
+        weights,
+        F.shape[-1],
+        n_electrons,
+        context="n_electrons",
+    )
     eps, U = eigh(
         F,
         block_specs=eigh_block_specs,
