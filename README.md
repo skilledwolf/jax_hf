@@ -21,6 +21,8 @@ Project links:
 
 ## Installation
 
+Python 3.11+ is required.
+
 Users (PyPI):
 ```bash
 pip install jax-hf
@@ -30,11 +32,12 @@ Note: jax_hf depends on JAX. For CPU‑only installs, pip will usually pull a
 working wheel automatically. For GPU, follow JAX’s official install guide to
 select the correct extras/wheels for your CUDA/cuDNN stack. 
 
-Developers (editable install):
+Developers (editable install with test tools):
 ```bash
 git clone https://github.com/skilledwolf/jax_hf.git
 cd jax_hf
-pip install -e .
+pip install -e ".[dev]"
+pytest -q
 ```
 
 ## Quick start
@@ -110,6 +113,9 @@ qr = jax_hf.solve(
 `solve(...)` returns a standardized `SolveResult` with `fine` and optional
 `coarse` stage results. The convenience wrappers `run_scf(...)`,
 `run_variational_qr(...)`, and `run_variational_rtr(...)` call the same path.
+If `solver` is omitted, `solve(...)` uses `jax_hf.DEFAULT_SOLVER`, which is
+currently `"scf"`. Explicit solver selection is still recommended in examples
+and production scripts that depend on a specific algorithm.
 The legacy `electrondensity0` argument is still accepted as an alias for
 `n_electrons_per_degeneracy`, but new code should prefer the latter.
 Likewise, the legacy `P0` / `params0` / `nk_coarse` inputs still work, but the
@@ -147,15 +153,14 @@ class HartreeFockKernel:
     def __init__(self, weights, hamiltonian, coulomb_q, T: float):
         ...
 
-def hartreefock_iteration(
-    P0, electrondensity0, hf_step: HartreeFockKernel,
-    *, max_iter=100, comm_tol=5e-3, diis_size=4, log_every: int | None = 1,
-):
-    """Runs SCF and returns (P_fin, F_fin, E_fin, mu_fin, n_iter, history)."""
-
 def jit_hartreefock_iteration(hf_step: HartreeFockKernel):
-    """Returns a jitted version of hartreefock_iteration with static args."""
+    """Returns a jitted SCF runner for one kernel."""
 ```
+
+The returned runner is called as `runner(P0, electrondensity0, **solver_kwargs)`
+and returns `(P_fin, F_fin, E_fin, mu_fin, n_iter, history)`.
+For advanced integrations, the non-jitted `hartreefock_iteration(...)` is also
+exported from the root package.
 
 - shapes: `weights` is (nk, nk), `hamiltonian` is (nk, nk, d, d),
   `coulomb_q` is (nk, nk, 1, 1) or (nk, nk, d, d), `P0` matches (nk, nk, d, d).

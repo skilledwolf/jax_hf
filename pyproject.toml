@@ -11,12 +11,12 @@ authors = [
   {name = "Tobias Wolf"}
 ]
 requires-python = ">=3.11"
+license = "BSD-2-Clause"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 keywords = ["physics", "condensed matter", "hartree fock", "mean field", "scf"]
-license = {file = "LICENSE"}
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3"
 ]
 dependencies = [
@@ -29,8 +29,11 @@ dependencies = [
 
 dynamic = ["version"]
 
-# [project.optional-dependencies]
-# dev = ["tqdm", "jupyterlab"]
+[project.optional-dependencies]
+dev = [
+    "build",
+    "pytest",
+]
 
 [project.urls]
 Homepage = "https://github.com/skilledwolf/jax_hf"
@@ -48,12 +51,6 @@ where = ["src"]  # list of folders that contain the packages (["."] by default)
 # include = ["my_package*"]  # package names should match these glob patterns (["*"] by default)
 # exclude = ["my_package.tests*"]  # exclude packages matching these glob patterns (empty by default)
 namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
-
-[tool.setuptools]
-license-files = [
-  "LICENSE",
-  "THIRD_PARTY_NOTICES.md",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
