@@ -47,6 +47,7 @@ from .fock import (  # noqa: F401
     free_energy,
     occupation_entropy,
 )
+from .utils import resample_kgrid  # noqa: F401
 
 __all__ = [
     # Kernel (problem definition + precomputed arrays)
@@ -65,4 +66,6 @@ __all__ = [
     "hf_energy",
     "free_energy",
     "occupation_entropy",
+    # Continuation / seeding utilities
+    "resample_kgrid",
 ]

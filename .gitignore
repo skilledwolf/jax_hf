@@ -20,6 +20,7 @@ playground-*/*
 !examples/multilayer_graphene_density_scan_extended.py
 !examples/multilayer_graphene_density_scan_hartree.py
 !examples/multilayer_graphene_reference_scf_scan.py
+!examples/multilayer_graphene_baseline_check.py
 
 # Local History for Visual Studio Code
 .history/

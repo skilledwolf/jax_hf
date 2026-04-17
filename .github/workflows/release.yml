@@ -48,7 +48,12 @@ jobs:
           import jax_hf
           import importlib.metadata as md
           print("jax_hf version:", md.version("jax_hf"))
-          print("default solver:", jax_hf.DEFAULT_SOLVER)
+          # Smoke-check public API surface that downstream users rely on.
+          for name in ("HartreeFockKernel", "solve", "solve_scf",
+                       "SolverConfig", "SCFConfig", "build_fock",
+                       "hf_energy", "resample_kgrid"):
+              assert hasattr(jax_hf, name), f"missing public symbol: {name}"
+          print("public API OK:", sorted(jax_hf.__all__))
           PY
 
       # Only publish on tag refs like v0.1.0
