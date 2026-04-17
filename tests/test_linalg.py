@@ -3,7 +3,6 @@ import numpy as np
 import jax.numpy as jnp
 
 from jax_hf.linalg import eigh
-from jax_hf.main import HartreeFockKernel, jit_hartreefock_iteration
 from jax_hf.utils import selfenergy_fft
 
 
@@ -174,39 +173,3 @@ def test_selfenergy_fft_block_specs_falls_back_to_full_when_coupled():
     assert diff > 1e-3
 
 
-def test_hartreefock_iteration_accepts_block_specs_kwarg():
-    # Tiny 1x1 grid HF step, just to ensure the kwargs thread through the JIT runner.
-    weights = jnp.ones((1, 1), dtype=jnp.float32)
-    hamiltonian = jnp.diag(jnp.array([-1.0, -0.5, 0.5, 1.0], dtype=jnp.float32)).astype(jnp.complex64)
-    hamiltonian = hamiltonian[None, None, ...]  # (1,1,4,4)
-
-    coulomb_q = jnp.zeros((1, 1, 1, 1), dtype=jnp.complex64)
-    kernel = HartreeFockKernel(
-        weights=weights,
-        hamiltonian=hamiltonian,
-        coulomb_q=coulomb_q,
-        T=0.2,
-        include_hartree=False,
-        include_exchange=True,
-    )
-    runner = jit_hartreefock_iteration(kernel)
-
-    P0 = jnp.eye(4, dtype=jnp.complex64)[None, None, ...] * 0.5
-
-    P_fin, F_fin, E_fin, mu_fin, k_fin, history = runner(
-        P0,
-        electrondensity0=2.0,
-        max_iter=1,
-        comm_tol=1e-12,
-        diis_size=2,
-        precond_mode="diag",
-        eigh_block_specs=[{"block_sizes": [2, 2]}],
-        eigh_check_offdiag=True,
-    )
-
-    assert P_fin.shape == (1, 1, 4, 4)
-    assert F_fin.shape == (1, 1, 4, 4)
-    assert np.isfinite(np.array(E_fin))
-    assert np.isfinite(np.array(mu_fin))
-    assert int(k_fin) == 1
-    assert "E" in history and "dC" in history

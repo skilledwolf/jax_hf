@@ -1,4 +1,22 @@
-"""jax_hf 
+"""jax_hf — Hartree-Fock solvers on 2D k-meshes.
+
+Two solvers are available, sharing a single :class:`HartreeFockKernel`:
+
+* :func:`solve` (alias :func:`solve_direct_minimization`) — preconditioned
+  Riemannian CG on Stiefel × capped simplex.  One Fock build per iteration,
+  eigen-free inner loop, Cayley retraction.  **Default and recommended.**
+* :func:`solve_scf` — reference self-consistent field iteration with linear
+  mixing.  Useful as a baseline or fallback.
+
+Both return rich NamedTuples (:class:`SolveResult`, :class:`SCFResult`) with
+the converged density, Fock matrix, energy, and full iteration history.
+
+Lower-level building blocks are exposed for users who want to evaluate the
+HF objective at arbitrary densities without running a solver:
+
+* :func:`build_fock` — construct the Fock matrix at a given density
+* :func:`hf_energy` — total HF energy at (P, Σ, H, h)
+* :func:`free_energy` — free energy Ω = E − T·S
 """
 
 from __future__ import annotations
@@ -11,88 +29,40 @@ try:  # pragma: no cover - metadata only
 except metadata.PackageNotFoundError:  # pragma: no cover - package not installed
     pass
 
-# Export mixing (kept intact) and expose skeleton API
-from . import mixing  # noqa: F401
-from .api import (  # noqa: F401
-    ContinuationConfig,
-    DEFAULT_SOLVER,
-    DensityMatrixSeed,
-    HFProblem,
-    QRRunConfig,
-    RTRRunConfig,
-    SCFRunConfig,
+from .problem import HartreeFockKernel  # noqa: F401
+from .solver import (  # noqa: F401
+    SolverConfig,
     SolveResult,
-    SolveStageResult,
-    VariationalSeed,
     solve,
-    run_scf,
-    run_scf_coarse_to_fine,
-    run_variational_qr,
-    run_variational_qr_coarse_to_fine,
-    run_variational_rtr,
-    run_variational_rtr_coarse_to_fine,
+    solve_direct_minimization,
 )
-from .main import HartreeFockKernel, hartreefock_iteration, jit_hartreefock_iteration  # noqa: F401
-from .variational import (  # noqa: F401
-    VariationalHFParams,
-    init_variational_params_from_density,
-    jit_variational_hartreefock_iteration,
-    variational_hartreefock_optimize,
+from .reference_scf import (  # noqa: F401
+    SCFConfig,
+    SCFResult,
+    solve_scf,
 )
-from .variational_qr import (  # noqa: F401
-    jit_variational_qr_iteration,
-    variational_qr_optimize,
-)
-from .variational_rtr import (  # noqa: F401
-    jit_variational_rtr_iteration,
-    variational_rtr_optimize,
-)
-# Minimal utils shim to aid migration
-from . import utils  # noqa: F401
-from .multigrid import (  # noqa: F401
-    HFRunResult,
-    MultigridHFResult,
-    MultigridVariationalResult,
-    VariationalRunResult,
-    coarse_to_fine_scf,
-    coarse_to_fine_variational,
+from .fock import (  # noqa: F401
+    build_fock,
+    hf_energy,
+    free_energy,
+    occupation_entropy,
 )
 
 __all__ = [
-    "mixing",
-    "HFProblem",
-    "DEFAULT_SOLVER",
-    "SCFRunConfig",
-    "QRRunConfig",
-    "RTRRunConfig",
-    "DensityMatrixSeed",
-    "VariationalSeed",
-    "ContinuationConfig",
-    "SolveStageResult",
-    "SolveResult",
+    # Kernel (problem definition + precomputed arrays)
     "HartreeFockKernel",
-    "hartreefock_iteration",
-    "jit_hartreefock_iteration",
+    # Direct-minimization solver (primary)
+    "SolverConfig",
+    "SolveResult",
     "solve",
-    "run_scf",
-    "run_scf_coarse_to_fine",
-    "run_variational_qr",
-    "run_variational_qr_coarse_to_fine",
-    "run_variational_rtr",
-    "run_variational_rtr_coarse_to_fine",
-    "VariationalHFParams",
-    "init_variational_params_from_density",
-    "variational_hartreefock_optimize",
-    "jit_variational_hartreefock_iteration",
-    "utils",
-    "HFRunResult",
-    "MultigridHFResult",
-    "MultigridVariationalResult",
-    "VariationalRunResult",
-    "coarse_to_fine_scf",
-    "coarse_to_fine_variational",
-    "jit_variational_qr_iteration",
-    "variational_qr_optimize",
-    "jit_variational_rtr_iteration",
-    "variational_rtr_optimize",
+    "solve_direct_minimization",
+    # Reference SCF solver (fallback / baseline)
+    "SCFConfig",
+    "SCFResult",
+    "solve_scf",
+    # HF objective building blocks
+    "build_fock",
+    "hf_energy",
+    "free_energy",
+    "occupation_entropy",
 ]

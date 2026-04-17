@@ -7,176 +7,97 @@
 [![Build](https://github.com/skilledwolf/jax_hf/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/skilledwolf/jax_hf/actions/workflows/build-and-test.yml)
 [![Release](https://github.com/skilledwolf/jax_hf/actions/workflows/release.yml/badge.svg)](https://github.com/skilledwolf/jax_hf/actions/workflows/release.yml)
 
-jax_hf provides a JAX implementation of a Hartree–Fock self‑consistent field
-(SCF) loop on uniform 2D k‑grids, with optional JIT compilation.
+jax_hf provides two JAX-jitted solvers for the Hartree–Fock free-energy
+minimisation problem on 2D k-meshes:
 
-- FFT‑based exchange in k‑space
-- Dense Hermitian diagonalization (JAX eigh)
-- DIIS/EDIIS‑style mixing (robust convergence)
-- NumPy/JAX‑friendly API, easy to integrate with other JAX code
+* **Direct minimisation** (primary): preconditioned Riemannian CG on
+  Stiefel × capped simplex, eigen-free inner loop, Cayley retraction,
+  one Fock build per iteration.
+* **Reference SCF** (baseline / fallback): standard Roothaan iteration
+  with linear mixing.
 
-Project links:
-- PyPI: https://pypi.org/project/jax-hf/
-- Source: https://github.com/skilledwolf/jax_hf
+Exchange and Hartree can both be included, and the exchange kernel may
+be layer-resolved.  See `examples/` for density-scan scripts on a
+bilayer graphene model.
 
-## Installation
+> **v2.0.0 note:** This release is a clean-slate rewrite.  The
+> entire public API has changed relative to the deprecated v1.x line
+> (which was already a skeleton in v1.1.0).  See
+> [`MIGRATION.md`](MIGRATION.md) for the migration guide.
 
-Python 3.11+ is required.
+### Install
 
-Users (PyPI):
 ```bash
 pip install jax-hf
 ```
 
-Note: jax_hf depends on JAX. For CPU‑only installs, pip will usually pull a
-working wheel automatically. For GPU, follow JAX’s official install guide to
-select the correct extras/wheels for your CUDA/cuDNN stack. 
-
-Developers (editable install with test tools):
-```bash
-git clone https://github.com/skilledwolf/jax_hf.git
-cd jax_hf
-pip install -e ".[dev]"
-pytest -q
-```
-
-## Quick start
+### Minimal example
 
 ```python
-import numpy as np
 import jax.numpy as jnp
 import jax_hf
 
-# Grid and shapes
-nk = 128; d = 2
-weights = np.ones((nk, nk)) * ((2/nk)*(2/nk) / (2*np.pi)**2)  # scalar mesh measure
-H = np.zeros((nk, nk, d, d), dtype=np.complex128)
-K = np.linspace(-1.0, 1.0, nk)
-Vq = (1.0 / np.sqrt((K[:, None]**2 + K[None, :]**2) + 0.1)).astype(np.complex128)[..., None, None]
-P0 = np.zeros_like(H)
-
-# Target electron density (half‑filling)
-ne_target = 0.5 * d * weights.sum()
-
-# Build HF kernel (JAX arrays inside)
+# Build a HartreeFockKernel: precomputes the FFT of the interaction kernel,
+# the Hartree matrix, etc., ready for JIT.
 kernel = jax_hf.HartreeFockKernel(
-    weights,                 # (nk, nk)
-    H,                       # (nk, nk, d, d)
-    Vq,                      # (nk, nk, 1, 1) or (nk, nk, d, d)
-    T=0.5,                   # temperature
+    weights=weights,          # (nk1, nk2) k-point weights
+    hamiltonian=hamiltonian,  # (nk1, nk2, nb, nb) single-particle Hamiltonian
+    coulomb_q=coulomb_q,      # (nk1, nk2, 1, 1) scalar or (nk1, nk2, nb, nb) layer-resolved
+    T=0.1,
+    include_hartree=False,    # set True for Hartree; also pass reference_density + hartree_matrix
+    include_exchange=True,
 )
 
-# JIT‑compile the SCF iteration function (optional but recommended)
-hf_iter = jax_hf.jit_hartreefock_iteration(kernel)
+# Solve (direct minimisation, default)
+result = jax_hf.solve(kernel, P0=jnp.zeros_like(hamiltonian), n_electrons=N)
+print(result.energy, result.converged, result.n_iter)
+# result.density, result.fock, result.Q, result.p, result.mu, result.history
 
-P_fin, F_fin, E_fin, mu_fin, n_iter, history = hf_iter(
-    P0, float(ne_target),
-    max_iter=50, comm_tol=1e-3, diis_size=6, log_every=None,
-)
-print("iters:", int(n_iter), "mu:", float(mu_fin), "E:", float(E_fin))
+# Or use SCF as a fallback baseline
+result_scf = jax_hf.solve_scf(kernel, P0=jnp.zeros_like(hamiltonian), n_electrons=N)
 ```
 
-## Prepared-problem API
+### Config
 
-If you want a stable public surface above the low-level JIT wrappers, use the
-prepared-problem API:
+Both solvers take a Config dataclass with sensible defaults:
 
 ```python
-import jax_hf
-import jax.numpy as jnp
-
-problem = jax_hf.HFProblem(
-    weights=weights,
-    hamiltonian=H,
-    coulomb_q=Vq,
-    T=0.5,
-)
-
-result = jax_hf.solve(
-    problem,
-    solver="scf",
-    seed=jax_hf.DensityMatrixSeed(jnp.zeros_like(H)),
-    n_electrons_per_degeneracy=float(ne_target),
-    config=jax_hf.SCFRunConfig(max_iter=50, comm_tol=1e-3, diis_size=6),
-)
-print(result.fine.n_iter, float(result.mu))
-
-qr = jax_hf.solve(
-    problem,
-    solver="qr",
-    seed=jax_hf.DensityMatrixSeed(jnp.zeros_like(H)),
-    n_electrons_per_degeneracy=float(ne_target),
-    config=jax_hf.QRRunConfig(max_iter=80, comm_tol=1e-5, p_tol=1e-3),
-)
+jax_hf.SolverConfig(max_iter=200, tol_E=1e-7, max_step=0.6, project_fn=None, ...)
+jax_hf.SCFConfig(max_iter=200, mixing=0.3, density_tol=1e-7, comm_tol=1e-6, ...)
 ```
 
-`solve(...)` returns a standardized `SolveResult` with `fine` and optional
-`coarse` stage results. The convenience wrappers `run_scf(...)`,
-`run_variational_qr(...)`, and `run_variational_rtr(...)` call the same path.
-If `solver` is omitted, `solve(...)` uses `jax_hf.DEFAULT_SOLVER`, which is
-currently `"scf"`. Explicit solver selection is still recommended in examples
-and production scripts that depend on a specific algorithm.
-The legacy `electrondensity0` argument is still accepted as an alias for
-`n_electrons_per_degeneracy`, but new code should prefer the latter.
-Likewise, the legacy `P0` / `params0` / `nk_coarse` inputs still work, but the
-preferred interface is `seed=...` plus `continuation=ContinuationConfig(...)`.
+`project_fn` lets you enforce symmetry constraints (spin, valley, time
+reversal, spatial) on the density and Fock at every iteration.  See
+`jax_hf.symmetry.make_project_fn`.
 
-## Coarse-to-fine continuation (`nk_coarse`)
+### Public API
 
-For large k-grids it can be helpful to converge on a smaller coarse grid and use
-the resulting mean-field self-energy as a seed for a fine-grid run. jax_hf
-includes a small helper that resamples (H, Vq, P) between uniform centered
-grids:
+| Name | Purpose |
+|---|---|
+| `HartreeFockKernel` | Problem + precomputed arrays |
+| `solve` (alias `solve_direct_minimization`), `SolverConfig`, `SolveResult` | Primary solver |
+| `solve_scf`, `SCFConfig`, `SCFResult` | Reference SCF solver |
+| `build_fock`, `hf_energy`, `free_energy`, `occupation_entropy` | HF objective building blocks |
 
-```python
-import jax_hf
+Lower-level modules (`jax_hf.utils`, `jax_hf.symmetry`, `jax_hf.linalg`,
+`jax_hf.fock`) expose the individual pieces for users who need them.
 
-out = jax_hf.solve(
-    problem,
-    solver="scf",
-    seed=jax_hf.DensityMatrixSeed(P0),
-    n_electrons_per_degeneracy=float(ne_target),
-    continuation=jax_hf.ContinuationConfig(
-        nk_coarse=64,
-        coarse_config=jax_hf.SCFRunConfig(max_iter=80, comm_tol=1e-3, diis_size=6),
-        fine_config=jax_hf.SCFRunConfig(max_iter=50, comm_tol=1e-4, diis_size=6),
-    ),
-)
-print("coarse iters:", int(out.coarse.n_iter) if out.coarse else None)
-print("fine iters:", int(out.fine.n_iter))
+### Examples
+
+* `examples/multilayer_graphene_density_scan.py` — PM/SVP density scan
+  for bilayer graphene, direct minimisation, Fock only
+* `examples/multilayer_graphene_density_scan_extended.py` — adds
+  spin-polarised and "SVP flipped" branches (4 total)
+* `examples/multilayer_graphene_density_scan_hartree.py` — same four
+  branches with layer-resolved Coulomb and Hartree included
+* `examples/multilayer_graphene_reference_scf_scan.py` — SCF baseline
+  scan for side-by-side comparison
+
+### Running tests
+
+```bash
+pytest tests/
 ```
 
-## API
-
-```python
-class HartreeFockKernel:
-    def __init__(self, weights, hamiltonian, coulomb_q, T: float):
-        ...
-
-def jit_hartreefock_iteration(hf_step: HartreeFockKernel):
-    """Returns a jitted SCF runner for one kernel."""
-```
-
-The returned runner is called as `runner(P0, electrondensity0, **solver_kwargs)`
-and returns `(P_fin, F_fin, E_fin, mu_fin, n_iter, history)`.
-For advanced integrations, the non-jitted `hartreefock_iteration(...)` is also
-exported from the root package.
-
-- shapes: `weights` is (nk, nk), `hamiltonian` is (nk, nk, d, d),
-  `coulomb_q` is (nk, nk, 1, 1) or (nk, nk, d, d), `P0` matches (nk, nk, d, d).
-- returns: converged density `P_fin`, mean‑field `F_fin`, total energy,
-  chemical potential `mu_fin`, iteration count, and a small `history` dict with
-  energy/commutator traces.
-
-## Versioning
-
-Versions are derived from git tags using setuptools_scm. Tags like `v1.2.3`
-produce version `1.2.3`; non‑tag builds produce development versions.
-
-## License
-
-BSD 2‑Clause — see `LICENSE`.
-
-Third‑party notices: see `THIRD_PARTY_NOTICES.md`.
-
-**Author: Dr. Tobias Wolf**
+The bilayer regression tests (`tests/test_bilayer_regression.py`) require
+`contimod` and `contimod_graphene` and will be skipped otherwise.

@@ -14,7 +14,12 @@ backup
 playground/*
 examples/*
 playground-*/*
+!examples/_bilayer_common.py
 !examples/contimod_example_meshgrid_offline.py
+!examples/multilayer_graphene_density_scan.py
+!examples/multilayer_graphene_density_scan_extended.py
+!examples/multilayer_graphene_density_scan_hartree.py
+!examples/multilayer_graphene_reference_scf_scan.py
 
 # Local History for Visual Studio Code
 .history/

@@ -8,9 +8,31 @@ import sys
 import jax_hf
 
 
-def test_root_package_exports_documented_low_level_entry_points():
-    assert hasattr(jax_hf, "hartreefock_iteration")
-    assert hasattr(jax_hf, "jit_hartreefock_iteration")
+def test_root_package_exports_new_api():
+    # Kernel + direct-minimization solver (primary)
+    assert hasattr(jax_hf, "HartreeFockKernel")
+    assert hasattr(jax_hf, "SolverConfig")
+    assert hasattr(jax_hf, "SolveResult")
+    assert hasattr(jax_hf, "solve")
+    assert hasattr(jax_hf, "solve_direct_minimization")
+    # Reference SCF solver
+    assert hasattr(jax_hf, "SCFConfig")
+    assert hasattr(jax_hf, "SCFResult")
+    assert hasattr(jax_hf, "solve_scf")
+    # HF objective building blocks
+    assert hasattr(jax_hf, "build_fock")
+    assert hasattr(jax_hf, "hf_energy")
+    assert hasattr(jax_hf, "free_energy")
+
+
+def test_removed_v1_api_is_absent():
+    """These names were in v1.0.2 / v1.1.0 but are deliberately removed in v2.0.0."""
+    assert not hasattr(jax_hf, "HFProblem"), "HFProblem was removed; use HartreeFockKernel"
+    assert not hasattr(jax_hf, "jit_solve"), "jit_solve was renamed to solve / solve_direct_minimization"
+    assert not hasattr(jax_hf, "hartreefock_iteration"), "v1 SCF driver; use solve_scf"
+    assert not hasattr(jax_hf, "jit_hartreefock_iteration"), "v1 SCF driver; use solve_scf"
+    assert not hasattr(jax_hf, "HartreeFockResult"), "v1 result type; use SolveResult or SCFResult"
+    assert not hasattr(jax_hf, "mixing"), "v1 DIIS module; tied to SCF, removed with the old solver"
 
 
 def test_import_does_not_allocate_jax_arrays_at_module_import():
