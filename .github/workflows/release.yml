@@ -51,7 +51,8 @@ jobs:
           # Smoke-check public API surface that downstream users rely on.
           for name in ("HartreeFockKernel", "solve", "solve_scf",
                        "SolverConfig", "SCFConfig", "build_fock",
-                       "hf_energy", "resample_kgrid"):
+                       "hf_energy", "resample_kgrid",
+                       "solve_continuation", "ContinuationResult"):
               assert hasattr(jax_hf, name), f"missing public symbol: {name}"
           print("public API OK:", sorted(jax_hf.__all__))
           PY

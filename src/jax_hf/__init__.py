@@ -48,6 +48,10 @@ from .fock import (  # noqa: F401
     occupation_entropy,
 )
 from .utils import resample_kgrid  # noqa: F401
+from .continuation import (  # noqa: F401
+    ContinuationResult,
+    solve_continuation,
+)
 
 __all__ = [
     # Kernel (problem definition + precomputed arrays)
@@ -68,4 +72,6 @@ __all__ = [
     "occupation_entropy",
     # Continuation / seeding utilities
     "resample_kgrid",
+    "ContinuationResult",
+    "solve_continuation",
 ]

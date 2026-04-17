@@ -78,9 +78,39 @@ reversal, spatial) on the density and Fock at every iteration.  See
 | `solve` (alias `solve_direct_minimization`), `SolverConfig`, `SolveResult` | Primary solver |
 | `solve_scf`, `SCFConfig`, `SCFResult` | Reference SCF solver |
 | `build_fock`, `hf_energy`, `free_energy`, `occupation_entropy` | HF objective building blocks |
+| `solve_continuation`, `ContinuationResult`, `resample_kgrid` | Coarse → fine multigrid driver + k-grid resampler |
 
 Lower-level modules (`jax_hf.utils`, `jax_hf.symmetry`, `jax_hf.linalg`,
 `jax_hf.fock`) expose the individual pieces for users who need them.
+
+### Coarse → fine continuation
+
+For large fine grids, `solve_continuation` runs a cheap coarse solve first
+and uses its density to seed the fine solve. The two stages can mix and
+match direct minimisation and SCF:
+
+```python
+import jax_hf
+from jax_hf import SCFConfig, SolverConfig
+
+coarse = jax_hf.HartreeFockKernel(weights_c, h_c, Vq_c, T=0.1)
+fine   = jax_hf.HartreeFockKernel(weights_f, h_f, Vq_f, T=0.1)
+
+result = jax_hf.solve_continuation(
+    coarse, fine, P0_coarse=jnp.zeros_like(h_c),
+    n_electrons_coarse=N, n_electrons_fine=N,
+    coarse_config=SCFConfig(max_iter=50, mixing=0.5),   # robust coarse
+    fine_config=SolverConfig(max_iter=200, tol_E=1e-8), # fast fine
+)
+# result.coarse, result.fine (each a SolveResult or SCFResult)
+# result.P0_fine (resampled coarse density used to seed the fine solve)
+```
+
+The driver is intentionally algorithm-agnostic: it resamples the coarse
+density onto the fine grid via `resample_kgrid` and hands off. Callers
+that need physics-aware seeding (reference-density interpolation,
+self-energy seeds, filling-consistent electron counts across grids) should
+construct both kernels themselves.
 
 ### Examples
 

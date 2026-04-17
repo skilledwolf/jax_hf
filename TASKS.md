@@ -22,3 +22,7 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done.
 - [x] Reconcile the README API section with the actual package exports, including whether `hartreefock_iteration` should be public.
 - [x] Investigate the current regression mismatch in `tests/test_meshgrid_regression.py` where the fixture expects `k_fin == 15` but the present run returns `13`.
 - [ ] Investigate the remaining `vcs_versioning` warning emitted during isolated builds.
+
+## v2.1
+
+- [x] Add `solve_continuation` / `ContinuationResult` — a thin coarse → fine multigrid driver so downstream callers don't re-implement the coarse-solve-then-resample-then-fine-solve sequence. Ships with validation tests for config dispatch, kernel shape mismatches, and convergence-to-same-fixed-point.
