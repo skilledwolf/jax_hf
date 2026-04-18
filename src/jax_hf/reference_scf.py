@@ -112,8 +112,8 @@ def solve_scf(
     The inner loop uses dense ``eigh`` at every SCF step (not eigen-free),
     which makes per-iteration cost slightly higher than direct minimization
     for small problems.  On the bilayer benchmark, direct minimization
-    converges ~8x faster end-to-end but SCF is more robust at phase
-    boundaries.
+    converges ~8x faster end-to-end and is also more robust at phase
+    boundaries (see ``MIGRATION.md``); SCF is retained as a baseline.
     """
     if config is None:
         config = SCFConfig()
