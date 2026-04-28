@@ -29,7 +29,23 @@ class HartreeFockKernel:
         include_exchange: bool = True,
         reference_density=None,
         hartree_matrix=None,
+        contact_terms=None,
     ):
+        """
+        Parameters
+        ----------
+        contact_terms : sequence of (g, O_i, O_j) tuples, optional
+            Additional flavor-bilinear *contact* (q-independent) interactions
+            of the form ``H = (1/2) g · O_i ⊗ O_j``.  Each term contributes
+            both Hartree and Fock channels via the BZ-averaged density:
+                σ_H = g · O_i · tr(O_j ρ̄)         (k-independent)
+                σ_F = -g · O_i · ρ̄ · O_j         (k-independent)
+            where ρ̄ = Σ_k w_k (P_k - refP_k).  ``O_i`` and ``O_j`` are
+            ``(n_orb, n_orb)`` operator matrices in flavor space.  Pass an
+            asymmetric pair plus its h.c. partner to model a Hermitian term
+            with O_i ≠ O_j (matches contimod's ``Shortrange`` convention,
+            cf. ``get_shortrange_MF_valley`` in contimod.meanfield).
+        """
         h = jnp.asarray(hamiltonian)
         self.h = h
         w2d = jnp.asarray(weights, dtype=h.real.dtype)
@@ -84,6 +100,41 @@ class HartreeFockKernel:
         else:
             self.HH = jnp.zeros(h.shape[-2:], dtype=h.real.dtype)
 
+        # Contact (q-independent) flavor-bilinear interactions. Always at
+        # least one term in the stack so that JIT shapes are static; if
+        # the user passes nothing, we install a zero-coupling dummy.
+        n_orb = int(h.shape[-1])
+        if contact_terms is None or len(contact_terms) == 0:
+            self.contact_g  = jnp.zeros((1,), dtype=h.real.dtype)
+            self.contact_Oi = jnp.zeros((1, n_orb, n_orb), dtype=h.dtype)
+            self.contact_Oj = jnp.zeros((1, n_orb, n_orb), dtype=h.dtype)
+        else:
+            gs, Ois, Ojs = [], [], []
+            for k, term in enumerate(contact_terms):
+                if len(term) != 3:
+                    raise ValueError(
+                        f"contact_terms[{k}] must be (g, O_i, O_j); got len={len(term)}"
+                    )
+                g_t, Oi_t, Oj_t = term
+                Oi_arr = jnp.asarray(Oi_t, dtype=h.dtype)
+                Oj_arr = jnp.asarray(Oj_t, dtype=h.dtype)
+                if Oi_arr.shape != (n_orb, n_orb):
+                    raise ValueError(
+                        f"contact_terms[{k}].O_i must have shape {(n_orb, n_orb)}, "
+                        f"got {Oi_arr.shape}"
+                    )
+                if Oj_arr.shape != (n_orb, n_orb):
+                    raise ValueError(
+                        f"contact_terms[{k}].O_j must have shape {(n_orb, n_orb)}, "
+                        f"got {Oj_arr.shape}"
+                    )
+                gs.append(jnp.asarray(g_t, dtype=h.real.dtype))
+                Ois.append(Oi_arr)
+                Ojs.append(Oj_arr)
+            self.contact_g  = jnp.stack(gs)
+            self.contact_Oi = jnp.stack(Ois)
+            self.contact_Oj = jnp.stack(Ojs)
+
     def as_args(self):
         """Dynamic inputs for jitted solver functions (no constant capture)."""
         return dict(
@@ -97,4 +148,7 @@ class HartreeFockKernel:
             include_hartree=self.include_hartree,
             include_exchange=self.include_exchange,
             exchange_hermitian_channel_packing=self.exchange_hermitian_channel_packing,
+            contact_g=self.contact_g,
+            contact_Oi=self.contact_Oi,
+            contact_Oj=self.contact_Oj,
         )

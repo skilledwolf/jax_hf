@@ -26,6 +26,9 @@ def build_fock(
     include_exchange: bool,
     include_hartree: bool,
     exchange_hermitian_channel_packing: bool,
+    contact_g: jax.Array | None = None,
+    contact_Oi: jax.Array | None = None,
+    contact_Oj: jax.Array | None = None,
     exchange_block_specs: Any | None = None,
     exchange_check_offdiag: bool | None = None,
     exchange_offdiag_atol: float = 1e-12,
@@ -35,6 +38,15 @@ def build_fock(
     """Build Fock matrix and return (Sigma, H_hartree, F).
 
     F = project(hermitize(h + Sigma[P] + H[P]))
+
+    ``Sigma`` includes the long-range Coulomb exchange (FFT convolution
+    with VR) plus, when ``contact_g/Oi/Oj`` are provided, k-independent
+    contributions from contact (q-independent) flavor-bilinear terms:
+        σ_contact = Σ_t [g_t · O_i_t · tr(O_j_t · ρ̄)
+                         - g_t · O_i_t · ρ̄ · O_j_t]
+    where ρ̄ = Σ_k w_k (P_k - refP_k). The standard ½·Tr((Σ+H)·P)
+    energy formula applied to the augmented Σ yields the right contact
+    energy automatically.
     """
     Sigma = (
         selfenergy_fft(
@@ -60,6 +72,24 @@ def build_fock(
         H = H_mat[None, None, ...]
     else:
         H = jnp.zeros_like(h)
+
+    # Contact (q-independent) flavor-bilinear contributions, k-independent.
+    if contact_g is not None and contact_Oi is not None and contact_Oj is not None:
+        # ρ̄ = Σ_k w_k (P_k − refP_k), shape (n_orb, n_orb)
+        rho_bar = jnp.einsum("ij,ijab->ab", w2d, (P - refP))
+        # Hartree-channel term: g_t · O_i_t · tr(O_j_t · ρ̄)
+        # tr_t = einsum over (j, i) of O_j_t · ρ̄ → tr(O_j_t @ ρ̄) for each t
+        tr_Oj_rho = jnp.einsum("tij,ji->t", contact_Oj, rho_bar)
+        sigma_h_contact = jnp.einsum(
+            "t,tij->ij", contact_g * tr_Oj_rho, contact_Oi
+        )
+        # Fock-channel term: -g_t · O_i_t · ρ̄ · O_j_t
+        oi_rho = jnp.einsum("tij,jk->tik", contact_Oi, rho_bar)
+        oi_rho_oj = jnp.einsum("tik,tkl->til", oi_rho, contact_Oj)
+        sigma_f_contact = jnp.einsum("t,tij->ij", -contact_g, oi_rho_oj)
+
+        sigma_contact = (sigma_h_contact + sigma_f_contact).astype(h.dtype)
+        Sigma = Sigma + sigma_contact[None, None, ...]
 
     F = _herm(h + Sigma + H)
     if project_fn is not None:

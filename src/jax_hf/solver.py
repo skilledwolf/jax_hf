@@ -238,6 +238,9 @@ def _solve_impl(
     include_hartree: bool,
     include_exchange: bool,
     exchange_hermitian_channel_packing: bool,
+    contact_g: jax.Array,
+    contact_Oi: jax.Array,
+    contact_Oj: jax.Array,
     max_iter: int,
     bt_max: int,
     cg_restart: int,
@@ -291,6 +294,7 @@ def _solve_impl(
         P0_h, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
         include_exchange=include_exchange, include_hartree=include_hartree,
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+        contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
         exchange_block_specs=block_specs,
         project_fn=project_fn,
     )
@@ -482,6 +486,7 @@ def _solve_impl(
         P_pre, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
         include_exchange=include_exchange, include_hartree=include_hartree,
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+        contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
         exchange_block_specs=block_specs,
         project_fn=project_fn,
     )
@@ -497,6 +502,7 @@ def _solve_impl(
         P_fin, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
         include_exchange=include_exchange, include_hartree=include_hartree,
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+        contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
         exchange_block_specs=block_specs,
         project_fn=project_fn,
     )

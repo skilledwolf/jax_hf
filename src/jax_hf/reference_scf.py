@@ -129,6 +129,9 @@ def solve_scf(
     include_hartree = args["include_hartree"]
     include_exchange = args["include_exchange"]
     hcp = args["exchange_hermitian_channel_packing"]
+    contact_g = args["contact_g"]
+    contact_Oi = args["contact_Oi"]
+    contact_Oj = args["contact_Oj"]
 
     w2d = kernel.w2d
     project_fn = config.project_fn
@@ -142,6 +145,7 @@ def solve_scf(
             include_hartree=include_hartree,
             include_exchange=include_exchange,
             exchange_hermitian_channel_packing=hcp,
+            contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
             mixing=float(config.mixing),
             level_shift=float(config.level_shift),
             density_tol=float(config.density_tol),
@@ -190,6 +194,7 @@ def _run_scf(
     n_electrons,
     include_hartree, include_exchange,
     exchange_hermitian_channel_packing,
+    contact_g, contact_Oi, contact_Oj,
     mixing, level_shift, density_tol, comm_tol, max_iter,
     project_fn,
 ):
@@ -209,6 +214,7 @@ def _run_scf(
             density_h, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange, include_hartree=include_hartree,
             exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+            contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
             project_fn=project_fn,
         )
         E = hf_energy(density_h, h=h, Sigma=Sigma, H=H, weights_b=weights_b)
