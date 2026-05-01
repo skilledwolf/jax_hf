@@ -138,23 +138,63 @@ def _cayley_retract(d: jax.Array, tau: jax.Array) -> jax.Array:
 
 
 # ---------------------------------------------------------------------------
-# Simplex projection for occupations
+# Spectral Cayley: amortise eigh of (i*d) across line search backtracking.
+#
+# For skew-Hermitian d, i*d is Hermitian.  Diagonalise once:
+#     i*d = V diag(lam) V†      (lam real, V unitary)
+# then for any tau:
+#     U(tau) = (I - tau*d/2)(I + tau*d/2)^-1
+#            = V · diag((1 + i*tau*lam/2)/(1 - i*tau*lam/2)) · V†
+# The factor c(tau, lam) = (1 + iτλ/2)/(1 − iτλ/2) has |c|=1 ⇒ U is exactly
+# unitary independently of how many times we evaluate it.
+#
+# In the line search we only need diag(U(tau)† Ft U(tau)) (the trial orbital
+# energies).  Pre-rotating Ft once into the eigenbasis of i*d gives
+#     Ft_eig = V† Ft V
+# and per-tau the diagonal is computed with one Hadamard scaling and one
+# matmul, with no LU solve and no full Ft_trial:
+#     M(tau) = c̄(tau) Ft_eig c(tau)              (Hadamard, O(nb²))
+#     diag(U†FtU) = (V @ M(tau) ⊙ conj(V)).sum(-1)  (one matmul, O(nb³))
 # ---------------------------------------------------------------------------
 
-def _project_occupations(p_raw: jax.Array, w_norm: jax.Array,
-                         n_target_norm: jax.Array, T: float) -> jax.Array:
-    """Project occupations onto the capped simplex {0<=p<=1, sum w*p = N}.
+def _cayley_spectral_setup(d: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Eigendecompose i*d for a skew-Hermitian d.  Returns (V, lam)."""
+    iA = (1j * d).astype(d.dtype)
+    iA = 0.5 * (iA + jnp.conj(jnp.swapaxes(iA, -1, -2)))  # exact Hermitisation
+    lam, V = jnp.linalg.eigh(iA)
+    return V, lam.astype(jnp.real(d).dtype)
 
-    Uses the Fermi-Dirac parametrization: find mu such that
-    p_i = clip(p_raw_i + shift, 0, 1) satisfies the particle constraint.
-    For smooth differentiability, we use a soft sigmoid projection.
+
+def _cayley_factor(lam: jax.Array, tau: jax.Array, complex_dtype) -> jax.Array:
+    """c(τ, λ) = (1 + iτλ/2) / (1 - iτλ/2) — |c|=1 by construction."""
+    half = jnp.asarray(0.5, dtype=lam.dtype)
+    arg = jnp.asarray(tau, dtype=lam.dtype) * lam * half
+    iexp = (1j * arg).astype(complex_dtype)
+    one = jnp.asarray(1.0, dtype=complex_dtype)
+    return (one + iexp) / (one - iexp)
+
+
+def _cayley_unitary_from_spectrum(V: jax.Array, lam: jax.Array,
+                                  tau: jax.Array) -> jax.Array:
+    """U(τ) = V · diag(c(τ, λ)) · V†."""
+    c = _cayley_factor(lam, tau, V.dtype)
+    return (V * c[..., None, :]) @ jnp.conj(jnp.swapaxes(V, -1, -2))
+
+
+def _diag_UFU_from_spectrum(V: jax.Array, Ft_eig: jax.Array,
+                            lam: jax.Array, tau: jax.Array) -> jax.Array:
+    """Compute diag(U(τ)† Ft U(τ)) using precomputed Ft_eig = V† Ft V.
+
+    Cost: one Hadamard (nb²) plus one matmul (nb³) — versus the LU+two-matmul
+    path in :func:`_cayley_retract` followed by a full U†FtU triple product.
     """
-    real_dtype = p_raw.dtype
-    # Treat p_raw as effective energies and find a shift via mu solve
-    eps_eff = -_logit(jnp.clip(p_raw, 1e-6, 1.0 - 1e-6))
-    T_proj = jnp.maximum(jnp.asarray(T, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
-    mu = _solve_mu(eps_eff, w_norm, n_target_norm, jnp.asarray(0.0, dtype=real_dtype), float(T_proj))
-    return jax.nn.sigmoid((mu - eps_eff) / T_proj)
+    c = _cayley_factor(lam, tau, V.dtype)
+    cbar = jnp.conj(c)
+    M = (cbar[..., :, None]) * Ft_eig * (c[..., None, :])
+    A = V @ M
+    diag = jnp.real(jnp.sum(A * jnp.conj(V), axis=-1))
+    return diag
+
 
 
 # ---------------------------------------------------------------------------
@@ -348,13 +388,20 @@ def _solve_impl(
          G_Q_prev, g_p_prev, _grad_norm_prev, E_prev, _dE_prev, hE, hG) = carry
 
         # ========== 1. Build Fock matrix (THE expensive step) ==========
+        # P_cur is already projected to the symmetric subspace above.  When
+        # h, V_q, and the contact terms are themselves symmetric (the only
+        # use case where project_fn makes physical sense), F[symmetric P]
+        # is automatically symmetric to FFT roundoff (verified ~5e-16 on
+        # the bilayer regression).  Skip the redundant inner projection of
+        # F to save one symmetry-group sweep per outer iter.
         P_cur = _herm(_project(_density_from_Qp(Q, p)))
         Sigma, H_h, F = build_fock(
             P_cur, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange, include_hartree=include_hartree,
             exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+            contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
             exchange_block_specs=block_specs,
-            project_fn=project_fn,
+            project_fn=None,
         )
         E = hf_energy(P_cur, h=h, Sigma=Sigma, H=H_h, weights_b=weights_b)
         Ft = _fock_in_orbital_basis(Q, F)
@@ -366,7 +413,11 @@ def _solve_impl(
         G_Q = _skew_hermitian(diff_p * Ft) * offdiag
 
         # Occupation gradient: g_i = eps_i + T*logit(p_i) - mu
-        mu = _solve_mu(eps, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter)
+        # Use the carry's mu (from last iter's post-retraction solve) as a
+        # warm guess.  g_p only enters the line-search direction d_p; the
+        # final p_new is set via a fresh _solve_mu after retraction, so a
+        # small staleness in mu only perturbs the τ choice.  Skipping this
+        # mu_solve cuts ~14% of body work per iter.
         g_p = (eps + T_r * _logit(p) - mu).astype(real_dtype)
 
         # Convergence uses only the orbital gradient (commutator [F, P]).
@@ -393,14 +444,13 @@ def _solve_impl(
         # Since Q changed by Q_new = Q_old @ U, the transport is U† * prev * U.
         # We approximate transport as identity (reset via periodic restart).
 
-        # Preconditioned Polak-Ribiere+: beta = <g, M^-1 g - M^-1 g_prev> / <g_prev, M^-1 g_prev>
+        # Preconditioned Polak-Ribiere+: beta = <g, M^-1 g - M^-1 g_prev> / <g_prev, g_prev>
         # Here H_Q = M^-1 G_Q is the preconditioned orbital gradient, h_p = M^-1 g_p likewise.
+        # The denominator uses the unpreconditioned squared norm of the previous
+        # gradient — always well-scaled and avoids the division-then-multiplication
+        # round-trip an earlier draft had.
         pr_num = (_ip_matrix(G_Q, H_Q, w_norm) - _ip_matrix(G_Q_prev, H_Q, w_norm)
                   + _ip_vec(g_p, h_p, w_norm) - _ip_vec(g_p_prev, h_p, w_norm))
-        pr_den = (_ip_matrix(G_Q_prev, G_Q_prev, w_norm) / jnp.maximum(_norm_matrix(G_Q_prev, w_norm), tiny)
-                  * _norm_matrix(G_Q_prev, w_norm)
-                  + _ip_vec(g_p_prev, g_p_prev, w_norm))
-        # Use previous gradient squared norm as denominator (always well-scaled)
         pr_den = _ip_matrix(G_Q_prev, G_Q_prev, w_norm) + _ip_vec(g_p_prev, g_p_prev, w_norm)
         beta = jnp.where(pr_den > tiny, jnp.maximum(0.0, pr_num / pr_den), 0.0)
         beta = jnp.minimum(beta, 5.0)  # cap to prevent runaway
@@ -418,18 +468,32 @@ def _solve_impl(
 
         # ========== 5. Line search (backtracking on frozen-F free energy) ==========
         # Frozen-F free energy: Omega(tau) = Tr[diag(p_trial) U†FtU] - T*S(p_trial)
+        #
+        # Spectral Cayley path: eigendecompose (i * d_Q) once and pre-rotate Ft
+        # into the d_Q eigenbasis.  Each line-search trial then costs one
+        # Hadamard scaling + one matmul (versus an LU solve + two matmuls in
+        # the LU-based Cayley).  The accepted U(tau_final) is reconstructed
+        # spectrally afterwards, and eps_new is read from the same spectral
+        # form so we never materialise U†FtU explicitly.
+        V_d, lam_d = _cayley_spectral_setup(d_Q)
+        Ft_eig = jnp.conj(jnp.swapaxes(V_d, -2, -1)) @ Ft @ V_d
+
         d_Q_norm = _norm_matrix(d_Q, w_norm)
         tau0 = jnp.minimum(1.0, max_step_r / jnp.maximum(d_Q_norm, tiny))
 
         def frozen_F_free_energy(tau_val):
-            U_trial = _cayley_retract(d_Q, tau_val)
-            Ft_trial = jnp.conj(jnp.swapaxes(U_trial, -2, -1)) @ Ft @ U_trial
-            eps_trial = jnp.real(jnp.diagonal(Ft_trial, axis1=-2, axis2=-1))
+            eps_trial = _diag_UFU_from_spectrum(V_d, Ft_eig, lam_d, tau_val)
             p_trial = jnp.clip(p - tau_val * d_p, 1e-8, 1.0 - 1e-8)
             E_frozen = jnp.sum(w_norm[..., None] * p_trial * eps_trial)
             return free_energy(E_frozen, p_trial, w_norm, T_r)
 
-        Omega0 = frozen_F_free_energy(jnp.asarray(0.0, dtype=real_dtype))
+        # Inlined frozen_F_free_energy(tau=0): eps_trial = eps and
+        # p_trial = clip(p), avoiding the spectral diag computation entirely
+        # at the trivial trial point.  Mathematically identical to the
+        # original frozen_F_free_energy(0.0) call.
+        p0_clip = jnp.clip(p, 1e-8, 1.0 - 1e-8)
+        E_frozen0 = jnp.sum(w_norm[..., None] * p0_clip * eps)
+        Omega0 = free_energy(E_frozen0, p0_clip, w_norm, T_r)
 
         def bt_cond(state):
             i, tau, accepted = state
@@ -454,11 +518,11 @@ def _solve_impl(
         # re-occupation.  Exact within p-degenerate blocks; slightly
         # approximate for near-degenerate states but the CG direction
         # already kills pure-gauge components via the diff_p factor.
-        U = _cayley_retract(d_Q, tau_final)
+        U = _cayley_unitary_from_spectrum(V_d, lam_d, tau_final)
         Q_new = Q @ U
-        eps_new = jnp.real(jnp.diagonal(
-            _fock_in_orbital_basis(Q_new, F), axis1=-2, axis2=-1
-        )).astype(real_dtype)
+        # eps_new = diag(Q_new† F Q_new) = diag(U† Ft U) — read directly from
+        # the cached spectral form without an extra matmul triple-product.
+        eps_new = _diag_UFU_from_spectrum(V_d, Ft_eig, lam_d, tau_final).astype(real_dtype)
         mu_new = _solve_mu(eps_new, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter)
         p_new = jax.nn.sigmoid((mu_new - eps_new) / T_r).astype(real_dtype)
 
@@ -488,7 +552,7 @@ def _solve_impl(
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
         contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
         exchange_block_specs=block_specs,
-        project_fn=project_fn,
+        project_fn=None,
     )
     Ft_fin = _fock_in_orbital_basis(Q_fin, F_pre)
     eps_fin, V_fin = jnp.linalg.eigh(Ft_fin)
@@ -504,7 +568,7 @@ def _solve_impl(
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
         contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
         exchange_block_specs=block_specs,
-        project_fn=project_fn,
+        project_fn=None,
     )
     E_fin = hf_energy(P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b)
 

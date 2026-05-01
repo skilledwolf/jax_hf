@@ -5,7 +5,14 @@ import pytest
 
 import jax.numpy as jnp
 
-from jax_hf import HartreeFockKernel, SolverConfig, SolveResult, solve
+from jax_hf import (
+    HartreeFockKernel,
+    SCFConfig,
+    SolverConfig,
+    SolveResult,
+    solve,
+    solve_scf,
+)
 
 
 def _comm_rms(F, P, weights_2d):
@@ -140,6 +147,125 @@ class TestSolveResult:
         assert result.p.shape == kernel.h.shape[:-1]
 
 
+class TestContactTerms:
+    """Contact (q-independent) flavor-bilinear terms must enter the inner loop.
+
+    Regression for the bug where ``_solve_impl`` body forgot to forward
+    ``contact_g/Oi/Oj`` to ``build_fock`` — the optimizer minimised the
+    contact-free energy and re-introduced the contact contribution only at
+    the final eval, so the returned density was not a stationary point of
+    the augmented energy and ``history["E"]`` jumped at the boundary.
+    """
+
+    @staticmethod
+    def _kernel_with_contact(g, nk=2, T=0.05):
+        """Two-band kernel with off-diagonal h (so density mixes flavors) and σ_z⊗σ_z contact."""
+        weights = jnp.ones((nk, nk), dtype=jnp.float32)
+        h = np.zeros((nk, nk, 2, 2), dtype=np.complex64)
+        h[..., 0, 0] = -1.0
+        h[..., 1, 1] = 1.0
+        # k-dependent off-diagonal hopping — gives orbitals that mix flavors,
+        # so ρ̄ acquires nontrivial off-diagonal entries that the contact term
+        # actually couples to.
+        for i in range(nk):
+            for j in range(nk):
+                h[i, j, 0, 1] = 0.4 + 0.1 * (i + j)
+                h[i, j, 1, 0] = 0.4 + 0.1 * (i + j)
+        coulomb_q = jnp.full((nk, nk, 1, 1), 0.1, dtype=jnp.complex64)
+        sigma_z = jnp.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=jnp.complex64)
+        contact_terms = [(jnp.float32(g), sigma_z, sigma_z)]
+        return HartreeFockKernel(
+            weights=weights,
+            hamiltonian=jnp.asarray(h),
+            coulomb_q=coulomb_q,
+            T=T,
+            contact_terms=contact_terms,
+        )
+
+    def test_direct_minimization_matches_scf_with_contact(self):
+        """Both solvers must land on the same density and energy with a contact term.
+
+        Energy alone is insensitive (it's stationary at both fixed points, so a
+        small density miss costs only O(δP²)).  The Frobenius density distance
+        is the load-bearing check — pre-fix, DM converged to the contact-free
+        density which differs from the SCF density at ~1e-3 in this setup.
+        """
+        kernel = self._kernel_with_contact(g=0.3, nk=2)
+        P0 = jnp.zeros_like(kernel.h)
+
+        dm = solve(
+            kernel, P0, n_electrons=4.0,
+            config=SolverConfig(max_iter=200, tol_E=1e-9),
+        )
+        scf = solve_scf(
+            kernel, P0, n_electrons=4.0,
+            config=SCFConfig(max_iter=400, mixing=0.3,
+                             density_tol=1e-7, comm_tol=1e-6),
+        )
+
+        assert bool(dm.converged)
+        assert bool(scf.converged)
+        np.testing.assert_allclose(
+            float(dm.energy), float(scf.energy), atol=1e-5, rtol=1e-6,
+        )
+        density_diff = float(jnp.linalg.norm(dm.density - scf.density_matrix))
+        assert density_diff < 1e-4, (
+            f"DM and SCF densities disagree (||ΔP||_F = {density_diff:.3e}); "
+            "indicates the contact term is missing from the inner-loop Fock build."
+        )
+
+    def test_direct_minimization_loop_history_matches_final_energy(self):
+        """Last logged loop energy must equal the returned energy.
+
+        Pre-fix the loop trace logged ``E_no_contact[P]`` while the returned
+        ``energy`` reported ``E_with_contact[P]`` — a visible jump at the
+        loop boundary.
+        """
+        kernel = self._kernel_with_contact(g=0.3, nk=2)
+        P0 = jnp.zeros_like(kernel.h)
+        result = solve(
+            kernel, P0, n_electrons=4.0,
+            config=SolverConfig(max_iter=200, tol_E=1e-9),
+        )
+
+        assert bool(result.converged)
+        n = int(result.n_iter)
+        last_loop_E = float(np.array(result.history["E"])[n - 1])
+        np.testing.assert_allclose(
+            last_loop_E, float(result.energy), atol=1e-5, rtol=1e-6,
+        )
+
+    def test_direct_minimization_self_consistent_with_contact(self):
+        """[F, P] must vanish at convergence — F includes the contact contribution."""
+        kernel = self._kernel_with_contact(g=0.3, nk=2)
+        P0 = jnp.zeros_like(kernel.h)
+        result = solve(
+            kernel, P0, n_electrons=4.0,
+            config=SolverConfig(max_iter=200, tol_E=1e-9),
+        )
+
+        assert bool(result.converged)
+        rms = _comm_rms(result.fock, result.density, kernel.w2d)
+        assert rms < 1e-3
+
+    def test_contact_term_changes_solution(self):
+        """Sanity check: the contact coupling must actually move the energy.
+
+        Guards against a regression where contact terms get silently zeroed —
+        without this check, a fix that wires them through incorrectly (e.g.
+        multiplied by 0) could still pass the SCF-vs-DM cross-check.
+        """
+        kernel_off = self._kernel_with_contact(g=0.0, nk=2)
+        kernel_on = self._kernel_with_contact(g=0.3, nk=2)
+        P0 = jnp.zeros_like(kernel_off.h)
+        cfg = SolverConfig(max_iter=200, tol_E=1e-9)
+
+        E_off = float(solve(kernel_off, P0, 4.0, config=cfg).energy)
+        E_on = float(solve(kernel_on, P0, 4.0, config=cfg).energy)
+
+        assert abs(E_on - E_off) > 1e-3
+
+
 class TestEdgeCases:
     def test_rejects_unreachable_density(self):
         kernel = _make_two_band_kernel()
@@ -155,3 +281,92 @@ class TestEdgeCases:
 
         assert int(result.n_iter) <= 50
         assert np.isfinite(float(result.energy))
+
+
+class TestSpectralCayley:
+    """Spectral Cayley path: line search uses eigh(i*d_Q) + Hadamard scaling.
+
+    Verifies that the spectral helpers produce results numerically equivalent
+    to building U via the LU-based Cayley solve and computing diag(U†FtU)
+    explicitly.
+    """
+
+    @staticmethod
+    def _make_skew(rng, shape, dtype=jnp.complex64):
+        d = rng.normal(size=shape) + 1j * rng.normal(size=shape)
+        d = 0.5 * (d - np.conj(d.swapaxes(-1, -2)))
+        return jnp.asarray(d, dtype=dtype)
+
+    @staticmethod
+    def _make_herm(rng, shape, dtype=jnp.complex64):
+        F = rng.normal(size=shape) + 1j * rng.normal(size=shape)
+        F = 0.5 * (F + np.conj(F.swapaxes(-1, -2)))
+        return jnp.asarray(F, dtype=dtype)
+
+    def test_spectral_unitary_matches_cayley_lu(self):
+        """U(τ) from spectral form must match U(τ) from Cayley LU to roundoff."""
+        from jax_hf.solver import (
+            _cayley_retract,
+            _cayley_spectral_setup,
+            _cayley_unitary_from_spectrum,
+        )
+        rng = np.random.default_rng(0)
+        d = self._make_skew(rng, (3, 3, 6, 6))
+        V_d, lam_d = _cayley_spectral_setup(d)
+
+        for tau_val in [0.0, 0.1, 0.5, 1.0, -0.3]:
+            tau = jnp.asarray(tau_val, dtype=jnp.float32)
+            U_lu = _cayley_retract(d, tau)
+            U_sp = _cayley_unitary_from_spectrum(V_d, lam_d, tau)
+            np.testing.assert_allclose(
+                np.asarray(U_sp), np.asarray(U_lu),
+                atol=1e-5, rtol=1e-5,
+                err_msg=f"spectral U mismatch at tau={tau_val}",
+            )
+
+    def test_spectral_diag_matches_lu_diag(self):
+        """diag(U(τ)†·Ft·U(τ)) from spectral form must match LU-built form."""
+        from jax_hf.solver import (
+            _cayley_retract,
+            _cayley_spectral_setup,
+            _diag_UFU_from_spectrum,
+        )
+        rng = np.random.default_rng(1)
+        d = self._make_skew(rng, (3, 3, 6, 6))
+        Ft = self._make_herm(rng, (3, 3, 6, 6))
+
+        V_d, lam_d = _cayley_spectral_setup(d)
+        Ft_eig = jnp.conj(jnp.swapaxes(V_d, -2, -1)) @ Ft @ V_d
+
+        for tau_val in [0.0, 0.05, 0.3, 0.7, -0.5]:
+            tau = jnp.asarray(tau_val, dtype=jnp.float32)
+            diag_sp = _diag_UFU_from_spectrum(V_d, Ft_eig, lam_d, tau)
+            U_lu = _cayley_retract(d, tau)
+            Ft_trial = jnp.conj(jnp.swapaxes(U_lu, -2, -1)) @ Ft @ U_lu
+            diag_lu = jnp.real(jnp.diagonal(Ft_trial, axis1=-2, axis2=-1))
+            np.testing.assert_allclose(
+                np.asarray(diag_sp), np.asarray(diag_lu),
+                atol=1e-4, rtol=1e-4,
+                err_msg=f"spectral diag mismatch at tau={tau_val}",
+            )
+
+    def test_spectral_unitary_is_unitary(self):
+        """Even for τ=0 (eigh roundoff worst case), U†U must equal I."""
+        from jax_hf.solver import (
+            _cayley_spectral_setup,
+            _cayley_unitary_from_spectrum,
+        )
+        rng = np.random.default_rng(2)
+        d = self._make_skew(rng, (2, 2, 8, 8))
+        V_d, lam_d = _cayley_spectral_setup(d)
+
+        for tau_val in [0.0, 0.5, 1.0]:
+            tau = jnp.asarray(tau_val, dtype=jnp.float32)
+            U = _cayley_unitary_from_spectrum(V_d, lam_d, tau)
+            UUH = U @ jnp.conj(jnp.swapaxes(U, -1, -2))
+            eye = jnp.eye(8, dtype=U.dtype)
+            np.testing.assert_allclose(
+                np.asarray(UUH), np.asarray(eye[None, None, ...] * jnp.ones((2, 2, 1, 1), dtype=U.dtype)),
+                atol=1e-5, rtol=1e-5,
+                err_msg=f"non-unitary at tau={tau_val}",
+            )

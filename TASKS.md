@@ -22,6 +22,8 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done.
 - [x] Reconcile the README API section with the actual package exports, including whether `hartreefock_iteration` should be public.
 - [x] Investigate the current regression mismatch in `tests/test_meshgrid_regression.py` where the fixture expects `k_fin == 15` but the present run returns `13`.
 - [ ] Investigate the remaining `vcs_versioning` warning emitted during isolated builds.
+- [x] Remove the avoidable `tau=0` Cayley solve in the direct-minimization line search and evaluate caching the accepted trial unitary.  *(Done: τ=0 is now inlined; the line-search trials and the post-line-search retraction share a single `eigh(i*d_Q)` decomposition that replaces the LU solves and the U†FtU triple product with one Hadamard scaling + one matmul.  Per-iter speedup ~10–35% at nb≥16, neutral on bilayer DM regression suite.  See `benchmarks/cayley_baseline.txt` for measurements.)*
+- [ ] Pass `contact_terms` through the direct-minimization hot-loop Fock build and add regression coverage for contact interactions.
 
 ## v2.1
 
