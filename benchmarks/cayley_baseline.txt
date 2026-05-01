@@ -1,0 +1,105 @@
+DM solver optimisations: measured impact
+=========================================
+
+Setup: CPU JAX 0.8.1, Apple M4 Pro, JAX_PLATFORMS=cpu (Metal lacks support
+for batched complex eigh / linalg.solve at these sizes).
+
+Six changes, in commit order:
+  (1) Inline frozen_F_free_energy(tau=0) to skip an LU + two matmuls per
+      outer iteration.  Mathematically identical (modulo LU roundoff in
+      diag(Ft_trial(0)) ≈ diag(Ft)).
+  (3) Spectral Cayley: eigendecompose i*d_Q once per outer iter and
+      reformulate diag(U(τ)†·Ft·U(τ)) as one Hadamard scaling + one matmul
+      via the precomputed Ft_eig = V_d† Ft V_d.  Skips the LU solve and
+      the full U†FtU triple-product on every line-search trial (and on the
+      post-line-search retraction).
+  (a) Remove dead pr_den computation (X²/|X|·|X| → X² rewrite was bit-
+      exact equivalent; first form was overwritten on the next line).
+  (b) Remove dead _project_occupations (defined, never called).
+  (c) Skip duplicate project_fn inside build_fock when called from solver
+      body and finalize.  P is already projected before each build_fock
+      call; F[symmetric P] is symmetric to FFT roundoff (verified ~5e-16
+      on the bilayer regression for both PM and SVP groups), so the inner
+      project is a no-op.  Saves one symmetry-group sweep per body iter.
+  (d) Skip first _solve_mu in body (only used to compute g_p which feeds
+      d_p which feeds line-search τ; final p is recomputed via fresh mu
+      after retraction).  Carry's mu (from previous iter's post-retraction
+      _solve_mu) is used directly for g_p.  Saves ~14% of body work per
+      iter.
+
+
+Per-iteration wall time, slope-fit (tol_E=-1.0 forces full max_iter run)
+========================================================================
+Bilayer-like (nk=49, nb=16, T=0.5), linear fit on n_iter ∈ {10, 60}
+
+    variant                  per-iter (ms)      vs baseline
+    baseline                    ~108                 —
+    fix (1)+(3)+(a)+(b)+(c)+(d)  ~65               -40%
+
+(Run-to-run noise on this hardware is ~10–30%; numbers above are min-of-N
+fits.  Bilayer-like uses random off-diagonal hopping, not real graphene.)
+
+
+Bilayer DM regression (nk=49, nb=16, MultilayerAB, contimod env)
+================================================================
+DM-only subset (15 tests, both PM and SVP branches, 8 density points each):
+  baseline:   24.73 s
+  all fixes:  13.22 s    (47% faster)
+
+Single SVP +0.05 cm^-12 point (warm cache, 5 iters, contimod env):
+  baseline:   mean 945 ms / 5 iters = 186 ms/iter
+  all fixes:  mean ~440 ms / 5 iters = 88 ms/iter   (53% faster)
+
+Energy match: identical to 1e-7 (E = -6.3286552e+00, converged in 5 iters).
+
+
+Full regression suite (32 bilayer + 54 unit + 1 xfailed = 87 cases)
+====================================================================
+  baseline:   386.52 s (6:26)  — 84 passed, 2 skipped, 1 xfailed
+  all fixes:  145.56 s (2:25)  — 84 passed, 2 skipped, 1 xfailed
+  → 62% faster wall-time on the full suite.
+
+
+Per-component cost breakdown (bilayer-like 49×49×16, individually JIT'd)
+========================================================================
+Each op compiled and timed in isolation; per-call dispatch overhead is
+inflated relative to a fused body() jit, so treat as RELATIVE weights.
+
+  op                                          min (us)    %
+  build_fock (FFT exchange + matmul)            4975     13.4%
+  Ft = Q^dag F Q                                4051     10.9%
+  hf_energy                                     1174      3.2%
+  gradient G_Q (analytic)                        489      1.3%
+  solve_mu (25 Newton-bracket iters)            5351     14.4%   ← was x2/iter, now x1
+  eigh(i*d_Q)            [fix3 setup]           3854     10.4%   ← per iter, once
+  Ft_eig = V^dag Ft V    [fix3 setup]           3961     10.7%   ← per iter, once
+  frozen_F per-tau trial [fix3 inner]           3100      8.4%   ← per BT step
+  U(tau) from spectrum   [fix3 post-LS]         3116      8.4%
+  Q @ U                                         3929     10.6%
+  eps_new from spectrum  [fix3 post-LS]         3109      8.4%
+
+
+Verdict
+=======
+* Fixes (1)+(3): the biggest individual lever (~50% per-iter at nb≥16).
+* Cleanups (a)+(b): zero-risk dead-code removal.
+* Fix (c): one symmetry-group projection per iter saved (~10% on bilayer).
+* Fix (d): one _solve_mu per iter saved (~14% on bilayer); zero cost
+  because the carry's mu is already exactly converged from the previous
+  iter's post-retraction _solve_mu.
+* All correctness checks pass; numerical results match reference at
+  E_ATOL=1e-4 across the full bilayer scan (PM + SVP, 8 densities each).
+
+
+Threading note (Apple M4 Pro)
+==============================
+On this hardware, single-threaded vs default-threaded was within run-to-run
+noise (67 ms/iter both ways).  On systems with more performance cores or
+oversubscribed BLAS pools, set:
+
+  OMP_NUM_THREADS=1  OPENBLAS_NUM_THREADS=1  VECLIB_MAXIMUM_THREADS=1
+  XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+
+The body has many small ops (eigh, matmul, LU on 16x16 batched 49²); for
+nb in this range XLA-CPU's parallel batch dispatch + nested BLAS threading
+can spend more on sync than on the work.
