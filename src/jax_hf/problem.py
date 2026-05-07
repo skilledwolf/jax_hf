@@ -30,6 +30,8 @@ class HartreeFockKernel:
         reference_density=None,
         hartree_matrix=None,
         contact_terms=None,
+        embed_reference_potential: bool = False,
+        center_embedded_hartree: bool = True,
     ):
         """
         Parameters
@@ -45,6 +47,26 @@ class HartreeFockKernel:
             asymmetric pair plus its h.c. partner to model a Hermitian term
             with O_i ≠ O_j (matches contimod's ``Shortrange`` convention,
             cf. ``get_shortrange_MF_valley`` in contimod.meanfield).
+        embed_reference_potential : bool, default False
+            When True, precompute the reference Hartree-Fock potential
+            ``V_HF[refP] = J[refP] + Σ[refP]`` (where Σ = −K is the
+            kernel-convention sign for exchange) and add it to the bare
+            ``hamiltonian`` once at construction time.  The kernel then
+            runs reference-subtracted updates ``Σ[P−refP] + H[P−refP]``
+            on this enlarged ``h_eff``, giving F = h + V_HF[P] — i.e.
+            the standard HF Fock matrix.  Without this flag, the kernel
+            solves a *modified* HF problem whose minimum differs from
+            standard HF by an amount proportional to the layer-screening
+            in V_HF[refP].  Reported energy then equals
+            ``E_std + ½ Tr[V_HF[refP] · refP]`` (see
+            ``embedded_energy_offset``).
+        center_embedded_hartree : bool, default True
+            When ``embed_reference_potential`` is True, subtract the
+            orbital-uniform mean of ``J[refP]`` from ``h_eff``.  This
+            is a gauge choice that brings absolute eigenvalues to a
+            sensible scale (E_F near 0 instead of near +mean(J[refP])
+            which can be huge for strong-Coulomb dual-gate setups).
+            Does not affect band asymmetries or DOS at E_F.
         """
         h = jnp.asarray(hamiltonian)
         self.h = h
@@ -134,6 +156,47 @@ class HartreeFockKernel:
             self.contact_g  = jnp.stack(gs)
             self.contact_Oi = jnp.stack(Ois)
             self.contact_Oj = jnp.stack(Ojs)
+
+        # Embedded reference potential — see constructor docstring.
+        self.embed_reference_potential = bool(embed_reference_potential)
+        self.center_embedded_hartree = bool(center_embedded_hartree)
+        self.embedded_energy_offset = 0.0
+        if self.embed_reference_potential:
+            if reference_density is None:
+                raise ValueError(
+                    "embed_reference_potential=True requires reference_density."
+                )
+            ref = self.refP
+            n_orb = int(h.shape[-1])
+            real_dtype = h.real.dtype
+            const_J_refP_refP = 0.0
+            J_ref_diag = jnp.zeros(n_orb, dtype=real_dtype)
+            if self.include_hartree:
+                diag_R = jnp.einsum("ij,ijaa->a", w2d, ref).real
+                J_ref_diag = self.HH @ diag_R
+                if self.center_embedded_hartree:
+                    J_ref_diag = J_ref_diag - jnp.mean(J_ref_diag)
+                const_J_refP_refP = float(jnp.sum(J_ref_diag * diag_R))
+            const_Sigma_refP_refP = 0.0
+            Sigma_ref = None
+            if self.include_exchange:
+                Sigma_ref = selfenergy_fft(
+                    self._VR_shifted, ref,
+                    _apply_ifftshift=False,
+                    hermitian_channel_packing=self.exchange_hermitian_channel_packing,
+                )
+                const_Sigma_refP_refP = float(jnp.einsum(
+                    "ij,ijab,ijba->", w2d, Sigma_ref, ref,
+                ).real)
+            h_eff = self.h
+            if Sigma_ref is not None:
+                h_eff = h_eff + Sigma_ref
+            # Add per-orbital diagonal in JAX-compatible way.
+            h_eff = h_eff + jnp.diag(J_ref_diag.astype(h.dtype))[None, None, :, :]
+            self.h = h_eff
+            self.embedded_energy_offset = 0.5 * (
+                const_J_refP_refP + const_Sigma_refP_refP
+            )
 
     def as_args(self):
         """Dynamic inputs for jitted solver functions (no constant capture)."""
