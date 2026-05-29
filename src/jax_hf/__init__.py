@@ -52,6 +52,12 @@ from .continuation import (  # noqa: F401
     ContinuationResult,
     solve_continuation,
 )
+from .superlattice import (  # noqa: F401
+    ExtendedGridLayout,
+    build_extended_layout,
+    make_superlattice_fock_fn,
+    make_superlattice_build_fock_fn,
+)
 
 __all__ = [
     # Kernel (problem definition + precomputed arrays)
@@ -74,4 +80,9 @@ __all__ = [
     "resample_kgrid",
     "ContinuationResult",
     "solve_continuation",
+    # Superlattice (g_basis / SuperlatticeModel) Fock
+    "ExtendedGridLayout",
+    "build_extended_layout",
+    "make_superlattice_fock_fn",
+    "make_superlattice_build_fock_fn",
 ]

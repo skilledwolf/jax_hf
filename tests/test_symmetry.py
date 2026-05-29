@@ -246,3 +246,123 @@ def test_kx_only_flip_is_idempotent():
     np.testing.assert_allclose(np.array(once), np.array(twice), atol=1e-5)
 
 
+
+
+# ----------------------------------------------------------------------
+# Index-map (continuum-patch) spatial path
+# ----------------------------------------------------------------------
+
+def _make_c3_index_maps(nk1: int, nk2: int):
+    """Build periodic-mod-nk C3 index maps for testing (no continuum patch).
+
+    On the centred fractional grid ``f_i = i/nk - 0.5``, the rotation
+    ``(f_x, f_y) -> (-f_y, f_x - f_y)`` maps integer indices via
+    (-jj % nk, (ii - jj + nk_half) % nk).
+    """
+    if nk1 != nk2:
+        raise ValueError("test helper assumes square grid")
+    nk = nk1
+    half = nk // 2
+    ii, jj = np.meshgrid(np.arange(nk), np.arange(nk), indexing="ij")
+    perm_i_R = (-jj) % nk
+    perm_j_R = (ii - jj + half) % nk
+    perm_i_R2 = (jj - ii + half) % nk
+    perm_j_R2 = (-ii) % nk
+    idx_i = np.stack([ii, perm_i_R, perm_i_R2], axis=0).astype(np.int32)
+    idx_j = np.stack([jj, perm_j_R, perm_j_R2], axis=0).astype(np.int32)
+    return idx_i, idx_j
+
+
+def test_spatial_k_index_maps_path_is_idempotent_and_invariant():
+    """Projector built from spatial_k_index_maps is a projection: P(P(A)) = P(A)."""
+    nk = 6
+    nb = 4
+    # Diagonal cube-root-of-identity orbital unitary
+    omega = np.exp(2j * np.pi / 3.0)
+    U = np.diag([omega**0, omega**1, omega**2, omega**0]).astype(np.complex128)
+    S = np.stack([np.eye(nb, dtype=np.complex128), U, U @ U], axis=0)
+    idx_i, idx_j = _make_c3_index_maps(nk, nk)
+
+    proj = make_project_fn(
+        spatial_group=jnp.asarray(S),
+        spatial_k_index_maps=(jnp.asarray(idx_i), jnp.asarray(idx_j)),
+    )
+
+    rng = np.random.default_rng(11)
+    A = (rng.standard_normal((nk, nk, nb, nb))
+         + 1j * rng.standard_normal((nk, nk, nb, nb))).astype(np.complex128)
+    A_jax = jnp.asarray(A)
+
+    once = proj(A_jax)
+    twice = proj(once)
+    # Default jax dtype is float32 unless jax_enable_x64; allow that tolerance.
+    atol = 1e-5
+    np.testing.assert_allclose(np.array(twice), np.array(once), atol=atol)
+
+    # Symmetric output: applying any element of the spatial group to the
+    # projected matrix (with the matching k-permutation) leaves it unchanged.
+    once_np = np.asarray(once)
+    for g in (1, 2):
+        rotated = np.array([
+            S[g] @ once_np[idx_i[g, i, j], idx_j[g, i, j]] @ np.conj(S[g].T)
+            for i in range(nk) for j in range(nk)
+        ]).reshape(nk, nk, nb, nb)
+        np.testing.assert_allclose(rotated, once_np, atol=atol)
+
+
+def test_spatial_k_index_maps_requires_spatial_group():
+    import pytest
+
+    nk = 4
+    idx_i, idx_j = _make_c3_index_maps(nk, nk)
+    with pytest.raises(ValueError, match="spatial_group"):
+        make_project_fn(
+            spatial_k_index_maps=(jnp.asarray(idx_i), jnp.asarray(idx_j)),
+        )
+
+
+def test_spatial_k_index_maps_dim_mismatch_raises():
+    import pytest
+
+    nk = 4
+    nb = 2
+    S = np.stack([np.eye(nb, dtype=np.complex128)] * 3, axis=0)
+    # only 2 elements in idx, but spatial_group has 3
+    idx_i = np.zeros((2, nk, nk), dtype=np.int32)
+    idx_j = np.zeros((2, nk, nk), dtype=np.int32)
+    with pytest.raises(ValueError, match="leading dim"):
+        make_project_fn(
+            spatial_group=jnp.asarray(S),
+            spatial_k_index_maps=(jnp.asarray(idx_i), jnp.asarray(idx_j)),
+        )
+
+
+def test_time_reversal_k_index_map_path_with_invalid_mask():
+    """TR with a per-k index map and a partial validity mask leaves invalid points alone."""
+    nk = 4
+    nb = 2
+    U_tr = np.eye(nb, dtype=np.complex128)
+    # Index map: standard mod-nk (-k) flip, but mask out the (0,0) corner
+    ii, jj = np.meshgrid(np.arange(nk), np.arange(nk), indexing="ij")
+    idx_i = (-ii) % nk
+    idx_j = (-jj) % nk
+    valid = np.ones((nk, nk), dtype=bool)
+    valid[0, 0] = False  # leave (0,0) untouched
+
+    proj = make_project_fn(
+        time_reversal_U=jnp.asarray(U_tr),
+        time_reversal_k_index_map=(
+            jnp.asarray(idx_i), jnp.asarray(idx_j), jnp.asarray(valid),
+        ),
+    )
+
+    rng = np.random.default_rng(3)
+    A = (rng.standard_normal((nk, nk, nb, nb))
+         + 1j * rng.standard_normal((nk, nk, nb, nb))).astype(np.complex128)
+
+    out = np.asarray(proj(jnp.asarray(A)))
+    # (0,0) was masked → output equals input there
+    np.testing.assert_allclose(out[0, 0], A[0, 0], atol=1e-12)
+    # (1,2) was averaged with conj(A[(-1) % nk, (-2) % nk]) = conj(A[3, 2])
+    expected = 0.5 * (A[1, 2] + np.conj(A[3, 2]))
+    np.testing.assert_allclose(out[1, 2], expected, atol=1e-12)

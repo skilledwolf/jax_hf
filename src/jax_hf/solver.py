@@ -287,6 +287,7 @@ def _solve_impl(
     mu_maxiter: int,
     block_sizes: tuple | None,
     project_fn,
+    fock_build_fn=None,
 ) -> SolveResult:
     """Direct minimization via preconditioned Riemannian CG.
 
@@ -307,6 +308,7 @@ def _solve_impl(
     tiny = jnp.asarray(1e-30, dtype=real_dtype)
 
     _project = project_fn if project_fn is not None else (lambda A: A)
+    _fock_fn = fock_build_fn if fock_build_fn is not None else build_fock
     block_specs = _exchange_block_specs(block_sizes)
 
     w2d = jnp.asarray(weights_b[..., 0, 0], dtype=real_dtype)
@@ -330,7 +332,7 @@ def _solve_impl(
     # Build initial Fock matrix and diagonalize to get a good starting point.
     # This handles P0=0 gracefully (gives non-interacting ground state).
     P0_h = _herm(jnp.asarray(P0, dtype=target_dtype))
-    Sigma0, H0, F0 = build_fock(
+    Sigma0, H0, F0 = _fock_fn(
         P0_h, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
         include_exchange=include_exchange, include_hartree=include_hartree,
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
@@ -395,7 +397,7 @@ def _solve_impl(
         # the bilayer regression).  Skip the redundant inner projection of
         # F to save one symmetry-group sweep per outer iter.
         P_cur = _herm(_project(_density_from_Qp(Q, p)))
-        Sigma, H_h, F = build_fock(
+        Sigma, H_h, F = _fock_fn(
             P_cur, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange, include_hartree=include_hartree,
             exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
@@ -546,7 +548,7 @@ def _solve_impl(
     # we rebuild the Fock one more time with the clean density for a consistent
     # final result.
     P_pre = _herm(_project(_density_from_Qp(Q_fin, p_fin)))
-    _, _, F_pre = build_fock(
+    _, _, F_pre = _fock_fn(
         P_pre, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
         include_exchange=include_exchange, include_hartree=include_hartree,
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
@@ -562,7 +564,7 @@ def _solve_impl(
     p_fin = jax.nn.sigmoid((mu_fin - eps_fin) / T_r).astype(real_dtype)
 
     P_fin = _herm(_project(_density_from_Qp(Q_fin, p_fin)))
-    Sigma_fin, H_fin, F_fin = build_fock(
+    Sigma_fin, H_fin, F_fin = _fock_fn(
         P_fin, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
         include_exchange=include_exchange, include_hartree=include_hartree,
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
@@ -603,6 +605,9 @@ _solve_jitted = jax.jit(
         "mu_maxiter",
         "block_sizes",
         "project_fn",
+        # Optional Fock build override (e.g. superlattice streaming Fock).
+        # Captured by identity, so passing the same closure is cache-friendly.
+        "fock_build_fn",
     ),
 )
 
@@ -613,6 +618,7 @@ def solve_direct_minimization(
     n_electrons: float,
     *,
     config: SolverConfig | None = None,
+    fock_build_fn=None,
 ) -> SolveResult:
     """Direct-minimization Hartree-Fock solver.
 
@@ -677,6 +683,7 @@ def solve_direct_minimization(
         mu_maxiter=int(config.mu_maxiter),
         block_sizes=config.block_sizes,
         project_fn=config.project_fn,
+        fock_build_fn=fock_build_fn,
     )
 
 

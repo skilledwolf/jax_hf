@@ -80,6 +80,7 @@ def solve_scf(
     n_electrons: float,
     *,
     config: SCFConfig | None = None,
+    fock_build_fn: Callable | None = None,
 ) -> SCFResult:
     """Reference self-consistent field (SCF) solver with linear mixing.
 
@@ -100,6 +101,16 @@ def solve_scf(
     config
         :class:`SCFConfig` controls (max_iter, mixing, density_tol,
         comm_tol, level_shift, project_fn).  Defaults to ``SCFConfig()``.
+    fock_build_fn
+        Optional Fock builder for non-standard exchange kernels (e.g. the
+        superlattice / moire streaming Fock in :mod:`jax_hf.superlattice`).
+        Signature must match :func:`jax_hf.fock.build_fock`'s call site:
+        ``fn(density_h, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
+        include_exchange=..., include_hartree=...,
+        exchange_hermitian_channel_packing=..., contact_g=..., contact_Oi=...,
+        contact_Oj=..., project_fn=...) -> (Sigma, H, F)``.  ``None`` falls
+        back to the default k-space FFT exchange.  The function is captured
+        at trace time, so the JIT'd inner SCF loop stays fully XLA-native.
 
     Returns
     -------
@@ -135,6 +146,7 @@ def solve_scf(
 
     w2d = kernel.w2d
     project_fn = config.project_fn
+    fock_fn = fock_build_fn if fock_build_fn is not None else build_fock
 
     density, fock, energy, mu, iterations, converged, \
         hist_E, hist_density, hist_comm = _run_scf(
@@ -152,6 +164,7 @@ def solve_scf(
             comm_tol=float(config.comm_tol),
             max_iter=int(config.max_iter),
             project_fn=project_fn,
+            fock_build_fn=fock_fn,
         )
 
     n_iter = int(iterations)
@@ -184,7 +197,7 @@ def solve_scf(
     static_argnames=(
         "include_hartree", "include_exchange",
         "exchange_hermitian_channel_packing",
-        "max_iter", "project_fn",
+        "max_iter", "project_fn", "fock_build_fn",
     ),
 )
 def _run_scf(
@@ -197,6 +210,7 @@ def _run_scf(
     contact_g, contact_Oi, contact_Oj,
     mixing, level_shift, density_tol, comm_tol, max_iter,
     project_fn,
+    fock_build_fn,
 ):
     real_dtype = jnp.zeros((), dtype=h.dtype).real.dtype
     weights_2d = w2d
@@ -210,7 +224,7 @@ def _run_scf(
 
     def _build_and_occupy(density):
         density_h = _herm(jnp.asarray(_project(density), dtype=h.dtype))
-        Sigma, H, F = build_fock(
+        Sigma, H, F = fock_build_fn(
             density_h, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange, include_hartree=include_hartree,
             exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
