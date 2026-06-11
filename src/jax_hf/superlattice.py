@@ -19,6 +19,7 @@ channels, which cuts compile time on moderate-to-large layouts.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 
@@ -260,9 +261,14 @@ def make_superlattice_build_fock_fn(
                                               · ρ_γ(ΔG_{AB}),
 
         where ``ρ_γ(d) = Σ_{(A',B'): pair_to_delta(A',B')=d} ρ_bar[(A', γ), (B', γ)]``.
-        Diagonal-G blocks (``HH_GG_orbital[i, i, :, :]``) must be zero on
-        input (q=0 piece dropped).  Matches the CPU
-        ``cpp_hf.superlattice.SuperlatticeHartreeFockKernel`` semantics.
+        The diagonal-G blocks (``HH_GG_orbital[i, i, :, :]``) are the q=0 layer
+        Hartree.  Whether to keep them is the caller's physical convention: the
+        canonical moiré/TBG convention drops them (the gate neutralises the
+        uniform charge, so they are zero), while a layer-resolved system at
+        finite displacement field keeps the gate-screened q=0 layer Hartree.
+        A nonzero diagonal is therefore allowed but *warned* about, since a
+        stray nonzero diagonal is also a common bug (forgetting to drop q=0).
+        Matches the CPU ``cpp_hf.superlattice`` semantics.
     """
     fock_fn = make_superlattice_fock_fn(layout, n_G, dim_orb, nkx, nky)
     pair_to_delta_jax = jnp.asarray(np.asarray(layout.pair_to_delta, dtype=np.int64))
@@ -281,9 +287,17 @@ def make_superlattice_build_fock_fn(
             )
         diag_blocks = HH_orb_np[np.arange(n_G), np.arange(n_G)]
         if float(np.max(np.abs(diag_blocks))) > 1e-12:
-            raise ValueError(
-                "HH_GG_orbital must have zero diagonal-G blocks (q=0 piece "
-                "dropped); pass a version with HH_GG_orbital[i, i, :, :] = 0."
+            # The diagonal-G blocks are the q=0 layer Hartree.  Keeping them is
+            # a valid convention (layer-resolved system at finite displacement
+            # field); dropping them is the moiré/TBG convention.  Warn rather
+            # than raise so both work, since a stray nonzero diagonal is also a
+            # common bug (forgetting to drop q=0).
+            warnings.warn(
+                "HH_GG_orbital has nonzero diagonal-G blocks; the q=0 layer "
+                "Hartree will be included.  This is intended for a layer-resolved "
+                "system at finite displacement field; for the moiré/TBG "
+                "convention pass HH_GG_orbital[i, i, :, :] = 0.",
+                stacklevel=2,
             )
         HH_orb_jax = jnp.asarray(HH_orb_np)
     else:

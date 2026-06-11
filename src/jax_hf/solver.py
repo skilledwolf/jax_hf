@@ -250,6 +250,10 @@ class SolverConfig:
     bt_shrink: float = 0.5      # backtracking shrink factor
     bt_max: int = 8             # max backtracking steps
     mu_maxiter: int = 25        # chemical potential solver iterations
+    # Windowed energy convergence (CG path): stop when the energy improved by
+    # < tol_E over the last `plateau_window` iters (robust to per-step CG noise
+    # that makes a single-iteration |dE| test stop early).  0 = per-iteration.
+    plateau_window: int = 5
     # Orbital optimizer: "cg" (preconditioned Riemannian CG, default) or
     # "newton" (trust-region Newton — a Steihaug truncated-CG on the joint
     # (Q, p) response Hessian, one Fock build per Hessian-vector product).
@@ -320,6 +324,7 @@ def _solve_impl(
     bt_max: int,
     cg_restart: int,
     mu_maxiter: int,
+    plateau_window: int,
     block_sizes: tuple | None,
     project_fn,
     fock_build_fn=None,
@@ -409,10 +414,23 @@ def _solve_impl(
     )
 
     def cond(carry):
-        # Converge when energy change is below tol_E.  If tol_grad > 0, also
+        # Converge when the energy change is below tol_E.  If tol_grad > 0, also
         # require gradient norm below tol_grad before declaring convergence.
-        k, _, _, _, _, _, _, _, grad_norm, _, dE, _, _ = carry
-        energy_not_converged = dE > tol_E_r
+        #
+        # With plateau_window > 0 the energy test is windowed: stop only when the
+        # energy improved by less than tol_E over the last `plateau_window`
+        # recorded iters.  The line search makes E monotone, so this is a
+        # reliable stop, whereas a single-iteration |dE| test can dip below tol_E
+        # during CG warm-up or after a backtracked step and quit prematurely.
+        k, _, _, _, _, _, _, _, grad_norm, _, dE, hist_E, _ = carry
+        if plateau_window > 0:
+            e_now = hist_E[jnp.maximum(k - 1, 0)]
+            e_past = hist_E[jnp.maximum(k - 1 - plateau_window, 0)]
+            energy_not_converged = jnp.where(
+                k > plateau_window, (e_past - e_now) > tol_E_r, dE > tol_E_r,
+            )
+        else:
+            energy_not_converged = dE > tol_E_r
         grad_check_active = tol_grad_r > 0.0
         grad_not_converged = jnp.logical_and(grad_check_active, grad_norm > tol_grad_r)
         return jnp.logical_and(
@@ -638,6 +656,7 @@ _solve_jitted = jax.jit(
         "bt_max",
         "cg_restart",
         "mu_maxiter",
+        "plateau_window",
         "block_sizes",
         "project_fn",
         # Optional Fock build override (e.g. superlattice streaming Fock).
@@ -1204,6 +1223,7 @@ def solve_direct_minimization(
         bt_max=int(config.bt_max),
         cg_restart=int(config.cg_restart),
         mu_maxiter=int(config.mu_maxiter),
+        plateau_window=int(config.plateau_window),
         block_sizes=config.block_sizes,
         project_fn=config.project_fn,
         fock_build_fn=fock_build_fn,

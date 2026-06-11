@@ -12,9 +12,13 @@ minimisation problem on 2D k-meshes:
 
 * **Direct minimisation** (primary): preconditioned Riemannian CG on
   Stiefel × capped simplex, eigen-free inner loop, Cayley retraction,
-  one Fock build per iteration.
+  one Fock build per iteration.  An optional **trust-region Newton**
+  variant (`optimizer="newton"`) converges superlinearly (a handful of
+  outer steps) on stiff problems, and **deflation** (`solve_deflated`)
+  finds *distinct* self-consistent solutions on non-convex landscapes.
 * **Reference SCF** (baseline / fallback): standard Roothaan iteration
-  with linear mixing.
+  with linear mixing, **Pulay DIIS**, or **ODA** (optimal damping)
+  acceleration, plus an optional `trust_radius` on the density step.
 
 Exchange and Hartree can both be included, and the exchange kernel may
 be layer-resolved.  See `examples/` for density-scan scripts on a
@@ -62,21 +66,40 @@ result_scf = jax_hf.solve_scf(kernel, P0=jnp.zeros_like(hamiltonian), n_electron
 Both solvers take a Config dataclass with sensible defaults:
 
 ```python
-jax_hf.SolverConfig(max_iter=200, tol_E=1e-7, max_step=0.6, project_fn=None, ...)
-jax_hf.SCFConfig(max_iter=200, mixing=0.3, density_tol=1e-7, comm_tol=1e-6, ...)
+jax_hf.SolverConfig(max_iter=200, tol_E=1e-7, optimizer="cg", ...)   # or optimizer="newton"
+jax_hf.SCFConfig(max_iter=200, mixing=0.3, acceleration="linear", ...)  # or "diis" / "oda"
 ```
 
 `project_fn` lets you enforce symmetry constraints (spin, valley, time
 reversal, spatial) on the density and Fock at every iteration.  See
 `jax_hf.symmetry.make_project_fn`.
 
+### Newton, deflation, and SCF acceleration
+
+```python
+from jax_hf import SolverConfig, SCFConfig, solve, solve_scf, solve_deflated
+
+# Trust-region Newton: far fewer Fock builds than CG on stiff problems.
+# (A second-order method — enable x64 / build the kernel in float64.)
+r = solve(kernel, P0, N, config=SolverConfig(optimizer="newton", tol_grad=1e-6))
+
+# Deflation: find *distinct* HF solutions (e.g. competing broken-symmetry
+# phases).  Returns them sorted by energy; `best` is the ground-state candidate.
+res = solve_deflated(kernel, P0, N, n_solutions=4)
+print(res.energies, res.best.energy)
+
+# SCF with Pulay DIIS (typically ~10x fewer iterations than linear mixing):
+r = solve_scf(kernel, P0, N, config=SCFConfig(acceleration="diis"))
+```
+
 ### Public API
 
 | Name | Purpose |
 |---|---|
 | `HartreeFockKernel` | Problem + precomputed arrays |
-| `solve` (alias `solve_direct_minimization`), `SolverConfig`, `SolveResult` | Primary solver |
-| `solve_scf`, `SCFConfig`, `SCFResult` | Reference SCF solver |
+| `solve` (alias `solve_direct_minimization`), `SolverConfig`, `SolveResult` | Primary solver (CG + trust-region Newton) |
+| `solve_deflated`, `DeflatedResult` | Find distinct HF solutions (deflated Newton) |
+| `solve_scf`, `SCFConfig`, `SCFResult` | Reference SCF solver (linear / DIIS / ODA) |
 | `build_fock`, `hf_energy`, `free_energy`, `occupation_entropy` | HF objective building blocks |
 | `solve_continuation`, `ContinuationResult`, `resample_kgrid` | Coarse → fine multigrid driver + k-grid resampler |
 

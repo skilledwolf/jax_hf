@@ -195,11 +195,12 @@ def test_build_fock_orbital_hartree_reduces_to_scalar(small_layout):
     assert diff < 1e-12, f"orbital path with broadcast HH disagrees with scalar: {diff}"
 
 
-def test_build_fock_orbital_hartree_rejects_nonzero_diagG(small_layout):
-    """Diagonal-G blocks of ``HH_GG_orbital`` must be zero (q=0 piece dropped).
+def test_build_fock_orbital_hartree_q0_warns_and_is_included(small_layout):
+    """A nonzero diagonal-G block is the q=0 layer Hartree: allowed but warned.
 
-    Mirrors the contimod / cpp_hf validators so all three backends fail
-    consistently when given a non-conforming Hartree matrix.
+    Mirrors cpp_hf relaxing the validator from raise to warn so a layer-resolved
+    system at finite displacement field can keep the gate-screened q=0 layer
+    Hartree.  The contribution must actually change the Fock.
     """
     from jax_hf.superlattice import make_superlattice_build_fock_fn
 
@@ -207,11 +208,39 @@ def test_build_fock_orbital_hartree_rejects_nonzero_diagG(small_layout):
     n_G = small_layout["n_G"]
     nk = small_layout["nk"]
     dim_orb = 2
-    bad = np.zeros((n_G, n_G, dim_orb, dim_orb))
-    bad[0, 0, 0, 0] = 1.0  # nonzero diagonal-G block
-    with pytest.raises(ValueError, match="diagonal-G"):
-        make_superlattice_build_fock_fn(
+    D = n_G * dim_orb
+    rng = np.random.default_rng(7)
+
+    HH_off = rng.standard_normal((n_G, n_G, dim_orb, dim_orb)).astype(np.float64)
+    HH_off[np.arange(n_G), np.arange(n_G)] = 0.0      # moiré/TBG convention: q=0 dropped
+    HH_q0 = HH_off.copy()
+    HH_q0[np.arange(n_G), np.arange(n_G), 0, 0] = 0.5  # keep a q=0 layer Hartree
+
+    h = jnp.zeros((nk, nk, D, D), dtype=jnp.complex128)
+    refP = jnp.zeros_like(h)
+    rho = (rng.standard_normal((nk, nk, D, D))
+           + 1j * rng.standard_normal((nk, nk, D, D))) * 1e-3
+    rho = 0.5 * (rho + np.swapaxes(rho.conj(), -1, -2))
+    P = jnp.asarray(rho)
+    w2d = jnp.full((nk, nk), 1.0 / (nk * nk), dtype=jnp.float64)
+
+    build_off = make_superlattice_build_fock_fn(
+        layout, n_G, dim_orb, nk, nk,
+        HH_GG=np.zeros((n_G, n_G)), hartree_degeneracy=1.0, HH_GG_orbital=HH_off)
+    # a nonzero diagonal-G block must WARN (not raise)
+    with pytest.warns(UserWarning, match="q=0"):
+        build_q0 = make_superlattice_build_fock_fn(
             layout, n_G, dim_orb, nk, nk,
-            HH_GG=np.zeros((n_G, n_G)), hartree_degeneracy=1.0,
-            HH_GG_orbital=bad,
-        )
+            HH_GG=np.zeros((n_G, n_G)), hartree_degeneracy=1.0, HH_GG_orbital=HH_q0)
+
+    kw = dict(
+        h=h, VR=None, refP=refP, HH=jnp.zeros((D, D)), w2d=w2d,
+        include_exchange=False, include_hartree=True,
+        exchange_hermitian_channel_packing=False,
+        contact_g=jnp.zeros((1,)), contact_Oi=jnp.zeros((1, D, D)),
+        contact_Oj=jnp.zeros((1, D, D)),
+    )
+    _, _, F_off = build_off(P, **kw)
+    _, _, F_q0 = build_q0(P, **kw)
+    # the q=0 layer Hartree is actually computed -> the Fock changes
+    assert np.max(np.abs(np.asarray(F_q0) - np.asarray(F_off))) > 1e-9

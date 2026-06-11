@@ -131,6 +131,26 @@ class TestMultiKPoint:
         assert bool(result.converged)
 
 
+class TestPlateauWindow:
+    """Windowed-energy convergence (plateau_window) for the CG path."""
+
+    def test_windowed_and_single_step_agree(self):
+        kernel = _make_two_band_kernel(nk=2, T=0.1)
+        P0 = jnp.zeros_like(kernel.h)
+        # plateau_window=0 is the per-iteration |dE| test; the default 5 is the
+        # windowed test.  Both must reach the same converged solution.
+        r_single = solve(kernel, P0, 4.0, config=SolverConfig(
+            max_iter=200, tol_E=1e-8, plateau_window=0))
+        r_window = solve(kernel, P0, 4.0, config=SolverConfig(
+            max_iter=200, tol_E=1e-8, plateau_window=5))
+        assert bool(r_single.converged) and bool(r_window.converged)
+        np.testing.assert_allclose(
+            float(r_window.energy), float(r_single.energy), atol=1e-6)
+
+    def test_default_is_windowed(self):
+        assert SolverConfig().plateau_window == 5
+
+
 class TestSolveResult:
     def test_result_is_named_tuple(self):
         kernel = _make_two_band_kernel()
