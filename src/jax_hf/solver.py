@@ -15,6 +15,7 @@ Algorithm:
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -220,6 +221,18 @@ def _norm_vec(x: jax.Array, w_norm: jax.Array) -> jax.Array:
     return jnp.sqrt(jnp.maximum(0.0, _ip_vec(x, x, w_norm)))
 
 
+def _project_occ(dp: jax.Array, w2d: jax.Array) -> jax.Array:
+    """Project an occupation variation onto the particle-conserving subspace.
+
+    Removes the component that changes the total electron count, i.e. enforces
+    ``sum_k w_k sum_b dp[k, b] = 0`` by subtracting a uniform shift.
+    """
+    nb = dp.shape[-1]
+    num = jnp.sum(w2d[..., None] * dp)
+    den = jnp.sum(w2d) * nb
+    return dp - num / den
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -237,6 +250,28 @@ class SolverConfig:
     bt_shrink: float = 0.5      # backtracking shrink factor
     bt_max: int = 8             # max backtracking steps
     mu_maxiter: int = 25        # chemical potential solver iterations
+    # Orbital optimizer: "cg" (preconditioned Riemannian CG, default) or
+    # "newton" (trust-region Newton — a Steihaug truncated-CG on the joint
+    # (Q, p) response Hessian, one Fock build per Hessian-vector product).
+    # Newton needs far fewer Fock builds than CG on stiff problems; it
+    # converges on the gradient norm, so it uses ``tol_grad`` (which defaults
+    # to 1e-6 internally when left at 0) instead of ``tol_E``, and ignores the
+    # CG-only knobs ``max_step``, ``cg_restart``, ``bt_shrink``, ``bt_max``.
+    # Newton is a second-order method and needs float64 precision (enable x64);
+    # in float32 it warns and may not converge.  CG works in either precision.
+    optimizer: str = "cg"
+    tr_delta0: float = 0.5      # Newton: initial trust radius
+    tr_cg_max: int = 20         # Newton: max Steihaug inner CG iters per outer step
+    # Deflation (optimizer="newton" only): add a repulsive Gaussian bias around
+    # each density in ``deflation_targets`` so the solve is pushed out of those
+    # basins and converges to a DISTINCT HF solution.  ``deflation_targets`` has
+    # shape ``(n_solutions, nk1, nk2, nb, nb)`` — or None for no deflation;
+    # ``deflation_sigma`` is the bias height (0 = off) and ``deflation_length``
+    # its width in weighted-Frobenius density distance.  Usually driven by
+    # :func:`jax_hf.solve_deflated` rather than set by hand.
+    deflation_targets: Any = None
+    deflation_sigma: float = 0.0
+    deflation_length: float = 1.0
     block_sizes: tuple[int, ...] | None = None
     project_fn: Any = None
 
@@ -612,6 +647,418 @@ _solve_jitted = jax.jit(
 )
 
 
+def _solve_newton_impl(
+    P0: jax.Array,
+    n_electrons: float,
+    tol_grad: float,
+    tr_delta0: float,
+    denom_scale: float,
+    *,
+    h: jax.Array,
+    weights_b: jax.Array,
+    weight_sum: jax.Array,
+    VR: jax.Array,
+    T: float,
+    refP: jax.Array,
+    HH: jax.Array,
+    include_hartree: bool,
+    include_exchange: bool,
+    exchange_hermitian_channel_packing: bool,
+    contact_g: jax.Array,
+    contact_Oi: jax.Array,
+    contact_Oj: jax.Array,
+    deflation_targets: jax.Array,
+    deflation_sigma: float,
+    deflation_length: float,
+    has_deflation: bool,
+    max_iter: int,
+    tr_cg_max: int,
+    mu_maxiter: int,
+    block_sizes: tuple | None,
+    project_fn,
+    fock_build_fn=None,
+) -> SolveResult:
+    """Trust-region Newton via Steihaug truncated-CG on the joint (Q, p) Hessian.
+
+    Minimizes the same free energy as :func:`_solve_impl`, but with a
+    second-order step: the joint (Q, p) Hessian-vector product uses the exact
+    linear interaction response ``Sigma[dP] = F[dP] - h`` (one Fock build each),
+    and a Steihaug truncated-CG solves the trust-region subproblem.  Converges
+    on the gradient norm (commutator ``[F, P]``); far fewer Fock builds than CG
+    on stiff problems.  Implementation mirrors ``cpp_hf``'s ``solve_rtr``.
+    """
+    target_dtype = h.dtype
+    real_dtype = jnp.zeros((), dtype=target_dtype).real.dtype
+    tiny = jnp.asarray(1e-30, dtype=real_dtype)
+
+    _project = project_fn if project_fn is not None else (lambda A: A)
+    _fock_fn = fock_build_fn if fock_build_fn is not None else build_fock
+    block_specs = _exchange_block_specs(block_sizes)
+
+    w2d = jnp.asarray(weights_b[..., 0, 0], dtype=real_dtype)
+    weight_sum_r = jnp.asarray(weight_sum, dtype=real_dtype)
+    w_norm = w2d / jnp.maximum(weight_sum_r, tiny)
+    ones_w = jnp.ones_like(w2d)
+
+    n_target = jnp.asarray(n_electrons, dtype=real_dtype)
+    n_target_norm = n_target / jnp.maximum(weight_sum_r, tiny)
+
+    T_r = jnp.maximum(jnp.asarray(T, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
+    tol_g = jnp.asarray(tol_grad, dtype=real_dtype)
+    denom_scale_r = jnp.asarray(denom_scale, dtype=real_dtype)
+    delta0 = jnp.asarray(tr_delta0, dtype=real_dtype)
+    delta_min = jnp.asarray(1e-10, dtype=real_dtype)
+    occ_clip = jnp.asarray(1e-8, dtype=real_dtype)
+    # Relative energy-noise floor for the trust-region ratio: ~4500 * machine
+    # epsilon, i.e. ~1e-12 in float64 (cpp_hf's hard-coded value) and ~5e-4 in
+    # float32, tracking the precision of the Fock build that produces E.
+    noise_floor = jnp.maximum(
+        jnp.asarray(1e-12, dtype=real_dtype),
+        jnp.asarray(4500.0 * jnp.finfo(real_dtype).eps, dtype=real_dtype),
+    )
+
+    nb = h.shape[-1]
+    eye = jnp.eye(nb, dtype=target_dtype)
+    offdiag = (1.0 - jnp.eye(nb, dtype=real_dtype))[None, None, ...]
+    refP_zero = jnp.zeros_like(refP)
+
+    def _fock_full(P):
+        return _fock_fn(
+            P, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
+            include_exchange=include_exchange, include_hartree=include_hartree,
+            exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+            contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
+            exchange_block_specs=block_specs, project_fn=None,
+        )
+
+    def _fock_response(dP):
+        # Linear interaction response Sigma[dP] = F[dP] - h, with refP = 0 so
+        # the interaction sees dP directly (exact since Sigma is linear in P).
+        _, _, F_resp = _fock_fn(
+            dP, h=h, VR=VR, refP=refP_zero, HH=HH, w2d=w2d,
+            include_exchange=include_exchange, include_hartree=include_hartree,
+            exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+            contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
+            exchange_block_specs=block_specs, project_fn=None,
+        )
+        return F_resp - h
+
+    # Joint metric: orbital part unweighted, occupation part weighted by w2d.
+    def _jip(aX, ap, bX, bp):
+        return _ip_matrix(aX, bX, ones_w) + _ip_vec(ap, bp, w2d)
+
+    def _jip_norm(aX, ap):
+        return jnp.sqrt(jnp.maximum(0.0, _jip(aX, ap, aX, ap)))
+
+    # Deflation bias (Newton-only): a repulsive Gaussian hill around each
+    # already-found density, so a re-solve is pushed out of those basins and
+    # converges to a DISTINCT HF solution.
+    #   Phi      = sigma * sum_i exp(-d_i^2 / (2 L^2)),
+    #   d_i^2    = sum_k w_k ||P_k - target_{i,k}||_F^2   (gauge-invariant in P)
+    #   S_pen    = sum_i 2 phi'(d_i^2) (P - target_i),    phi'(x) = -phi(x)/(2L^2)
+    # The force S_pen is folded into the Fock (F_eff = F + S_pen) so the gradient
+    # sees the bias, and pen_diag = 2 sum_i phi'(d_i^2) is the diagonal penalty
+    # curvature injected into the Hessian-vector product.  ``has_deflation`` is a
+    # static flag, so a normal Newton solve compiles with none of this.
+    defl_inv2L2 = 1.0 / (2.0 * jnp.maximum(
+        jnp.asarray(deflation_length, dtype=real_dtype),
+        jnp.asarray(1e-12, dtype=real_dtype)) ** 2)
+    defl_sigma = jnp.asarray(deflation_sigma, dtype=real_dtype)
+
+    def _deflation_bias(P):
+        diff = P[None] - deflation_targets               # (n_defl, nk1, nk2, nb, nb)
+        per_k = jnp.sum(jnp.abs(diff) ** 2, axis=(-2, -1))       # (n_defl, nk1, nk2)
+        d2 = jnp.sum(w2d[None] * per_k, axis=(1, 2))             # (n_defl,)
+        phi = defl_sigma * jnp.exp(-d2 * defl_inv2L2)
+        phip = -phi * defl_inv2L2                                # phi'(d^2) < 0
+        coeff = (2.0 * phip).astype(target_dtype)
+        S_pen = jnp.sum(coeff[:, None, None, None, None] * diff, axis=0)
+        return jnp.sum(phi), S_pen, 2.0 * jnp.sum(phip)
+
+    def _eval_state(Q, p):
+        """Energy, orbital-basis Fock, gradient norm, penalty curvature at (Q, p).
+
+        One Fock build.  Convergence is judged on the orbital gradient
+        (equivalently the commutator ``[F, P]``); the occupation sector is kept
+        Fermi-Dirac optimal by construction at every step and is relaxed once at
+        the cold start (see ``_relax_occupations``).  With deflation the Fock
+        carries the penalty force and ``E`` is the biased free energy (the
+        physical energy is recomputed unbiased at the finalize).
+        """
+        P = _herm(_project(_density_from_Qp(Q, p)))
+        Sigma, H_h, F = _fock_full(P)
+        E = hf_energy(P, h=h, Sigma=Sigma, H=H_h, weights_b=weights_b)
+        if has_deflation:
+            Phi, S_pen, pen_diag = _deflation_bias(P)
+            E = E + Phi
+            F = F + S_pen
+        else:
+            pen_diag = jnp.zeros((), dtype=real_dtype)
+        Ft = _fock_in_orbital_basis(Q, F)
+        diff_p = p[..., None, :] - p[..., :, None]
+        G = _skew_hermitian(diff_p * Ft) * offdiag
+        grad_norm = _norm_matrix(G, w_norm)
+        return E, Ft, grad_norm, pen_diag
+
+    # ---- Initialize (Q, p) from Fock at P0 ----
+    P0_h = _herm(jnp.asarray(P0, dtype=target_dtype))
+    _, _, F0 = _fock_full(P0_h)
+    eps0, Q0 = jnp.linalg.eigh(F0)
+    eps0 = eps0.astype(real_dtype)
+    Q0 = Q0.astype(target_dtype)
+    mu0 = _solve_mu(eps0, w_norm, n_target_norm,
+                    jnp.asarray(0.0, dtype=real_dtype), T_r, maxiter=mu_maxiter)
+    p0 = jax.nn.sigmoid((mu0 - eps0) / T_r).astype(real_dtype)
+    E0, Ft0, grad0, pen0 = _eval_state(Q0, p0)
+
+    # Cold-start occupation relaxation.  The orbital gradient diff_p * Ft is
+    # blind to the occupations, so if it is already below tolerance at the cold
+    # start the orbital sector may simply be decoupled from a not-yet-relaxed
+    # occupation sector (e.g. diagonal h with scalar exchange).  In that case
+    # relax the occupations to self-consistency at the fixed initial orbitals
+    # before trusting the convergence test, so we do not stop at the
+    # non-interacting occupations.  This only runs when grad0 <= tol_g, so a
+    # normal problem (large initial gradient) pays nothing.
+    def _relax_occupations(operands):
+        p, mu, _E, _Ft, _g, _pen = operands
+
+        def relax_step(_i, state):
+            p_i, mu_i = state
+            P = _herm(_project(_density_from_Qp(Q0, p_i)))
+            _, _, F = _fock_full(P)
+            eps_i = jnp.real(jnp.diagonal(
+                _fock_in_orbital_basis(Q0, F), axis1=-2, axis2=-1)).astype(real_dtype)
+            mu_i = _solve_mu(eps_i, w_norm, n_target_norm, mu_i, T_r, maxiter=mu_maxiter)
+            return jax.nn.sigmoid((mu_i - eps_i) / T_r).astype(real_dtype), mu_i
+
+        p_r, mu_r = lax.fori_loop(0, 30, relax_step, (p, mu))
+        E_r, Ft_r, g_r, pen_r = _eval_state(Q0, p_r)
+        return p_r, mu_r, E_r, Ft_r, g_r, pen_r
+
+    p0, mu0, E0, Ft0, grad0, pen0 = lax.cond(
+        grad0 <= tol_g, _relax_occupations, lambda o: o,
+        (p0, mu0, E0, Ft0, grad0, pen0),
+    )
+
+    hist_E = jnp.zeros(max_iter, dtype=real_dtype)
+    hist_grad = jnp.zeros(max_iter, dtype=real_dtype)
+
+    # carry: (k, Q, p, mu, Ft, E, Delta, grad_norm, pen_diag, hist_E, hist_grad)
+    carry0 = (jnp.int32(0), Q0, p0, mu0, Ft0, E0, delta0, grad0, pen0,
+              hist_E, hist_grad)
+
+    def outer_cond(carry):
+        k, _, _, _, _, _, Delta, grad_norm, _, _, _ = carry
+        return jnp.logical_and(
+            k < max_iter,
+            jnp.logical_and(grad_norm > tol_g, Delta > delta_min),
+        )
+
+    def outer_body(carry):
+        k, Q, p, mu, Ft, E, Delta, grad_norm, pen_diag, hE, hG = carry
+        hE = hE.at[k].set(E)
+        hG = hG.at[k].set(grad_norm)
+
+        eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
+        diff_p = p[..., None, :] - p[..., :, None]
+        G = _skew_hermitian(diff_p * Ft) * offdiag
+
+        eps_scale = jnp.sqrt(jnp.mean(eps ** 2) + tiny)
+        lam_pc = jnp.maximum(T_r, denom_scale_r * eps_scale)
+
+        # Block preconditioner: orbital 1/sqrt(gap^2 + lam^2), occupation
+        # p(1-p)/T, then project the occupation onto particle conservation.
+        gap = eps[..., :, None] - eps[..., None, :]
+        denomX = jnp.sqrt(gap ** 2 + lam_pc ** 2)
+        pc = jnp.clip(p, occ_clip, 1.0 - occ_clip)
+        fd_curv = pc * (1.0 - pc) / T_r
+
+        def _prec(aX, ap):
+            return aX / denomX, _project_occ(ap * fd_curv, w2d)
+
+        # Joint (Q, p) Hessian-vector product (one Fock build via _fock_response).
+        def _hvp(X, dp):
+            M = X * diff_p + dp[..., :, None] * eye  # [X, diag p] off-diag + diag(dp)
+            dP = jnp.einsum("...in,...nm,...jm->...ij", Q, M, jnp.conj(Q))
+            dP = _herm(dP)
+            resp = _fock_response(dP)
+            if has_deflation:
+                resp = resp + pen_diag * dP             # diagonal penalty curvature
+            St = _fock_in_orbital_basis(Q, resp)        # response in orbital basis
+            A = jnp.matmul(Ft, X) - jnp.matmul(X, Ft) + St  # [Ft, X] + St
+            diff_dp = dp[..., None, :] - dp[..., :, None]
+            C = diff_dp * Ft + diff_p * A
+            HX = _skew_hermitian(C) * offdiag
+            A_diag = jnp.real(jnp.diagonal(A, axis1=-2, axis2=-1)).astype(real_dtype)
+            Hp = A_diag + (T_r / (pc * (1.0 - pc))) * dp
+            return HX, _project_occ(Hp, w2d)
+
+        # ---- Steihaug truncated CG on the joint quadratic model ----
+        rX0 = -G
+        rp0 = jnp.zeros_like(p)
+        zX0, zp0 = _prec(rX0, rp0)
+        rz0 = _jip(rX0, rp0, zX0, zp0)
+        zerosQ = jnp.zeros_like(Q)
+        zerosp = jnp.zeros_like(p)
+        # carry: (cg, done, vX, vp, HvX, Hvp, rX, rp, dX, dp, rz)
+        cg_carry0 = (jnp.int32(0), jnp.bool_(False),
+                     zerosQ, zerosp, zerosQ, zerosp,
+                     rX0, rp0, zX0, zp0, rz0)
+
+        def cg_cond(c):
+            return jnp.logical_and(c[0] < tr_cg_max, jnp.logical_not(c[1]))
+
+        def cg_body(c):
+            cg, _done, vX, vp, HvX, Hvp, rX, rp, dX, dp, rz = c
+            HdX, Hdp = _hvp(dX, dp)
+            dHd = _jip(dX, dp, HdX, Hdp)
+            dd = _jip(dX, dp, dX, dp)
+            neg_curv = dHd <= 1e-14 * dd
+
+            # to_boundary: positive root t of ||v + t d||^2 = Delta^2.
+            b_coef = 2.0 * _jip(vX, vp, dX, dp)
+            cc = _jip(vX, vp, vX, vp) - Delta * Delta
+            disc = jnp.maximum(b_coef ** 2 - 4.0 * dd * cc, 0.0)
+            t_bd = (-b_coef + jnp.sqrt(disc)) / (2.0 * dd + 1e-30)
+            vX_bd, vp_bd = vX + t_bd * dX, vp + t_bd * dp
+            HvX_bd, Hvp_bd = HvX + t_bd * HdX, Hvp + t_bd * Hdp
+
+            # Full CG step (guard alpha denom so negative-curvature stays finite).
+            alpha = rz / jnp.where(neg_curv, jnp.ones_like(dHd), dHd)
+            vX_a, vp_a = vX + alpha * dX, vp + alpha * dp
+            norm_va = _jip_norm(vX_a, vp_a)
+            cross = norm_va >= Delta
+            take_boundary = jnp.logical_or(neg_curv, cross)
+
+            HvX_a, Hvp_a = HvX + alpha * HdX, Hvp + alpha * Hdp
+            rX_a, rp_a = rX - alpha * HdX, rp - alpha * Hdp
+            rn = _jip_norm(rX_a, rp_a)
+            inner_conv = rn < 0.05 * grad_norm
+            zX_a, zp_a = _prec(rX_a, rp_a)
+            rz_new = _jip(rX_a, rp_a, zX_a, zp_a)
+            beta = rz_new / jnp.where(jnp.abs(rz) > tiny, rz, jnp.ones_like(rz))
+            dX_a, dp_a = zX_a + beta * dX, zp_a + beta * dp
+
+            stop = jnp.logical_or(take_boundary, inner_conv)
+            vX_n = jnp.where(take_boundary, vX_bd, vX_a)
+            vp_n = jnp.where(take_boundary, vp_bd, vp_a)
+            HvX_n = jnp.where(take_boundary, HvX_bd, HvX_a)
+            Hvp_n = jnp.where(take_boundary, Hvp_bd, Hvp_a)
+            rX_n = jnp.where(take_boundary, rX, rX_a)
+            rp_n = jnp.where(take_boundary, rp, rp_a)
+            dX_n = jnp.where(stop, dX, dX_a)
+            dp_n = jnp.where(stop, dp, dp_a)
+            rz_n = jnp.where(stop, rz, rz_new)
+            return (cg + 1, stop, vX_n, vp_n, HvX_n, Hvp_n,
+                    rX_n, rp_n, dX_n, dp_n, rz_n)
+
+        cg_fin = lax.while_loop(cg_cond, cg_body, cg_carry0)
+        _, _, vX, vp, HvX, Hvp, _, _, _, _, _ = cg_fin
+
+        # Predicted reduction m(0) - m(v) in TRUE energy units: the orbital
+        # gradient/Hessian action are per-k (unweighted) but the energy carries
+        # the BZ measure w2d, so both terms here must be w2d-weighted for the
+        # trust-region ratio to compare against the actual energy change.
+        gv = _ip_matrix(G, vX, w2d)
+        vHv = _ip_matrix(vX, HvX, w2d) + _ip_vec(vp, Hvp, w2d)
+        pred = -(gv + 0.5 * vHv)
+
+        # Retract Q <- Q . Cayley(tau=-1, vX): Cayley(tau, d) ~ I - tau d, and
+        # Steihaug returns vX = -H^{-1} G (the descent direction), so tau = -1
+        # moves along +vX.  Trial occupations come from the frozen Ft.
+        V_v, lam_v = _cayley_spectral_setup(vX)
+        U = _cayley_unitary_from_spectrum(V_v, lam_v, jnp.asarray(-1.0, dtype=real_dtype))
+        Qt = Q @ U
+        Ft_froz = _fock_in_orbital_basis(U, Ft)  # U† Ft U
+        eps_t = jnp.real(jnp.diagonal(Ft_froz, axis1=-2, axis2=-1)).astype(real_dtype)
+        mu_t = _solve_mu(eps_t, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter)
+        p_trial = jax.nn.sigmoid((mu_t - eps_t) / T_r).astype(real_dtype)
+
+        # True energy + gradient at the trial point (one Fock build per outer).
+        E_trial, Ft_trial, grad_trial, pen_trial = _eval_state(Qt, p_trial)
+
+        # Energy-noise floor below which the predicted reduction is meaningless
+        # and the step is judged on the gradient instead.  Scaled to the working
+        # precision: ~1e-12 in float64 (matching cpp_hf), ~5e-4 in float32, so
+        # the trust-region ratio is never trusted below the actual Fock-build
+        # round-off (otherwise float32 noise makes every ratio garbage).
+        noise = noise_floor * jnp.maximum(jnp.abs(E), 1.0)
+        use_grad_branch = pred <= noise
+
+        # Branch 1 (pred below energy noise): judge by the gradient, never climb.
+        accept_g = jnp.logical_and(grad_trial <= grad_norm, E_trial <= E + noise)
+        Delta_g = jnp.where(accept_g, Delta, 0.5 * Delta)
+        # Branch 2 (standard trust-region ratio).
+        ratio = (E - E_trial) / jnp.where(use_grad_branch, jnp.ones_like(pred), pred)
+        step_norm = _jip_norm(vX, vp)
+        Delta_r = jnp.where(
+            ratio < 0.25, 0.25 * Delta,
+            jnp.where(jnp.logical_and(ratio > 0.75, step_norm > 0.9 * Delta),
+                      jnp.minimum(2.0 * Delta, 5.0), Delta),
+        )
+        accept_r = ratio > 0.1
+
+        accept = jnp.where(use_grad_branch, accept_g, accept_r)
+        Delta_new = jnp.where(use_grad_branch, Delta_g, Delta_r)
+
+        Q_new = jnp.where(accept, Qt, Q)
+        p_new = jnp.where(accept, p_trial, p)
+        Ft_new = jnp.where(accept, Ft_trial, Ft)
+        E_new = jnp.where(accept, E_trial, E)
+        mu_new = jnp.where(accept, mu_t, mu)
+        grad_new = jnp.where(accept, grad_trial, grad_norm)
+        pen_new = jnp.where(accept, pen_trial, pen_diag)
+
+        return (k + 1, Q_new, p_new, mu_new, Ft_new, E_new, Delta_new,
+                grad_new, pen_new, hE, hG)
+
+    (k_fin, Q_fin, p_fin, mu_fin, _Ft_fin, _E_loop, _Delta_fin, grad_fin,
+     _pen_fin, hist_E, hist_grad) = lax.while_loop(outer_cond, outer_body, carry0)
+
+    # ---- Finalize: rebuild the Fock at the converged (Q, p) and report.
+    # Unlike the CG path we do NOT re-diagonalize and re-occupy here: at finite
+    # temperature with near-degenerate occupations the orbital gradient
+    # diff_p * Ft can mask sizeable off-diagonal Ft entries, so an eigh +
+    # Fermi-Dirac re-occupation acts as one extra (unconverged) SCF step that
+    # would move the density away from the stationary point the loop reached.
+    # Reporting the loop's own (Q, p) keeps the solution self-consistent
+    # (mirrors cpp_hf's solve_rtr finalize).
+    P_fin = _herm(_project(_density_from_Qp(Q_fin, p_fin)))
+    Sigma_fin, H_fin, F_fin = _fock_full(P_fin)
+    E_fin = hf_energy(P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b)
+
+    converged = grad_fin <= tol_g
+
+    return SolveResult(
+        Q=Q_fin,
+        p=p_fin,
+        mu=mu_fin,
+        density=P_fin,
+        fock=F_fin,
+        energy=E_fin,
+        n_iter=k_fin,
+        converged=converged,
+        history=dict(E=hist_E, grad_norm=hist_grad),
+    )
+
+
+_solve_newton_jitted = jax.jit(
+    _solve_newton_impl,
+    static_argnames=(
+        "include_hartree",
+        "include_exchange",
+        "exchange_hermitian_channel_packing",
+        "has_deflation",
+        "max_iter",
+        "tr_cg_max",
+        "mu_maxiter",
+        "block_sizes",
+        "project_fn",
+        "fock_build_fn",
+    ),
+)
+
+
 def solve_direct_minimization(
     kernel,
     P0,
@@ -622,8 +1069,12 @@ def solve_direct_minimization(
 ) -> SolveResult:
     """Direct-minimization Hartree-Fock solver.
 
-    Preconditioned Riemannian CG on Stiefel x capped simplex, with one
-    Fock build per iteration.  See :class:`SolverConfig` for tuning knobs.
+    With ``config.optimizer="cg"`` (default): preconditioned Riemannian CG on
+    Stiefel x capped simplex, one Fock build per iteration.  With
+    ``config.optimizer="newton"``: trust-region Newton (Steihaug truncated-CG
+    on the joint (Q, p) response Hessian), which converges on the gradient norm
+    and typically needs far fewer Fock builds on stiff problems.  See
+    :class:`SolverConfig` for tuning knobs.
 
     Parameters
     ----------
@@ -668,6 +1119,78 @@ def solve_direct_minimization(
         n_electrons,
         context="n_electrons",
     )
+
+    optimizer = str(config.optimizer).lower()
+    if optimizer not in ("cg", "newton"):
+        raise ValueError(
+            f"Unknown optimizer {config.optimizer!r}; expected 'cg' or 'newton'."
+        )
+
+    deflation_on = (
+        config.deflation_targets is not None and float(config.deflation_sigma) > 0.0
+    )
+    if deflation_on and optimizer != "newton":
+        raise ValueError(
+            "deflation is only supported with optimizer='newton' "
+            f"(got optimizer={config.optimizer!r})."
+        )
+
+    if optimizer == "newton":
+        # Trust-region Newton is a second-order method: its Steihaug Hessian-
+        # vector products go through the FFT Fock build, whose float32 round-off
+        # (~1e-6) swamps the small Hessian eigenvalues on near-degenerate
+        # problems and yields ascent directions.  cpp_hf sidesteps this by
+        # computing in double precision throughout; warn so a float32 caller
+        # knows to enable x64 rather than silently get converged=False.
+        if jnp.finfo(jnp.asarray(kernel.h).real.dtype).bits < 64:
+            warnings.warn(
+                "optimizer='newton' needs float64 precision to converge "
+                "reliably; the kernel is float32. Enable x64 via "
+                "jax.config.update('jax_enable_x64', True) (and build the "
+                "kernel in float64). The CG optimizer works in float32.",
+                stacklevel=2,
+            )
+        # Trust-region Newton converges on the gradient norm; default tol_grad
+        # to 1e-6 when the caller leaves it at 0 (mirrors cpp_hf's solve_rtr).
+        tol_grad = float(config.tol_grad) if config.tol_grad > 0.0 else 1e-6
+
+        # Deflation targets -> (n_solutions, nk1, nk2, nb, nb), matching the
+        # kernel dtype.  An empty (0, ...) stack with has_deflation=False is the
+        # no-deflation path (the bias machinery is then compiled out entirely).
+        h_dtype = jnp.asarray(kernel.h).dtype
+        nk1, nk2, nb = kernel.h.shape[0], kernel.h.shape[1], kernel.h.shape[-1]
+        if deflation_on:
+            defl_arr = jnp.asarray(config.deflation_targets, dtype=h_dtype)
+            if defl_arr.ndim == 4:
+                defl_arr = defl_arr[None, ...]
+            if defl_arr.ndim != 5 or defl_arr.shape[1:] != (nk1, nk2, nb, nb):
+                raise ValueError(
+                    "deflation_targets must have shape "
+                    "(n_solutions, nk1, nk2, nb, nb) matching the kernel; got "
+                    f"{tuple(jnp.asarray(config.deflation_targets).shape)}."
+                )
+        else:
+            defl_arr = jnp.zeros((0, nk1, nk2, nb, nb), dtype=h_dtype)
+
+        return _solve_newton_jitted(
+            jnp.asarray(P0),
+            float(n_electrons),
+            tol_grad,
+            float(config.tr_delta0),
+            float(config.denom_scale),
+            **kernel.as_args(),
+            deflation_targets=defl_arr,
+            deflation_sigma=float(config.deflation_sigma),
+            deflation_length=float(config.deflation_length),
+            has_deflation=bool(deflation_on),
+            max_iter=int(config.max_iter),
+            tr_cg_max=int(config.tr_cg_max),
+            mu_maxiter=int(config.mu_maxiter),
+            block_sizes=config.block_sizes,
+            project_fn=config.project_fn,
+            fock_build_fn=fock_build_fn,
+        )
+
     return _solve_jitted(
         jnp.asarray(P0),
         float(n_electrons),

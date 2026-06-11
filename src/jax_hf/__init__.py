@@ -52,6 +52,10 @@ from .continuation import (  # noqa: F401
     ContinuationResult,
     solve_continuation,
 )
+from .deflation import (  # noqa: F401
+    DeflatedResult,
+    solve_deflated,
+)
 from .superlattice import (  # noqa: F401
     ExtendedGridLayout,
     build_extended_layout,
@@ -80,6 +84,9 @@ __all__ = [
     "resample_kgrid",
     "ContinuationResult",
     "solve_continuation",
+    # Deflation (distinct HF solutions, Newton path)
+    "DeflatedResult",
+    "solve_deflated",
     # Superlattice (g_basis / SuperlatticeModel) Fock
     "ExtendedGridLayout",
     "build_extended_layout",
