@@ -22,9 +22,9 @@ This project adheres to [Semantic Versioning](https://semver.org).
 ### Added
 - `TestGradientStop` regression tests (first-crossing stop, same-solution
   check against the energy stop, unreachable tolerance flags unconverged).
-  Float32 calibration notes live in the test comments: the orbital-gradient
-  noise floor is ~1e-5, and a gradient stop leaves O(1e-4) occupation-channel
-  energy settling relative to the tighter windowed-energy stop.
+  They run in float64: the float32 orbital-gradient noise floor is
+  platform-dependent (~1e-5 on macOS ARM, ~2e-4 on Linux CI), so float32
+  gradient tolerances are not portable.
 
 ## [2.2.0] — 2026-06-10
 
