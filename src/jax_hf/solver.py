@@ -242,8 +242,14 @@ class SolverConfig:
     """Solver controls. Intentionally minimal."""
 
     max_iter: int = 200
-    tol_E: float = 1e-7         # convergence on energy change per step (primary)
-    tol_grad: float = 0.0       # convergence on gradient norm (0 = disabled)
+    tol_E: float = 1e-7         # energy criterion (governs only when tol_grad == 0)
+    # Gradient stopping criterion.  When > 0 it is the SOLE and SUFFICIENT
+    # stop for both optimizers: the run ends (converged=True) as soon as the
+    # w-normalised Frobenius norm of the orbital gradient — the quantity
+    # logged in history["grad_norm"] — drops to tol_grad, and tol_E is
+    # inactive.  0 (default) stops on the windowed-energy criterion instead
+    # (CG path; the Newton path then falls back to an internal 1e-6).
+    tol_grad: float = 0.0
     denom_scale: float = 1e-3   # regularization for energy-gap preconditioner
     max_step: float = 0.6       # max orbital rotation norm per step
     cg_restart: int = 10        # restart CG every N steps
@@ -414,13 +420,19 @@ def _solve_impl(
     )
 
     def cond(carry):
-        # Converge when the energy change is below tol_E.  If tol_grad > 0, also
-        # require gradient norm below tol_grad before declaring convergence.
+        # Stopping rule (mirrors cpp_hf solve_dm):
         #
-        # With plateau_window > 0 the energy test is windowed: stop only when the
-        # energy improved by less than tol_E over the last `plateau_window`
-        # recorded iters.  The line search makes E monotone, so this is a
-        # reliable stop, whereas a single-iteration |dE| test can dip below tol_E
+        # tol_grad > 0 — the gradient criterion is the sole and SUFFICIENT
+        # stop: continue only while grad_norm > tol_grad; the energy criterion
+        # is inactive.  grad_norm in the carry was measured at the previous
+        # body's pre-step point and is the last recorded history entry, so the
+        # loop stops with the histories ending at the qualifying (E, grad)
+        # pair; the returned state is one accepted descent step past it.
+        #
+        # tol_grad == 0 — windowed energy test: stop only when the energy
+        # improved by less than tol_E over the last `plateau_window` recorded
+        # iters.  The line search makes E monotone, so this is a reliable
+        # stop, whereas a single-iteration |dE| test can dip below tol_E
         # during CG warm-up or after a backtracked step and quit prematurely.
         k, _, _, _, _, _, _, _, grad_norm, _, dE, hist_E, _ = carry
         if plateau_window > 0:
@@ -431,12 +443,10 @@ def _solve_impl(
             )
         else:
             energy_not_converged = dE > tol_E_r
-        grad_check_active = tol_grad_r > 0.0
-        grad_not_converged = jnp.logical_and(grad_check_active, grad_norm > tol_grad_r)
-        return jnp.logical_and(
-            k < max_iter,
-            jnp.logical_or(energy_not_converged, grad_not_converged),
+        not_converged = jnp.where(
+            tol_grad_r > 0.0, grad_norm > tol_grad_r, energy_not_converged,
         )
+        return jnp.logical_and(k < max_iter, not_converged)
 
     def body(carry):
         (k, Q, p, mu, d_Q_prev, d_p_prev,
@@ -627,8 +637,15 @@ def _solve_impl(
     )
     E_fin = hf_energy(P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b)
 
-    # Convergence flag: loop exited because of tolerance (not max_iter).
-    converged = k_fin < max_iter
+    # Convergence flag.  Gradient-primary when tol_grad > 0: grad_fin is the
+    # last measured gradient — the entry the loop stopped on, or the final
+    # recorded one when max_iter ran out (which cpp_hf's mid-iteration break
+    # would have accepted; the plain k_fin < max_iter test would miss it).
+    # tol_grad == 0 keeps the legacy flag: loop exited early on the energy
+    # criterion.
+    converged = jnp.where(
+        tol_grad_r > 0.0, grad_fin <= tol_grad_r, k_fin < max_iter,
+    )
 
     return SolveResult(
         Q=Q_fin,

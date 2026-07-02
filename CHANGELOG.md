@@ -3,6 +3,29 @@
 All notable changes to **jax_hf** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org).
 
+## [2.2.1] — 2026-07-02
+
+### Changed
+- **`tol_grad` is now a sufficient stopping criterion for the CG path**,
+  matching `cpp_hf` v1.1.1: with `tol_grad > 0` the run stops — and reports
+  `converged=True` — at the first iterate whose orbital-gradient norm drops
+  to `tol_grad`; `tol_E` is then inactive. Previously the CG loop required
+  the windowed-energy plateau AND the gradient criterion, so soft-mode runs
+  could sit below `tol_grad` for hundreds of iterations and finish
+  `converged=False` at `max_iter`. `tol_grad = 0` (default) keeps the
+  windowed-energy criterion; iterate trajectories are unchanged. The Newton
+  path was already gradient-only and is untouched.
+- `converged` for gradient-stopped runs is derived from the final measured
+  gradient (`grad_fin <= tol_grad`), so a run whose last recorded iterate
+  qualifies exactly at `max_iter` is no longer misflagged unconverged.
+
+### Added
+- `TestGradientStop` regression tests (first-crossing stop, same-solution
+  check against the energy stop, unreachable tolerance flags unconverged).
+  Float32 calibration notes live in the test comments: the orbital-gradient
+  noise floor is ~1e-5, and a gradient stop leaves O(1e-4) occupation-channel
+  energy settling relative to the tighter windowed-energy stop.
+
 ## [2.2.0] — 2026-06-10
 
 This release brings the JAX solver to feature parity with the C++ reference

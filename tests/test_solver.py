@@ -151,6 +151,67 @@ class TestPlateauWindow:
         assert SolverConfig().plateau_window == 5
 
 
+class TestGradientStop:
+    """tol_grad > 0 is a sufficient stop for the CG path (mirrors cpp_hf).
+
+    Needs a kernel with band hybridization: without off-diagonal h the
+    orbital gradient is exactly zero from iteration 0 (all relaxation lives
+    in the occupation channel, which tol_grad intentionally excludes).
+    Tolerances are float32-sized (this file runs without x64).
+    """
+
+    @staticmethod
+    def _hybridized_kernel(nk=2, T=0.1):
+        h = np.zeros((nk, nk, 2, 2), dtype=np.complex64)
+        h[..., 0, 0] = -0.5
+        h[..., 1, 1] = 0.5
+        h[..., 0, 1] = h[..., 1, 0] = 0.2
+        return HartreeFockKernel(
+            weights=jnp.ones((nk, nk), dtype=jnp.float32),
+            hamiltonian=jnp.asarray(h),
+            coulomb_q=jnp.full((nk, nk, 1, 1), 0.5, dtype=jnp.complex64),
+            T=T,
+        )
+
+    def _solve(self, config):
+        kernel = self._hybridized_kernel()
+        P0 = np.zeros(kernel.h.shape, dtype=np.complex64)
+        # Seed off the h-eigenbasis so the orbital gradient starts nonzero.
+        P0[..., 0, 0] = 0.6
+        P0[..., 1, 1] = 0.15
+        P0[..., 0, 1] = P0[..., 1, 0] = 0.25
+        return solve(kernel, jnp.asarray(P0), 3.0, config=config)
+
+    def test_cg_stops_at_first_crossing_and_flags_converged(self):
+        tol = 1e-4
+        result = self._solve(SolverConfig(max_iter=300, tol_grad=tol))
+        assert bool(result.converged)
+        n = int(result.n_iter)
+        assert 1 < n < 300
+        hG = np.asarray(result.history["grad_norm"][:n])
+        # Histories end with the qualifying point, and it is the first
+        # crossing — the run must not grind on after reaching tolerance.
+        assert hG[-1] <= tol
+        assert np.all(hG[:-1] > tol)
+
+    def test_cg_gradient_stop_matches_energy_stop_solution(self):
+        # Same solution (basin), not same precision: 5e-5 sits above the
+        # float32 gradient noise floor (~1.3e-5 here), and the gradient stop
+        # leaves a residual occupation-channel settling of O(1e-4) in energy
+        # that the tighter windowed-energy stop grinds out.  A wrong basin
+        # would differ at the 1e-2 scale.
+        by_grad = self._solve(SolverConfig(max_iter=300, tol_grad=5e-5))
+        by_energy = self._solve(SolverConfig(max_iter=300, tol_E=1e-8))
+        assert bool(by_grad.converged) and bool(by_energy.converged)
+        np.testing.assert_allclose(
+            float(by_grad.energy), float(by_energy.energy), atol=5e-4)
+
+    def test_cg_unreachable_tolerance_flags_unconverged(self):
+        result = self._solve(SolverConfig(max_iter=3, tol_grad=1e-12))
+        assert not bool(result.converged)
+        assert int(result.n_iter) == 3
+
+
 class TestSolveResult:
     def test_result_is_named_tuple(self):
         kernel = _make_two_band_kernel()
