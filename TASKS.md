@@ -52,3 +52,14 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done.
 - [x] Declare NumPy directly, remove unused Optimistix/Optax runtime dependencies unless intentional, and document the tested dependency floor.
 - [x] Fix README installation/testing prerequisites and make every fenced Python example syntactically valid.
 - [x] Remove or update optimizer diagnostics invalidated by the corrected true-objective and finalization behavior.
+
+## Downstream validation
+
+- [x] Re-run the `../contimod/examples` workflows that use the `jax_hf` backend against the current checkout, compare their convergence and physical outputs with saved/reference results, and record any regressions or qualifications.
+  - Representative reduced runs covered the meshgrid, scalar superlattice, orbital-resolved, and TDHF consumers in examples 11, 12, 20, 50, 53, 60, 62, and 63, plus 77 focused downstream tests. General/scalar JAX results agreed closely with C++; production-scale scans were runtime-limited. The confirmed example regressions and documentation qualifications are tracked below.
+- [ ] Update Contimod collective-mode response-Fock calls in `realtime_tdhf.py`, `lanczos_tdhf.py`, and `acfd_tdhf.py` that reuse `kernel.as_args()["VR"]`: after quadrature weights moved from the interaction transform onto the density, raw `selfenergy_fft(VR, dP)` calls over-scale exchange; pass `weights_b * dP` or route through a supported response builder and add a regression. (`acfd_tdhf_2deg.py` constructs a weighted transform itself and is unaffected.)
+- [ ] Update the Contimod tetralayer cRPA README's obsolete warning that `jax_hf` reports energy with `P` instead of `P - P_ref`; the corrected backend energy now agrees with an independent reference-consistent reconstruction to floating-point precision.
+- [ ] Update Contimod example 11's branch-tracker convergence export for the current JAX history schema: `dC_final` is now saved as all `NaN` because `jax_hf` no longer exposes the old `dC` diagnostic, even though the solves and order-parameter outputs remain finite.
+- [ ] Regenerate Contimod example 53's hard-coded reference narrative and plots for the current model artifact: current `hf.py`, `cpp_hf`, and `jax_hf` agree near `-2751.7041862` meV/cell, while the documented `-2755.6632` result and plots predate the current model file.
+- [ ] Give Contimod example 50's `--nk` option a plotting-safe lower bound (at least 4) or handle smaller meshes explicitly; the `nk=3` JAX solve converges, but its `RectBivariateSpline` contour plot fails after the solve.
+- [ ] Remove the misleading `superlattice_jax` CLI option from Contimod example 63, or implement orbital-resolved exchange in the JAX superlattice adapter; the example requires `coulomb_V_orbital` and currently raises `NotImplementedError` immediately.
