@@ -1,22 +1,23 @@
 """Direct minimization solver: preconditioned Riemannian CG on Stiefel x Simplex.
 
 Minimizes the Hartree-Fock free energy Omega(Q, p) = E[P] - T*S(p) over
-unitary orbitals Q (Stiefel manifold) and occupations p (capped simplex),
-with one Fock build per iteration.
+unitary orbitals Q (Stiefel manifold) and occupations p (capped simplex).
 
 Algorithm:
-  1. Build F[P] (one exchange FFT — the dominant cost)
+  1. Build F[P] (an exchange FFT — the dominant cost)
   2. Analytical Riemannian gradient from Fock matrix (no autodiff)
   3. Energy-gap preconditioning (diagonal Hessian)
   4. Polak-Ribiere CG direction with periodic restart
-  5. Backtracking line search on frozen-F free energy
-  6. QR retraction for orbitals, simplex projection for occupations
+  5. Backtracking line search on the true nonlinear free energy
+  6. Cayley retraction for orbitals, simplex projection for occupations
 """
 
 from __future__ import annotations
 
 import warnings
+import math
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, NamedTuple
 
 import jax
@@ -24,7 +25,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from .fock import build_fock, hf_energy, free_energy
-from .utils import validate_electron_count
+from .utils import validate_electron_count, validate_temperature
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +51,14 @@ def _fock_in_orbital_basis(Q: jax.Array, F: jax.Array) -> jax.Array:
 
 
 def _logit(p: jax.Array) -> jax.Array:
-    # Use 1e-6 bound (not 1e-14) so float32 can represent 1-eps != 1.
-    p_safe = jnp.clip(p, 1e-6, 1.0 - 1e-6)
+    # Use the tightest symmetric bound representable by the working dtype.
+    # A fixed 1e-6 bound badly distorts finite-T gradients in float64 when the
+    # physical thermal tail is smaller than 1e-6.
+    eps = jnp.maximum(
+        jnp.asarray(1e-14, dtype=p.dtype),
+        jnp.asarray(jnp.finfo(p.dtype).eps, dtype=p.dtype),
+    )
+    p_safe = jnp.clip(p, eps, 1.0 - eps)
     return jnp.log(p_safe) - jnp.log1p(-p_safe)
 
 
@@ -97,8 +104,28 @@ def _solve_mu(
         mu_new = jnp.where(jnp.isfinite(mu_new), mu_new, mu_bis)
         return (mu_new, lo, hi), None
 
-    (mu_fin, _, _), _ = lax.scan(body, (mu, lo, hi), xs=None, length=maxiter)
-    return mu_fin
+    (mu_fin, lo_fin, hi_fin), _ = lax.scan(
+        body, (mu, lo, hi), xs=None, length=maxiter,
+    )
+    mu_bis = 0.5 * (lo_fin + hi_fin)
+
+    def count(mu_value):
+        return jnp.sum(w_b * jax.nn.sigmoid((mu_value - eps) / Tj))
+
+    mu_fin = jnp.where(
+        jnp.abs(count(mu_bis) - n_target_norm)
+        < jnp.abs(count(mu_fin) - n_target_norm),
+        mu_bis,
+        mu_fin,
+    )
+    neg_inf = jnp.asarray(-jnp.inf, dtype=real_dtype)
+    pos_inf = jnp.asarray(jnp.inf, dtype=real_dtype)
+    capacity = jnp.sum(w_norm) * jnp.asarray(eps.shape[-1], dtype=real_dtype)
+    return jnp.where(
+        n_target_norm <= 0.0,
+        neg_inf,
+        jnp.where(n_target_norm >= capacity, pos_inf, mu_fin),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +248,21 @@ def _norm_vec(x: jax.Array, w_norm: jax.Array) -> jax.Array:
     return jnp.sqrt(jnp.maximum(0.0, _ip_vec(x, x, w_norm)))
 
 
+def _joint_predicted_reduction(
+    G: jax.Array,
+    g_p: jax.Array,
+    vX: jax.Array,
+    vp: jax.Array,
+    HvX: jax.Array,
+    Hvp: jax.Array,
+    w2d: jax.Array,
+) -> jax.Array:
+    """Quadratic-model reduction for the actual joint Newton trial step."""
+    linear = _ip_matrix(G, vX, w2d) + _ip_vec(g_p, vp, w2d)
+    quadratic = _ip_matrix(vX, HvX, w2d) + _ip_vec(vp, Hvp, w2d)
+    return -(linear + 0.5 * quadratic)
+
+
 def _project_occ(dp: jax.Array, w2d: jax.Array) -> jax.Array:
     """Project an occupation variation onto the particle-conserving subspace.
 
@@ -233,6 +275,42 @@ def _project_occ(dp: jax.Array, w2d: jax.Array) -> jax.Array:
     return dp - num / den
 
 
+def _project_capped_occupations(
+    p: jax.Array,
+    w2d: jax.Array,
+    n_target: jax.Array,
+    *,
+    maxiter: int = 50,
+) -> jax.Array:
+    """Euclidean projection onto ``0 <= p <= 1`` at fixed weighted count.
+
+    The weighted metric used by the optimizers has the same k-point weights as
+    the count constraint, so the Lagrange multiplier is a uniform shift:
+    ``p_projected = clip(p + shift, 0, 1)``.  Bisection finds that shift while
+    remaining fully JIT compatible.
+    """
+    real_dtype = p.dtype
+    lo = -jnp.max(p) - jnp.asarray(1.0, dtype=real_dtype)
+    hi = jnp.asarray(1.0, dtype=real_dtype) - jnp.min(p) + jnp.asarray(1.0, dtype=real_dtype)
+
+    def body(state, _):
+        lo_i, hi_i = state
+        mid = 0.5 * (lo_i + hi_i)
+        count = jnp.sum(w2d[..., None] * jnp.clip(p + mid, 0.0, 1.0))
+        lo_i = jnp.where(count < n_target, mid, lo_i)
+        hi_i = jnp.where(count > n_target, mid, hi_i)
+        return (lo_i, hi_i), None
+
+    (lo, hi), _ = lax.scan(body, (lo, hi), xs=None, length=maxiter)
+    projected = jnp.clip(p + 0.5 * (lo + hi), 0.0, 1.0)
+    capacity = jnp.sum(w2d) * jnp.asarray(p.shape[-1], dtype=real_dtype)
+    return jnp.where(
+        n_target <= 0.0,
+        jnp.zeros_like(projected),
+        jnp.where(n_target >= capacity, jnp.ones_like(projected), projected),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -243,19 +321,19 @@ class SolverConfig:
 
     max_iter: int = 200
     tol_E: float = 1e-7         # energy criterion (governs only when tol_grad == 0)
-    # Gradient stopping criterion.  When > 0 it is the SOLE and SUFFICIENT
-    # stop for both optimizers: the run ends (converged=True) as soon as the
-    # w-normalised Frobenius norm of the orbital gradient — the quantity
-    # logged in history["grad_norm"] — drops to tol_grad, and tol_E is
-    # inactive.  0 (default) stops on the windowed-energy criterion instead
-    # (CG path; the Newton path then falls back to an internal 1e-6).
+    # Stationarity stopping criterion.  When > 0 it is the sole stop for both
+    # optimizers: ``history["grad_norm"]`` includes the full weighted
+    # ``||P-P_FD(F)||`` residual so near-equal occupations cannot hide a
+    # non-self-consistent Fock matrix. ``tol_E`` is then inactive. 0 (default)
+    # uses windowed free-energy convergence plus stationarity (CG); Newton
+    # falls back to an internal 1e-6.
     tol_grad: float = 0.0
     denom_scale: float = 1e-3   # regularization for energy-gap preconditioner
     max_step: float = 0.6       # max orbital rotation norm per step
     cg_restart: int = 10        # restart CG every N steps
     bt_shrink: float = 0.5      # backtracking shrink factor
     bt_max: int = 8             # max backtracking steps
-    mu_maxiter: int = 25        # chemical potential solver iterations
+    mu_maxiter: int = 50        # chemical potential solver iterations
     # Windowed energy convergence (CG path): stop when the energy improved by
     # < tol_E over the last `plateau_window` iters (robust to per-step CG noise
     # that makes a single-iteration |dE| test stop early).  0 = per-iteration.
@@ -263,10 +341,11 @@ class SolverConfig:
     # Orbital optimizer: "cg" (preconditioned Riemannian CG, default) or
     # "newton" (trust-region Newton — a Steihaug truncated-CG on the joint
     # (Q, p) response Hessian, one Fock build per Hessian-vector product).
-    # Newton needs far fewer Fock builds than CG on stiff problems; it
-    # converges on the gradient norm, so it uses ``tol_grad`` (which defaults
-    # to 1e-6 internally when left at 0) instead of ``tol_E``, and ignores the
-    # CG-only knobs ``max_step``, ``cg_restart``, ``bt_shrink``, ``bt_max``.
+    # Newton often needs fewer outer iterations than CG on stiff problems. It
+    # converges on the stationarity norm, so it uses ``tol_grad`` (which
+    # defaults to 1e-6 internally when left at 0) instead of ``tol_E``, and
+    # ignores the CG-only knobs ``max_step``, ``cg_restart``, ``bt_shrink``,
+    # and ``bt_max``.
     # Newton is a second-order method and needs float64 precision (enable x64);
     # in float32 it warns and may not converge.  CG works in either precision.
     optimizer: str = "cg"
@@ -284,6 +363,66 @@ class SolverConfig:
     deflation_length: float = 1.0
     block_sizes: tuple[int, ...] | None = None
     project_fn: Any = None
+
+    def __post_init__(self) -> None:
+        finite_fields = (
+            "tol_E", "tol_grad", "denom_scale", "max_step", "bt_shrink",
+            "tr_delta0", "deflation_sigma", "deflation_length",
+        )
+        for name in finite_fields:
+            value = getattr(self, name)
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        integer_fields = (
+            "max_iter", "cg_restart", "bt_max", "mu_maxiter",
+            "plateau_window", "tr_cg_max",
+        )
+        for name in integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise ValueError(f"{name} must be an integer")
+        if self.max_iter <= 0:
+            raise ValueError("max_iter must be positive")
+        if self.tol_E < 0.0:
+            raise ValueError("tol_E must be non-negative")
+        if self.tol_grad < 0.0:
+            raise ValueError("tol_grad must be non-negative")
+        if self.denom_scale < 0.0:
+            raise ValueError("denom_scale must be non-negative")
+        if self.max_step <= 0.0:
+            raise ValueError("max_step must be positive")
+        if self.cg_restart <= 0:
+            raise ValueError("cg_restart must be positive")
+        if not 0.0 < self.bt_shrink < 1.0:
+            raise ValueError("bt_shrink must be strictly between 0 and 1")
+        if self.bt_max <= 0:
+            raise ValueError("bt_max must be positive")
+        if self.mu_maxiter <= 0:
+            raise ValueError("mu_maxiter must be positive")
+        if self.plateau_window < 0:
+            raise ValueError("plateau_window must be non-negative")
+        if str(self.optimizer).lower() not in ("cg", "newton"):
+            raise ValueError(
+                f"optimizer must be 'cg' or 'newton', got {self.optimizer!r}"
+            )
+        if self.tr_delta0 <= 0.0:
+            raise ValueError("tr_delta0 must be positive")
+        if self.tr_cg_max <= 0:
+            raise ValueError("tr_cg_max must be positive")
+        if self.deflation_sigma < 0.0:
+            raise ValueError("deflation_sigma must be non-negative")
+        if self.deflation_length <= 0.0:
+            raise ValueError("deflation_length must be positive")
+        if self.block_sizes is not None:
+            if any(
+                isinstance(size, bool)
+                or not isinstance(size, Integral)
+                or size <= 0
+                for size in self.block_sizes
+            ):
+                raise ValueError("block_sizes entries must be positive integers")
+        if self.project_fn is not None and not callable(self.project_fn):
+            raise ValueError("project_fn must be callable or None")
 
 
 class SolveResult(NamedTuple):
@@ -337,8 +476,9 @@ def _solve_impl(
 ) -> SolveResult:
     """Direct minimization via preconditioned Riemannian CG.
 
-    One Fock build per iteration.  Jointly optimizes orbitals (Q on Stiefel
-    manifold via Cayley retraction) and occupations (p on capped simplex).
+    Jointly optimizes orbitals (Q on Stiefel manifold via Cayley retraction)
+    and occupations (p on capped simplex). True-objective backtracking may
+    require multiple Fock builds per outer iteration.
 
     Implementation detail — users should call :func:`solve_direct_minimization`
     (or the :func:`solve` alias) instead.  JIT caching is handled by that wrapper.
@@ -395,11 +535,13 @@ def _solve_impl(
 
     # ---- History buffers ----
     hist_E = jnp.zeros(max_iter, dtype=real_dtype)
+    hist_free = jnp.zeros(max_iter, dtype=real_dtype)
     hist_grad = jnp.zeros(max_iter, dtype=real_dtype)
 
     # ---- Carry for lax.while_loop ----
-    # (iter, Q, p, mu, d_Q, d_p, G_Q_prev, g_p_prev, grad_norm, E_prev, dE,
-    #  hist_E, hist_grad)
+    # (iter, Q, p, mu, d_Q, d_p, G_Q_prev, g_p_prev, stationarity_norm,
+    #  free_energy_prev, free_energy_improvement, hist_E, hist_free_energy,
+    #  hist_grad)
     zeros_Q = jnp.zeros_like(Q0)
     zeros_p = jnp.zeros_like(p0)
 
@@ -413,44 +555,65 @@ def _solve_impl(
         zeros_Q,             # G_Q_prev (previous orbital gradient)
         zeros_p,             # g_p_prev (previous occupation gradient)
         jnp.asarray(jnp.inf, dtype=real_dtype),  # grad_norm
-        jnp.asarray(jnp.inf, dtype=real_dtype),  # E_prev (last recorded energy)
-        jnp.asarray(jnp.inf, dtype=real_dtype),  # dE = |E - E_prev|
+        jnp.asarray(jnp.inf, dtype=real_dtype),  # previous free energy
+        jnp.asarray(jnp.inf, dtype=real_dtype),  # previous free-energy improvement
         hist_E,
+        hist_free,
         hist_grad,
     )
 
     def cond(carry):
         # Stopping rule (mirrors cpp_hf solve_dm):
         #
-        # tol_grad > 0 — the gradient criterion is the sole and SUFFICIENT
-        # stop: continue only while grad_norm > tol_grad; the energy criterion
+        # tol_grad > 0 — the joint orbital/occupation stationarity criterion is
+        # the sole stop: continue only while grad_norm > tol_grad; the energy criterion
         # is inactive.  grad_norm in the carry was measured at the previous
         # body's pre-step point and is the last recorded history entry, so the
         # loop stops with the histories ending at the qualifying (E, grad)
         # pair; the returned state is one accepted descent step past it.
         #
-        # tol_grad == 0 — windowed energy test: stop only when the energy
+        # tol_grad == 0 — windowed free-energy test: stop only when the objective
         # improved by less than tol_E over the last `plateau_window` recorded
-        # iters.  The line search makes E monotone, so this is a reliable
-        # stop, whereas a single-iteration |dE| test can dip below tol_E
-        # during CG warm-up or after a backtracked step and quit prematurely.
-        k, _, _, _, _, _, _, _, grad_norm, _, dE, hist_E, _ = carry
+        # iters and the joint stationarity residual is small.  An objective
+        # increase always continues: it must never be interpreted as a plateau.
+        k, _, _, _, _, _, _, _, grad_norm, _, dE, _, hist_free, _ = carry
+        objective_scale = jnp.maximum(
+            jnp.abs(hist_free[jnp.maximum(k - 1, 0)]), 1.0,
+        )
+        energy_noise = (
+            jnp.asarray(100.0 * jnp.finfo(real_dtype).eps, dtype=real_dtype)
+            * objective_scale
+        )
         if plateau_window > 0:
-            e_now = hist_E[jnp.maximum(k - 1, 0)]
-            e_past = hist_E[jnp.maximum(k - 1 - plateau_window, 0)]
+            e_now = hist_free[jnp.maximum(k - 1, 0)]
+            e_past = hist_free[jnp.maximum(k - 1 - plateau_window, 0)]
+            improvement = e_past - e_now
             energy_not_converged = jnp.where(
-                k > plateau_window, (e_past - e_now) > tol_E_r, dE > tol_E_r,
+                k > plateau_window,
+                jnp.logical_or(
+                    improvement < -energy_noise, improvement > tol_E_r,
+                ),
+                jnp.logical_or(dE < -energy_noise, dE > tol_E_r),
             )
         else:
-            energy_not_converged = dE > tol_E_r
+            energy_not_converged = jnp.logical_or(
+                dE < -energy_noise, dE > tol_E_r,
+            )
+        stationarity_tol = jnp.maximum(
+            jnp.sqrt(jnp.maximum(tol_E_r, 0.0)),
+            jnp.asarray(jnp.sqrt(jnp.finfo(real_dtype).eps), dtype=real_dtype),
+        )
         not_converged = jnp.where(
-            tol_grad_r > 0.0, grad_norm > tol_grad_r, energy_not_converged,
+            tol_grad_r > 0.0,
+            grad_norm > tol_grad_r,
+            jnp.logical_or(energy_not_converged, grad_norm > stationarity_tol),
         )
         return jnp.logical_and(k < max_iter, not_converged)
 
     def body(carry):
         (k, Q, p, mu, d_Q_prev, d_p_prev,
-         G_Q_prev, g_p_prev, _grad_norm_prev, E_prev, _dE_prev, hE, hG) = carry
+         G_Q_prev, g_p_prev, _grad_norm_prev, E_prev, _dE_prev,
+         hE, hO, hG) = carry
 
         # ========== 1. Build Fock matrix (THE expensive step) ==========
         # P_cur is already projected to the symmetric subspace above.  When
@@ -468,7 +631,10 @@ def _solve_impl(
             exchange_block_specs=block_specs,
             project_fn=None,
         )
-        E = hf_energy(P_cur, h=h, Sigma=Sigma, H=H_h, weights_b=weights_b)
+        E = hf_energy(
+            P_cur, h=h, Sigma=Sigma, H=H_h, weights_b=weights_b, refP=refP,
+        )
+        Omega = free_energy(E, p, w2d, T_r)
         Ft = _fock_in_orbital_basis(Q, F)
         eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
 
@@ -477,18 +643,25 @@ def _solve_impl(
         diff_p = p[..., None, :] - p[..., :, None]
         G_Q = _skew_hermitian(diff_p * Ft) * offdiag
 
-        # Occupation gradient: g_i = eps_i + T*logit(p_i) - mu
-        # Use the carry's mu (from last iter's post-retraction solve) as a
-        # warm guess.  g_p only enters the line-search direction d_p; the
-        # final p_new is set via a fresh _solve_mu after retraction, so a
-        # small staleness in mu only perturbs the τ choice.  Skipping this
-        # mu_solve cuts ~14% of body work per iter.
-        g_p = (eps + T_r * _logit(p) - mu).astype(real_dtype)
+        # Occupation gradient on the fixed-particle tangent space.  The
+        # chemical-potential term is constant and is removed by the projection.
+        g_p = _project_occ(
+            (eps + T_r * _logit(p)).astype(real_dtype), w_norm,
+        )
 
-        # Convergence uses only the orbital gradient (commutator [F, P]).
-        # The occupation gradient is zero by construction since p is always
-        # set to the FD optimum at the end of each step.
-        grad_norm = _norm_matrix(G_Q, w_norm)
+        # A Fermi-Dirac fixed-point residual remains well-defined at saturated
+        # occupations, where the logit gradient is numerically singular.  Both
+        # orbital and occupation stationarity are required for convergence.
+        eps_fd, Q_fd = jnp.linalg.eigh(F)
+        mu_fd = _solve_mu(
+            eps_fd.astype(real_dtype), w_norm, n_target_norm, mu, T_r,
+            maxiter=mu_maxiter,
+        )
+        p_fd = jax.nn.sigmoid((mu_fd - eps_fd) / T_r).astype(real_dtype)
+        P_fd = _herm(_project(_density_from_Qp(Q_fd.astype(target_dtype), p_fd)))
+        orbital_norm = _norm_matrix(G_Q, w_norm)
+        fixed_point_norm = _norm_matrix(P_cur - P_fd, w_norm)
+        grad_norm = jnp.maximum(orbital_norm, fixed_point_norm)
 
         # ========== 3. Precondition ==========
         # Orbital: scale by inverse energy gaps
@@ -501,7 +674,7 @@ def _solve_impl(
         # Occupation: scale by inverse FD curvature  (d²S/dp² = 1/(p(1-p)T))
         p_safe = jnp.clip(p, 1e-8, 1.0 - 1e-8)
         fd_curv = p_safe * (1.0 - p_safe) / T_r
-        h_p = g_p * fd_curv
+        h_p = _project_occ(g_p * fd_curv, w_norm)
 
         # ========== 4. CG direction (Polak-Ribiere) ==========
         # On first iteration (k=0), just use steepest descent
@@ -531,8 +704,11 @@ def _solve_impl(
         d_Q = H_Q + beta * d_Q_prev
         d_p = h_p + beta * d_p_prev
 
-        # ========== 5. Line search (backtracking on frozen-F free energy) ==========
-        # Frozen-F free energy: Omega(tau) = Tr[diag(p_trial) U†FtU] - T*S(p_trial)
+        # ========== 5. Backtracking on the true free energy ==========
+        # A frozen-F surrogate is only first-order accurate and can accept a
+        # genuine free-energy increase, producing stable two-cycles that a
+        # signed plateau test then mistakes for convergence.  Evaluate the
+        # actual nonlinear HF free energy at every candidate.
         #
         # Spectral Cayley path: eigendecompose (i * d_Q) once and pre-rotate Ft
         # into the d_Q eigenbasis.  Each line-search trial then costs one
@@ -546,86 +722,135 @@ def _solve_impl(
         d_Q_norm = _norm_matrix(d_Q, w_norm)
         tau0 = jnp.minimum(1.0, max_step_r / jnp.maximum(d_Q_norm, tiny))
 
-        def frozen_F_free_energy(tau_val):
-            eps_trial = _diag_UFU_from_spectrum(V_d, Ft_eig, lam_d, tau_val)
-            p_trial = jnp.clip(p - tau_val * d_p, 1e-8, 1.0 - 1e-8)
-            E_frozen = jnp.sum(w_norm[..., None] * p_trial * eps_trial)
-            return free_energy(E_frozen, p_trial, w_norm, T_r)
-
-        # Inlined frozen_F_free_energy(tau=0): eps_trial = eps and
-        # p_trial = clip(p), avoiding the spectral diag computation entirely
-        # at the trivial trial point.  Mathematically identical to the
-        # original frozen_F_free_energy(0.0) call.
-        p0_clip = jnp.clip(p, 1e-8, 1.0 - 1e-8)
-        E_frozen0 = jnp.sum(w_norm[..., None] * p0_clip * eps)
-        Omega0 = free_energy(E_frozen0, p0_clip, w_norm, T_r)
+        def trial_free_energy(tau_val):
+            U_trial = _cayley_unitary_from_spectrum(V_d, lam_d, tau_val)
+            Q_trial = Q @ U_trial
+            p_trial = _project_capped_occupations(
+                p - tau_val * d_p, w_norm, n_target_norm,
+            )
+            P_trial = _herm(_project(_density_from_Qp(Q_trial, p_trial)))
+            Sigma_trial, H_trial, _ = _fock_fn(
+                P_trial, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
+                include_exchange=include_exchange, include_hartree=include_hartree,
+                exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+                contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
+                exchange_block_specs=block_specs, project_fn=None,
+            )
+            E_trial = hf_energy(
+                P_trial, h=h, Sigma=Sigma_trial, H=H_trial,
+                weights_b=weights_b, refP=refP,
+            )
+            return free_energy(E_trial, p_trial, w2d, T_r)
 
         def bt_cond(state):
-            i, tau, accepted = state
+            i, tau, accepted, _Omega_trial = state
             return jnp.logical_and(i < bt_max, jnp.logical_not(accepted))
 
         def bt_body(state):
-            i, tau, _ = state
-            Omega_trial = frozen_F_free_energy(tau)
-            accepted = Omega_trial < Omega0
+            i, tau, _accepted, _Omega_trial = state
+            Omega_trial = trial_free_energy(tau)
+            accepted = Omega_trial < Omega
             tau_next = jnp.where(accepted, tau, tau * bt_shrink_r)
-            return (i + 1, tau_next, accepted)
+            return (i + 1, tau_next, accepted, Omega_trial)
 
-        _, tau_final, bt_accepted = lax.while_loop(
+        _, tau_final, bt_accepted, Omega_bt = lax.while_loop(
             bt_cond, bt_body,
-            (jnp.int32(0), tau0, jnp.bool_(False)),
+            (jnp.int32(0), tau0, jnp.bool_(False), Omega),
         )
-        # If no step accepted, take a tiny step
-        tau_final = jnp.where(bt_accepted, tau_final, tau0 * bt_shrink_r ** bt_max)
+        # If no candidate descends, leave the state unchanged.  Taking an
+        # unchecked "tiny" step is exactly what allowed objective climbs.
+        tau_final = jnp.where(bt_accepted, tau_final, jnp.asarray(0.0, real_dtype))
 
-        # ========== 6. Retraction (eigen-free inner loop) ==========
-        # Use diag(Q_new† F Q_new) as approximate eigenvalues for FD
-        # re-occupation.  Exact within p-degenerate blocks; slightly
-        # approximate for near-degenerate states but the CG direction
-        # already kills pure-gauge components via the diff_p factor.
+        # ========== 6. Retraction ==========
+        # Apply the same joint orbital/occupation step that the line search
+        # accepted.  Replacing it by a frozen-F Fermi re-occupation turns the
+        # occupation update into an SCF map and can oscillate while the orbital
+        # gradient remains identically zero.
         U = _cayley_unitary_from_spectrum(V_d, lam_d, tau_final)
         Q_new = Q @ U
         # eps_new = diag(Q_new† F Q_new) = diag(U† Ft U) — read directly from
         # the cached spectral form without an extra matmul triple-product.
         eps_new = _diag_UFU_from_spectrum(V_d, Ft_eig, lam_d, tau_final).astype(real_dtype)
         mu_new = _solve_mu(eps_new, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter)
-        p_new = jax.nn.sigmoid((mu_new - eps_new) / T_r).astype(real_dtype)
+        p_new = _project_capped_occupations(
+            p - tau_final * d_p, w_norm, n_target_norm,
+        )
+
+        # When near-equal occupations hide a large full FD residual, the local
+        # (Q,p) direction can make negligible progress.  Compare it with a
+        # damped density fixed-point direction, retaining only a true
+        # free-energy descent and a consistent eigendecomposition.
+        # ``Omega_bt`` is the objective already evaluated for the accepted
+        # candidate. Reusing it avoids an otherwise redundant Fock build.
+        Omega_direct = jnp.where(bt_accepted, Omega_bt, Omega)
+
+        def fb_cond(state):
+            i, _lam, accepted_fb, *_ = state
+            return jnp.logical_and(i < bt_max, jnp.logical_not(accepted_fb))
+
+        def fb_body(state):
+            i, lam_fb, _accepted_fb, *_rest = state
+            P_mix = _herm(
+                _project(P_cur + lam_fb.astype(target_dtype) * (P_fd - P_cur))
+            )
+            p_mix, Q_mix = jnp.linalg.eigh(P_mix)
+            p_mix = _project_capped_occupations(
+                p_mix.astype(real_dtype), w_norm, n_target_norm,
+            )
+            Q_mix = Q_mix.astype(target_dtype)
+            P_mix = _herm(_project(_density_from_Qp(Q_mix, p_mix)))
+            Sigma_mix, H_mix, _ = _fock_fn(
+                P_mix, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
+                include_exchange=include_exchange, include_hartree=include_hartree,
+                exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+                contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
+                exchange_block_specs=block_specs, project_fn=None,
+            )
+            E_mix = hf_energy(
+                P_mix, h=h, Sigma=Sigma_mix, H=H_mix,
+                weights_b=weights_b, refP=refP,
+            )
+            O_mix = free_energy(E_mix, p_mix, w2d, T_r)
+            accepted_fb = O_mix < Omega
+            lam_next = jnp.where(accepted_fb, lam_fb, 0.5 * lam_fb)
+            return i + 1, lam_next, accepted_fb, Q_mix, p_mix, O_mix
+
+        fb0 = (
+            jnp.int32(0), jnp.asarray(1.0, real_dtype), jnp.bool_(False),
+            Q, p, Omega,
+        )
+        _fbi, _fbl, fb_accepted, Q_fb, p_fb, Omega_fb = lax.while_loop(
+            fb_cond, fb_body, fb0,
+        )
+        use_fb = jnp.logical_and(fb_accepted, Omega_fb < Omega_direct)
+        Q_new = jnp.where(use_fb, Q_fb, Q_new)
+        p_new = jnp.where(use_fb, p_fb, p_new)
+        Ft_fb = _fock_in_orbital_basis(Q_fb, F)
+        eps_fb = jnp.real(
+            jnp.diagonal(Ft_fb, axis1=-2, axis2=-1)
+        ).astype(real_dtype)
+        mu_fb = _solve_mu(
+            eps_fb, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter,
+        )
+        mu_new = jnp.where(use_fb, mu_fb, mu_new)
 
         # ========== 7. Record history + energy change ==========
         hE = hE.at[k].set(E)
+        hO = hO.at[k].set(Omega)
         hG = hG.at[k].set(grad_norm)
-        dE = jnp.abs(E - E_prev)
+        dE = E_prev - Omega
 
         return (k + 1, Q_new, p_new, mu_new, d_Q, d_p, G_Q, g_p, grad_norm,
-                E, dE, hE, hG)
+                Omega, dE, hE, hO, hG)
 
     # ---- Run ----
     (k_fin, Q_fin, p_fin, mu_fin, _, _, _, _, grad_fin, E_fin_loop, dE_fin,
-     hist_E, hist_grad) = lax.while_loop(cond, body, carry0)
+     hist_E, hist_free, hist_grad) = lax.while_loop(cond, body, carry0)
 
-    # ---- Finalize: one eigh to produce clean Fock eigenvectors ----
-    # Build Fock at current (Q, p), then rotate Q so the orbitals diagonalize
-    # the Fock matrix.  This gives the canonical output expected by consumers
-    # (eigenvalues in eps_final, orbitals as rows of Q).  P is gauge-invariant
-    # within degenerate p-blocks so this shouldn't change the energy much;
-    # we rebuild the Fock one more time with the clean density for a consistent
-    # final result.
-    P_pre = _herm(_project(_density_from_Qp(Q_fin, p_fin)))
-    _, _, F_pre = _fock_fn(
-        P_pre, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
-        include_exchange=include_exchange, include_hartree=include_hartree,
-        exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
-        contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
-        exchange_block_specs=block_specs,
-        project_fn=None,
-    )
-    Ft_fin = _fock_in_orbital_basis(Q_fin, F_pre)
-    eps_fin, V_fin = jnp.linalg.eigh(Ft_fin)
-    eps_fin = eps_fin.astype(real_dtype)
-    Q_fin = Q_fin @ V_fin.astype(target_dtype)
-    mu_fin = _solve_mu(eps_fin, w_norm, n_target_norm, mu_fin, T_r, maxiter=mu_maxiter)
-    p_fin = jax.nn.sigmoid((mu_fin - eps_fin) / T_r).astype(real_dtype)
-
+    # ---- Finalize without changing the optimized state -------------------
+    # A previous finalize diagonalized F[P] and re-occupied it, which is an
+    # additional, unchecked SCF step rather than a gauge cleanup.  It could
+    # materially change both density and energy after convergence.
     P_fin = _herm(_project(_density_from_Qp(Q_fin, p_fin)))
     Sigma_fin, H_fin, F_fin = _fock_fn(
         P_fin, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
@@ -635,7 +860,71 @@ def _solve_impl(
         exchange_block_specs=block_specs,
         project_fn=None,
     )
-    E_fin = hf_energy(P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b)
+    E_fin = hf_energy(
+        P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b, refP=refP,
+    )
+
+    # Recheck the full self-consistency residual at the exact returned state.
+    eps_check, Q_check = jnp.linalg.eigh(F_fin)
+    mu_check = _solve_mu(
+        eps_check.astype(real_dtype), w_norm, n_target_norm, mu_fin, T_r,
+        maxiter=mu_maxiter,
+    )
+    p_check = jax.nn.sigmoid((mu_check - eps_check) / T_r).astype(real_dtype)
+    P_check = _herm(_project(_density_from_Qp(Q_check.astype(target_dtype), p_check)))
+    final_res = _norm_matrix(P_fin - P_check, w_norm)
+
+    # A single canonical fixed-point polish is safe only when it is explicitly
+    # rechecked and improves an already-small residual.  This recovers a clean
+    # float32 output without reviving the old unconditional finalize step that
+    # could materially change a nonstationary solution.
+    if project_fn is None:
+        Sigma_polish, H_polish, F_polish = _fock_fn(
+            P_check, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
+            include_exchange=include_exchange, include_hartree=include_hartree,
+            exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
+            contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
+            exchange_block_specs=block_specs, project_fn=None,
+        )
+        eps_next, Q_next = jnp.linalg.eigh(F_polish)
+        mu_next = _solve_mu(
+            eps_next.astype(real_dtype), w_norm, n_target_norm, mu_check, T_r,
+            maxiter=mu_maxiter,
+        )
+        p_next = jax.nn.sigmoid((mu_next - eps_next) / T_r).astype(real_dtype)
+        P_next = _herm(_density_from_Qp(Q_next.astype(target_dtype), p_next))
+        polish_res = _norm_matrix(P_check - P_next, w_norm)
+        polish_limit = jnp.maximum(
+            jnp.where(
+                tol_grad_r > 0.0,
+                tol_grad_r,
+                jnp.sqrt(jnp.maximum(tol_E_r, 0.0)),
+            ),
+            jnp.asarray(jnp.sqrt(jnp.finfo(real_dtype).eps), dtype=real_dtype),
+        )
+        use_polish = jnp.logical_and(
+            final_res <= polish_limit, polish_res < final_res,
+        )
+        Q_fin = jnp.where(use_polish, Q_check.astype(target_dtype), Q_fin)
+        p_fin = jnp.where(use_polish, p_check, p_fin)
+        P_fin = jnp.where(use_polish, P_check, P_fin)
+        Sigma_fin = jnp.where(use_polish, Sigma_polish, Sigma_fin)
+        H_fin = jnp.where(use_polish, H_polish, H_fin)
+        F_fin = jnp.where(use_polish, F_polish, F_fin)
+        final_res = jnp.where(use_polish, polish_res, final_res)
+        E_polish = hf_energy(
+            P_check, h=h, Sigma=Sigma_polish, H=H_polish,
+            weights_b=weights_b, refP=refP,
+        )
+        E_fin = jnp.where(use_polish, E_polish, E_fin)
+
+    Ft_return = _fock_in_orbital_basis(Q_fin, F_fin)
+    eps_return = jnp.real(
+        jnp.diagonal(Ft_return, axis1=-2, axis2=-1)
+    ).astype(real_dtype)
+    mu_fin = _solve_mu(
+        eps_return, w_norm, n_target_norm, mu_fin, T_r, maxiter=mu_maxiter,
+    )
 
     # Convergence flag.  Gradient-primary when tol_grad > 0: grad_fin is the
     # last measured gradient — the entry the loop stopped on, or the final
@@ -643,8 +932,17 @@ def _solve_impl(
     # would have accepted; the plain k_fin < max_iter test would miss it).
     # tol_grad == 0 keeps the legacy flag: loop exited early on the energy
     # criterion.
-    converged = jnp.where(
-        tol_grad_r > 0.0, grad_fin <= tol_grad_r, k_fin < max_iter,
+    stationarity_tol = jnp.maximum(
+        jnp.where(tol_grad_r > 0.0, tol_grad_r, jnp.sqrt(jnp.maximum(tol_E_r, 0.0))),
+        jnp.where(
+            tol_grad_r > 0.0,
+            jnp.asarray(100.0 * jnp.finfo(real_dtype).eps, dtype=real_dtype),
+            jnp.asarray(jnp.sqrt(jnp.finfo(real_dtype).eps), dtype=real_dtype),
+        ),
+    )
+    converged = jnp.logical_and(
+        final_res <= stationarity_tol,
+        jnp.where(tol_grad_r > 0.0, grad_fin <= tol_grad_r, k_fin < max_iter),
     )
 
     return SolveResult(
@@ -656,7 +954,7 @@ def _solve_impl(
         energy=E_fin,
         n_iter=k_fin,
         converged=converged,
-        history=dict(E=hist_E, grad_norm=hist_grad),
+        history=dict(E=hist_E, free_energy=hist_free, grad_norm=hist_grad),
     )
 
 
@@ -719,9 +1017,9 @@ def _solve_newton_impl(
     Minimizes the same free energy as :func:`_solve_impl`, but with a
     second-order step: the joint (Q, p) Hessian-vector product uses the exact
     linear interaction response ``Sigma[dP] = F[dP] - h`` (one Fock build each),
-    and a Steihaug truncated-CG solves the trust-region subproblem.  Converges
-    on the gradient norm (commutator ``[F, P]``); far fewer Fock builds than CG
-    on stiff problems.  Implementation mirrors ``cpp_hf``'s ``solve_rtr``.
+    and a Steihaug truncated-CG solves the trust-region subproblem. Convergence
+    requires both the orbital gradient and the full Fermi-Dirac fixed-point
+    residual. It often needs fewer outer iterations than CG on stiff problems.
     """
     target_dtype = h.dtype
     real_dtype = jnp.zeros((), dtype=target_dtype).real.dtype
@@ -812,29 +1110,43 @@ def _solve_newton_impl(
         return jnp.sum(phi), S_pen, 2.0 * jnp.sum(phip)
 
     def _eval_state(Q, p):
-        """Energy, orbital-basis Fock, gradient norm, penalty curvature at (Q, p).
+        """Objectives, orbital-basis Fock, stationarity, and penalty curvature.
 
         One Fock build.  Convergence is judged on the orbital gradient
-        (equivalently the commutator ``[F, P]``); the occupation sector is kept
-        Fermi-Dirac optimal by construction at every step and is relaxed once at
-        the cold start (see ``_relax_occupations``).  With deflation the Fock
-        carries the penalty force and ``E`` is the biased free energy (the
-        physical energy is recomputed unbiased at the finalize).
+        (equivalently the commutator ``[F, P]``) and the occupation
+        Fermi-Dirac residual.  With deflation the Fock carries the penalty force
+        and ``Omega`` is the biased free energy (the physical internal energy
+        is recomputed unbiased at finalize).
         """
         P = _herm(_project(_density_from_Qp(Q, p)))
         Sigma, H_h, F = _fock_full(P)
-        E = hf_energy(P, h=h, Sigma=Sigma, H=H_h, weights_b=weights_b)
+        E = hf_energy(
+            P, h=h, Sigma=Sigma, H=H_h, weights_b=weights_b, refP=refP,
+        )
+        Omega = free_energy(E, p, w2d, T_r)
         if has_deflation:
             Phi, S_pen, pen_diag = _deflation_bias(P)
-            E = E + Phi
+            Omega = Omega + Phi
             F = F + S_pen
         else:
             pen_diag = jnp.zeros((), dtype=real_dtype)
         Ft = _fock_in_orbital_basis(Q, F)
         diff_p = p[..., None, :] - p[..., :, None]
         G = _skew_hermitian(diff_p * Ft) * offdiag
-        grad_norm = _norm_matrix(G, w_norm)
-        return E, Ft, grad_norm, pen_diag
+        eps, V_fd = jnp.linalg.eigh(Ft)
+        eps = eps.astype(real_dtype)
+        mu_fd = _solve_mu(
+            eps, w_norm, n_target_norm, jnp.asarray(0.0, dtype=real_dtype),
+            T_r, maxiter=mu_maxiter,
+        )
+        p_fd = jax.nn.sigmoid((mu_fd - eps) / T_r).astype(real_dtype)
+        Q_fd = Q @ V_fd.astype(target_dtype)
+        P_fd = _herm(_project(_density_from_Qp(Q_fd, p_fd)))
+        grad_norm = jnp.maximum(
+            _norm_matrix(G, w_norm),
+            _norm_matrix(P - P_fd, w_norm),
+        )
+        return E, Omega, Ft, grad_norm, pen_diag
 
     # ---- Initialize (Q, p) from Fock at P0 ----
     P0_h = _herm(jnp.asarray(P0, dtype=target_dtype))
@@ -845,59 +1157,41 @@ def _solve_newton_impl(
     mu0 = _solve_mu(eps0, w_norm, n_target_norm,
                     jnp.asarray(0.0, dtype=real_dtype), T_r, maxiter=mu_maxiter)
     p0 = jax.nn.sigmoid((mu0 - eps0) / T_r).astype(real_dtype)
-    E0, Ft0, grad0, pen0 = _eval_state(Q0, p0)
-
-    # Cold-start occupation relaxation.  The orbital gradient diff_p * Ft is
-    # blind to the occupations, so if it is already below tolerance at the cold
-    # start the orbital sector may simply be decoupled from a not-yet-relaxed
-    # occupation sector (e.g. diagonal h with scalar exchange).  In that case
-    # relax the occupations to self-consistency at the fixed initial orbitals
-    # before trusting the convergence test, so we do not stop at the
-    # non-interacting occupations.  This only runs when grad0 <= tol_g, so a
-    # normal problem (large initial gradient) pays nothing.
-    def _relax_occupations(operands):
-        p, mu, _E, _Ft, _g, _pen = operands
-
-        def relax_step(_i, state):
-            p_i, mu_i = state
-            P = _herm(_project(_density_from_Qp(Q0, p_i)))
-            _, _, F = _fock_full(P)
-            eps_i = jnp.real(jnp.diagonal(
-                _fock_in_orbital_basis(Q0, F), axis1=-2, axis2=-1)).astype(real_dtype)
-            mu_i = _solve_mu(eps_i, w_norm, n_target_norm, mu_i, T_r, maxiter=mu_maxiter)
-            return jax.nn.sigmoid((mu_i - eps_i) / T_r).astype(real_dtype), mu_i
-
-        p_r, mu_r = lax.fori_loop(0, 30, relax_step, (p, mu))
-        E_r, Ft_r, g_r, pen_r = _eval_state(Q0, p_r)
-        return p_r, mu_r, E_r, Ft_r, g_r, pen_r
-
-    p0, mu0, E0, Ft0, grad0, pen0 = lax.cond(
-        grad0 <= tol_g, _relax_occupations, lambda o: o,
-        (p0, mu0, E0, Ft0, grad0, pen0),
-    )
+    E0, Omega0, Ft0, grad0, pen0 = _eval_state(Q0, p0)
 
     hist_E = jnp.zeros(max_iter, dtype=real_dtype)
+    hist_free = jnp.zeros(max_iter, dtype=real_dtype)
     hist_grad = jnp.zeros(max_iter, dtype=real_dtype)
 
-    # carry: (k, Q, p, mu, Ft, E, Delta, grad_norm, pen_diag, hist_E, hist_grad)
-    carry0 = (jnp.int32(0), Q0, p0, mu0, Ft0, E0, delta0, grad0, pen0,
-              hist_E, hist_grad)
+    # carry: (k, Q, p, mu, Ft, E, Omega, Delta, grad_norm, pen_diag,
+    #         hist_E, hist_free, hist_grad)
+    carry0 = (
+        jnp.int32(0), Q0, p0, mu0, Ft0, E0, Omega0, delta0, grad0, pen0,
+        hist_E, hist_free, hist_grad,
+    )
 
     def outer_cond(carry):
-        k, _, _, _, _, _, Delta, grad_norm, _, _, _ = carry
+        k, _, _, _, _, _, _, Delta, grad_norm, _, _, _, _ = carry
         return jnp.logical_and(
             k < max_iter,
             jnp.logical_and(grad_norm > tol_g, Delta > delta_min),
         )
 
     def outer_body(carry):
-        k, Q, p, mu, Ft, E, Delta, grad_norm, pen_diag, hE, hG = carry
+        (
+            k, Q, p, mu, Ft, E, Omega, Delta, grad_norm, pen_diag,
+            hE, hO, hG,
+        ) = carry
         hE = hE.at[k].set(E)
+        hO = hO.at[k].set(Omega)
         hG = hG.at[k].set(grad_norm)
 
         eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
         diff_p = p[..., None, :] - p[..., :, None]
         G = _skew_hermitian(diff_p * Ft) * offdiag
+        g_p = _project_occ(
+            (eps + T_r * _logit(p)).astype(real_dtype), w2d,
+        )
 
         eps_scale = jnp.sqrt(jnp.mean(eps ** 2) + tiny)
         lam_pc = jnp.maximum(T_r, denom_scale_r * eps_scale)
@@ -931,9 +1225,10 @@ def _solve_newton_impl(
 
         # ---- Steihaug truncated CG on the joint quadratic model ----
         rX0 = -G
-        rp0 = jnp.zeros_like(p)
+        rp0 = -g_p
         zX0, zp0 = _prec(rX0, rp0)
         rz0 = _jip(rX0, rp0, zX0, zp0)
+        residual0 = _jip_norm(rX0, rp0)
         zerosQ = jnp.zeros_like(Q)
         zerosp = jnp.zeros_like(p)
         # carry: (cg, done, vX, vp, HvX, Hvp, rX, rp, dX, dp, rz)
@@ -969,7 +1264,7 @@ def _solve_newton_impl(
             HvX_a, Hvp_a = HvX + alpha * HdX, Hvp + alpha * Hdp
             rX_a, rp_a = rX - alpha * HdX, rp - alpha * Hdp
             rn = _jip_norm(rX_a, rp_a)
-            inner_conv = rn < 0.05 * grad_norm
+            inner_conv = rn < 0.05 * residual0
             zX_a, zp_a = _prec(rX_a, rp_a)
             rz_new = _jip(rX_a, rp_a, zX_a, zp_a)
             beta = rz_new / jnp.where(jnp.abs(rz) > tiny, rz, jnp.ones_like(rz))
@@ -991,41 +1286,61 @@ def _solve_newton_impl(
         cg_fin = lax.while_loop(cg_cond, cg_body, cg_carry0)
         _, _, vX, vp, HvX, Hvp, _, _, _, _, _ = cg_fin
 
+        # Retract the orbital sector first, then exactly minimize the frozen-F
+        # occupation block at those trial orbitals.  This is the stable reduced
+        # occupation step used by the original method.  Crucially, all model
+        # quantities below are recomputed for the *actual* displacement
+        # ``p_trial - p``; the raw Steihaug ``vp`` is not left in ``pred`` or
+        # the trust-radius norm when it is not the applied trial step.
+        V_v, lam_v = _cayley_spectral_setup(vX)
+        U = _cayley_unitary_from_spectrum(
+            V_v, lam_v, jnp.asarray(-1.0, dtype=real_dtype),
+        )
+        Qt = Q @ U
+        Ft_frozen = _fock_in_orbital_basis(U, Ft)
+        eps_frozen = jnp.real(
+            jnp.diagonal(Ft_frozen, axis1=-2, axis2=-1)
+        ).astype(real_dtype)
+        mu_t = _solve_mu(
+            eps_frozen, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter,
+        )
+        p_trial = jax.nn.sigmoid((mu_t - eps_frozen) / T_r).astype(real_dtype)
+        vp = p_trial - p
+        HvX, Hvp = _hvp(vX, vp)
+
         # Predicted reduction m(0) - m(v) in TRUE energy units: the orbital
         # gradient/Hessian action are per-k (unweighted) but the energy carries
         # the BZ measure w2d, so both terms here must be w2d-weighted for the
         # trust-region ratio to compare against the actual energy change.
-        gv = _ip_matrix(G, vX, w2d)
-        vHv = _ip_matrix(vX, HvX, w2d) + _ip_vec(vp, Hvp, w2d)
-        pred = -(gv + 0.5 * vHv)
+        pred = _joint_predicted_reduction(
+            G, g_p, vX, vp, HvX, Hvp, w2d,
+        )
 
-        # Retract Q <- Q . Cayley(tau=-1, vX): Cayley(tau, d) ~ I - tau d, and
-        # Steihaug returns vX = -H^{-1} G (the descent direction), so tau = -1
-        # moves along +vX.  Trial occupations come from the frozen Ft.
-        V_v, lam_v = _cayley_spectral_setup(vX)
-        U = _cayley_unitary_from_spectrum(V_v, lam_v, jnp.asarray(-1.0, dtype=real_dtype))
-        Qt = Q @ U
-        Ft_froz = _fock_in_orbital_basis(U, Ft)  # U† Ft U
-        eps_t = jnp.real(jnp.diagonal(Ft_froz, axis1=-2, axis2=-1)).astype(real_dtype)
-        mu_t = _solve_mu(eps_t, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter)
-        p_trial = jax.nn.sigmoid((mu_t - eps_t) / T_r).astype(real_dtype)
-
-        # True energy + gradient at the trial point (one Fock build per outer).
-        E_trial, Ft_trial, grad_trial, pen_trial = _eval_state(Qt, p_trial)
+        # True free energy + gradient at the trial point (one Fock build for
+        # this evaluation).
+        E_trial, Omega_trial, Ft_trial, grad_trial, pen_trial = _eval_state(Qt, p_trial)
+        eps_t = jnp.real(
+            jnp.diagonal(Ft_trial, axis1=-2, axis2=-1)
+        ).astype(real_dtype)
+        mu_t = _solve_mu(eps_t, w_norm, n_target_norm, mu_t, T_r, maxiter=mu_maxiter)
 
         # Energy-noise floor below which the predicted reduction is meaningless
         # and the step is judged on the gradient instead.  Scaled to the working
         # precision: ~1e-12 in float64 (matching cpp_hf), ~5e-4 in float32, so
         # the trust-region ratio is never trusted below the actual Fock-build
         # round-off (otherwise float32 noise makes every ratio garbage).
-        noise = noise_floor * jnp.maximum(jnp.abs(E), 1.0)
+        noise = noise_floor * jnp.maximum(jnp.abs(Omega), 1.0)
         use_grad_branch = pred <= noise
 
         # Branch 1 (pred below energy noise): judge by the gradient, never climb.
-        accept_g = jnp.logical_and(grad_trial <= grad_norm, E_trial <= E + noise)
+        accept_g = jnp.logical_and(
+            grad_trial <= grad_norm, Omega_trial <= Omega + noise,
+        )
         Delta_g = jnp.where(accept_g, Delta, 0.5 * Delta)
         # Branch 2 (standard trust-region ratio).
-        ratio = (E - E_trial) / jnp.where(use_grad_branch, jnp.ones_like(pred), pred)
+        ratio = (Omega - Omega_trial) / jnp.where(
+            use_grad_branch, jnp.ones_like(pred), pred,
+        )
         step_norm = _jip_norm(vX, vp)
         Delta_r = jnp.where(
             ratio < 0.25, 0.25 * Delta,
@@ -1037,19 +1352,97 @@ def _solve_newton_impl(
         accept = jnp.where(use_grad_branch, accept_g, accept_r)
         Delta_new = jnp.where(use_grad_branch, Delta_g, Delta_r)
 
-        Q_new = jnp.where(accept, Qt, Q)
-        p_new = jnp.where(accept, p_trial, p)
-        Ft_new = jnp.where(accept, Ft_trial, Ft)
-        E_new = jnp.where(accept, E_trial, E)
-        mu_new = jnp.where(accept, mu_t, mu)
-        grad_new = jnp.where(accept, grad_trial, grad_norm)
-        pen_new = jnp.where(accept, pen_trial, pen_diag)
+        # If the local (Q,p) model rejects its step, fall back to a damped
+        # full Fermi-Dirac fixed-point direction.  Near-equal occupations can
+        # suppress ``(p_j-p_i) F_ij`` and make the parameterization gradient
+        # tiny while ``||P-P_FD(F)||`` is still O(1).  Each fallback candidate
+        # preserves the particle count (convex density mixing), is represented
+        # by a consistent eigendecomposition (Q,p), and is accepted only on
+        # true free-energy descent.
+        eps_fd, V_fd = jnp.linalg.eigh(Ft)
+        mu_fd = _solve_mu(
+            eps_fd.astype(real_dtype), w_norm, n_target_norm, mu, T_r,
+            maxiter=mu_maxiter,
+        )
+        p_fd = jax.nn.sigmoid((mu_fd - eps_fd) / T_r).astype(real_dtype)
+        Q_fd = Q @ V_fd.astype(target_dtype)
+        P_cur = _herm(_project(_density_from_Qp(Q, p)))
+        P_fd = _herm(_project(_density_from_Qp(Q_fd, p_fd)))
 
-        return (k + 1, Q_new, p_new, mu_new, Ft_new, E_new, Delta_new,
-                grad_new, pen_new, hE, hG)
+        def fb_cond(state):
+            i, _lam, accepted_fb, *_ = state
+            return jnp.logical_and(i < 10, jnp.logical_not(accepted_fb))
 
-    (k_fin, Q_fin, p_fin, mu_fin, _Ft_fin, _E_loop, _Delta_fin, grad_fin,
-     _pen_fin, hist_E, hist_grad) = lax.while_loop(outer_cond, outer_body, carry0)
+        def fb_body(state):
+            i, lam_fb, _accepted_fb, *_rest = state
+            P_mix = _herm(_project(P_cur + lam_fb.astype(target_dtype) * (P_fd - P_cur)))
+            p_mix, Q_mix = jnp.linalg.eigh(P_mix)
+            p_mix = _project_capped_occupations(
+                p_mix.astype(real_dtype), w2d, n_target,
+            )
+            Q_mix = Q_mix.astype(target_dtype)
+            E_mix, O_mix, Ft_mix, g_mix, pen_mix = _eval_state(Q_mix, p_mix)
+            eps_mix = jnp.real(
+                jnp.diagonal(Ft_mix, axis1=-2, axis2=-1)
+            ).astype(real_dtype)
+            mu_mix = _solve_mu(
+                eps_mix, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter,
+            )
+            delta_O = O_mix - Omega
+            accepted_fb = jnp.logical_or(
+                delta_O < 0.0,
+                jnp.logical_and(
+                    jnp.abs(delta_O) <= noise,
+                    jnp.logical_and(g_mix < grad_norm, O_mix <= Omega + noise),
+                ),
+            )
+            lam_next = jnp.where(accepted_fb, lam_fb, 0.5 * lam_fb)
+            return (
+                i + 1, lam_next, accepted_fb, Q_mix, p_mix, E_mix, O_mix,
+                Ft_mix, g_mix, pen_mix, mu_mix,
+            )
+
+        fb0 = (
+            jnp.int32(0), jnp.asarray(1.0, real_dtype), jnp.bool_(False),
+            Q, p, E, Omega, Ft, grad_norm, pen_diag, mu,
+        )
+        (
+            _fb_i, _fb_lam, fb_accept, Q_fb, p_fb, E_fb, Omega_fb, Ft_fb,
+            grad_fb, pen_fb, mu_fb,
+        ) = lax.while_loop(fb_cond, fb_body, fb0)
+        use_fallback = jnp.logical_and(
+            fb_accept,
+            jnp.logical_or(jnp.logical_not(accept), grad_fb < grad_trial),
+        )
+
+        Q_new = jnp.where(use_fallback, Q_fb, jnp.where(accept, Qt, Q))
+        p_new = jnp.where(use_fallback, p_fb, jnp.where(accept, p_trial, p))
+        Ft_new = jnp.where(use_fallback, Ft_fb, jnp.where(accept, Ft_trial, Ft))
+        E_new = jnp.where(use_fallback, E_fb, jnp.where(accept, E_trial, E))
+        Omega_new = jnp.where(
+            use_fallback, Omega_fb, jnp.where(accept, Omega_trial, Omega),
+        )
+        mu_new = jnp.where(use_fallback, mu_fb, jnp.where(accept, mu_t, mu))
+        grad_new = jnp.where(
+            use_fallback, grad_fb, jnp.where(accept, grad_trial, grad_norm),
+        )
+        pen_new = jnp.where(
+            use_fallback, pen_fb, jnp.where(accept, pen_trial, pen_diag),
+        )
+        Delta_new = jnp.where(
+            use_fallback, jnp.maximum(Delta, jnp.asarray(0.1, real_dtype)),
+            Delta_new,
+        )
+
+        return (
+            k + 1, Q_new, p_new, mu_new, Ft_new, E_new, Omega_new, Delta_new,
+            grad_new, pen_new, hE, hO, hG,
+        )
+
+    (
+        k_fin, Q_fin, p_fin, mu_fin, _Ft_fin, _E_loop, _Omega_loop,
+        _Delta_fin, grad_fin, _pen_fin, hist_E, hist_free, hist_grad,
+    ) = lax.while_loop(outer_cond, outer_body, carry0)
 
     # ---- Finalize: rebuild the Fock at the converged (Q, p) and report.
     # Unlike the CG path we do NOT re-diagonalize and re-occupy here: at finite
@@ -1061,9 +1454,29 @@ def _solve_newton_impl(
     # (mirrors cpp_hf's solve_rtr finalize).
     P_fin = _herm(_project(_density_from_Qp(Q_fin, p_fin)))
     Sigma_fin, H_fin, F_fin = _fock_full(P_fin)
-    E_fin = hf_energy(P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b)
+    E_fin = hf_energy(
+        P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b, refP=refP,
+    )
+    eps_check, Q_check = jnp.linalg.eigh(F_fin)
+    mu_check = _solve_mu(
+        eps_check.astype(real_dtype), w_norm, n_target_norm, mu_fin, T_r,
+        maxiter=mu_maxiter,
+    )
+    p_check = jax.nn.sigmoid((mu_check - eps_check) / T_r).astype(real_dtype)
+    P_check = _herm(_project(_density_from_Qp(Q_check.astype(target_dtype), p_check)))
+    final_res = _norm_matrix(P_fin - P_check, w_norm)
+    Ft_return = _fock_in_orbital_basis(Q_fin, F_fin)
+    eps_return = jnp.real(
+        jnp.diagonal(Ft_return, axis1=-2, axis2=-1)
+    ).astype(real_dtype)
+    mu_fin = _solve_mu(
+        eps_return, w_norm, n_target_norm, mu_fin, T_r, maxiter=mu_maxiter,
+    )
 
-    converged = grad_fin <= tol_g
+    converged = jnp.logical_and(
+        grad_fin <= tol_g,
+        jnp.where(has_deflation, jnp.bool_(True), final_res <= tol_g),
+    )
 
     return SolveResult(
         Q=Q_fin,
@@ -1074,7 +1487,7 @@ def _solve_newton_impl(
         energy=E_fin,
         n_iter=k_fin,
         converged=converged,
-        history=dict(E=hist_E, grad_norm=hist_grad),
+        history=dict(E=hist_E, free_energy=hist_free, grad_norm=hist_grad),
     )
 
 
@@ -1106,10 +1519,11 @@ def solve_direct_minimization(
     """Direct-minimization Hartree-Fock solver.
 
     With ``config.optimizer="cg"`` (default): preconditioned Riemannian CG on
-    Stiefel x capped simplex, one Fock build per iteration.  With
+    Stiefel x capped simplex with true-free-energy backtracking (one
+    current-state Fock build plus trial builds).  With
     ``config.optimizer="newton"``: trust-region Newton (Steihaug truncated-CG
     on the joint (Q, p) response Hessian), which converges on the gradient norm
-    and typically needs far fewer Fock builds on stiff problems.  See
+    and typically needs fewer outer iterations on stiff problems.  See
     :class:`SolverConfig` for tuning knobs.
 
     Parameters
@@ -1131,13 +1545,17 @@ def solve_direct_minimization(
     SolveResult
         Named tuple with ``Q, p, mu, density, fock, energy, n_iter,
         converged, history``.  ``density`` = ``Q @ diag(p) @ Q†`` is the
-        canonical self-consistent density matrix.
+        self-consistent density matrix represented by the returned optimized
+        ``Q`` and ``p``.
 
     Notes
     -----
-    The inner loop is eigen-free (Cayley retraction + ``diag(Ft)`` for FD
-    re-occupation).  One eigendecomposition at convergence produces
-    canonical Fock eigenvectors in the returned ``Q``.
+    The inner loop uses Cayley retractions for orbitals and capped-simplex
+    occupation steps.  The returned ``Q`` and ``p`` represent the optimized
+    density directly. There is no unconditional final re-occupation; a single
+    canonical fixed-point polish is used only when it reduces an already-small
+    residual and the polished state is rechecked against its rebuilt Fock
+    matrix.
 
     JIT cache strategy: only *structurally static* config fields trigger
     recompilation — loop-bound integers (``max_iter``, ``bt_max``,
@@ -1149,12 +1567,22 @@ def solve_direct_minimization(
     """
     if config is None:
         config = SolverConfig()
+    P0_arr = jnp.asarray(P0)
+    if P0_arr.shape != kernel.h.shape:
+        raise ValueError(
+            f"P0 must have shape {tuple(kernel.h.shape)}, got {tuple(P0_arr.shape)}."
+        )
     validate_electron_count(
         kernel.w2d,
         kernel.h.shape[-1],
         n_electrons,
         context="n_electrons",
     )
+    validate_temperature(kernel.T, context="kernel.T")
+    if config.block_sizes is not None and sum(config.block_sizes) != kernel.h.shape[-1]:
+        raise ValueError(
+            f"block_sizes must sum to {kernel.h.shape[-1]}, got {sum(config.block_sizes)}."
+        )
 
     optimizer = str(config.optimizer).lower()
     if optimizer not in ("cg", "newton"):
@@ -1209,7 +1637,7 @@ def solve_direct_minimization(
             defl_arr = jnp.zeros((0, nk1, nk2, nb, nb), dtype=h_dtype)
 
         return _solve_newton_jitted(
-            jnp.asarray(P0),
+            P0_arr,
             float(n_electrons),
             tol_grad,
             float(config.tr_delta0),
@@ -1228,7 +1656,7 @@ def solve_direct_minimization(
         )
 
     return _solve_jitted(
-        jnp.asarray(P0),
+        P0_arr,
         float(n_electrons),
         float(config.tol_E),
         float(config.tol_grad),

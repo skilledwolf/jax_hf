@@ -96,9 +96,31 @@ class TestODA:
         # ODA reaches the same energy (its guarantee is energy descent)...
         np.testing.assert_allclose(float(oda.energy), float(lin.energy), atol=1e-3, rtol=1e-5)
         # ...and the energy history is non-increasing (robust line search).
-        hE = np.asarray(oda.history["E"])
-        assert hE.size > 1
-        assert np.all(np.diff(hE) <= 1e-4), "ODA energy not monotonically decreasing"
+        hO = np.asarray(oda.history["free_energy"])
+        assert hO.size > 1
+        assert np.all(np.diff(hO) <= 1e-4), "ODA free energy not monotonically decreasing"
+
+    def test_finite_temperature_oda_optimizes_free_energy(self):
+        h = jnp.array([[[[-1.0, 0.0], [0.0, 1.0]]]], dtype=jnp.complex64)
+        K = HartreeFockKernel(
+            weights=jnp.ones((1, 1), dtype=jnp.float32),
+            hamiltonian=h,
+            coulomb_q=jnp.zeros((1, 1, 1, 1), dtype=jnp.complex64),
+            T=1.0,
+        )
+        P0 = jnp.array([[[[1.0, 0.0], [0.0, 0.0]]]], dtype=jnp.complex64)
+        result = solve_scf(
+            K, P0, 1.0,
+            config=SCFConfig(
+                acceleration="oda", max_iter=20,
+                density_tol=1e-6, comm_tol=1e-6,
+            ),
+        )
+        assert result.converged
+        expected = np.diag([0.731059, 0.268941])
+        np.testing.assert_allclose(
+            np.asarray(result.density_matrix[0, 0]), expected, atol=2e-5,
+        )
 
 
 class TestSCFConfigValidation:
@@ -109,3 +131,43 @@ class TestSCFConfigValidation:
     def test_nonpositive_diis_size_raises(self):
         with pytest.raises(ValueError, match="diis_size"):
             SCFConfig(diis_size=0)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"max_iter": 1.5},
+            {"density_tol": np.nan},
+            {"comm_tol": np.inf},
+            {"mixing": -0.1},
+            {"diis_start": True},
+            {"level_shift": np.nan},
+        ],
+    )
+    def test_invalid_domains_raise(self, kwargs):
+        with pytest.raises(ValueError):
+            SCFConfig(**kwargs)
+
+    def test_scf_validates_count_shape_and_temperature_before_jit(self):
+        K = _dirac(nk=2)
+        with pytest.raises(ValueError, match="physically reachable range"):
+            solve_scf(K, jnp.zeros_like(K.h), 100.0)
+        with pytest.raises(ValueError, match="P0 must have shape"):
+            solve_scf(K, jnp.zeros((2, 2, 3, 3)), 1.0)
+        with pytest.raises(ValueError, match="non-negative"):
+            _dirac(nk=2, T=-0.1)
+
+    @pytest.mark.parametrize("n_electrons", [0.0, 2.0])
+    def test_scf_exact_empty_and_full_fillings(self, n_electrons):
+        h = jnp.array([[[[-1.0, 0.0], [0.0, 1.0]]]], dtype=jnp.complex64)
+        K = HartreeFockKernel(
+            weights=jnp.ones((1, 1), dtype=jnp.float32),
+            hamiltonian=h,
+            coulomb_q=jnp.zeros((1, 1, 1, 1), dtype=jnp.complex64),
+            T=0.1,
+        )
+        result = solve_scf(K, jnp.zeros_like(h), n_electrons)
+        assert result.converged
+        expected = np.eye(2) * (n_electrons / 2.0)
+        np.testing.assert_array_equal(
+            np.asarray(result.density_matrix[0, 0]), expected,
+        )

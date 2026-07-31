@@ -43,6 +43,17 @@ def validate_electron_count(
         )
 
 
+def validate_temperature(T: Any, *, context: str = "T") -> None:
+    """Reject non-finite or negative temperatures when values are concrete."""
+    if _has_tracer(T):
+        return
+    temperature = float(np.asarray(T))
+    if not np.isfinite(temperature):
+        raise ValueError(f"{context} must be finite, got {temperature!r}.")
+    if temperature < 0.0:
+        raise ValueError(f"{context} must be non-negative, got {temperature!r}.")
+
+
 def hermitize(X: jax.Array) -> jax.Array:
     """Hermitize the last two axes: 0.5*(X + X†)."""
     return 0.5 * (X + jnp.conj(jnp.swapaxes(X, -1, -2)))
@@ -50,6 +61,7 @@ def hermitize(X: jax.Array) -> jax.Array:
 
 def fermidirac(x: jax.Array, T: float) -> jax.Array:
     """Finite-T Fermi–Dirac occupation: 1/(1 + exp(x/T))."""
+    validate_temperature(T)
     return expit(-x / (T + 1e-12))
 
 
@@ -341,13 +353,28 @@ def find_chemical_potential(
         n_electrons,
         context="n_electrons",
     )
+    validate_temperature(T)
     method = str(method).lower()
     if method == "bisection":
-        return _find_mu_bisection(bands, weights, n_electrons, T, maxiter=maxiter)
+        mu = _find_mu_bisection(bands, weights, n_electrons, T, maxiter=maxiter)
     elif method == "newton":
-        return _find_mu_newton(bands, weights, n_electrons, T, maxiter=maxiter)
+        mu = _find_mu_newton(bands, weights, n_electrons, T, maxiter=maxiter)
     else:
         raise ValueError(f"method must be 'bisection' or 'newton', got {method!r}")
+
+    # Exact empty/full fillings require an infinite chemical potential at
+    # finite temperature.  Returning a merely "wide" finite bracket endpoint
+    # leaves exponentially small tails and can make SCF report convergence at
+    # the wrong particle count.
+    real_dtype = bands.real.dtype
+    target = jnp.asarray(n_electrons, dtype=real_dtype)
+    capacity = (
+        jnp.sum(jnp.asarray(weights, dtype=real_dtype))
+        * jnp.asarray(bands.shape[-1], dtype=real_dtype)
+    )
+    neg_inf = jnp.asarray(-jnp.inf, dtype=real_dtype)
+    pos_inf = jnp.asarray(jnp.inf, dtype=real_dtype)
+    return jnp.where(target <= 0.0, neg_inf, jnp.where(target >= capacity, pos_inf, mu))
 
 
 def _find_mu_bisection(
@@ -436,10 +463,20 @@ def _find_mu_newton(
 
     (mu_fin, lo_fin, hi_fin), _ = jax.lax.scan(body, (mu, lo, hi), xs=None, length=int(maxiter))
 
-    # Final check: if residual is still large, return bracket midpoint
+    # Return whichever of the safeguarded Newton iterate and the remaining
+    # bracket midpoint has the smaller particle-count residual.  At very low
+    # temperature an integer filling has a broad, numerically flat gap.  The
+    # old absolute 1e-12 cutoff discarded an already-correct Newton iterate in
+    # that gap and returned the midpoint of a still-asymmetric bracket, which
+    # could occupy an entire extra band.
     N_fin, _ = count_and_slope(mu_fin)
-    g_fin = jnp.abs(N_fin - n_target)
-    return jnp.where(g_fin > jnp.asarray(1e-12, dtype=real_dtype), 0.5 * (lo_fin + hi_fin), mu_fin)
+    mu_bis = 0.5 * (lo_fin + hi_fin)
+    N_bis, _ = count_and_slope(mu_bis)
+    return jnp.where(
+        jnp.abs(N_bis - n_target) < jnp.abs(N_fin - n_target),
+        mu_bis,
+        mu_fin,
+    )
 
 
 def density_matrix_from_fock(
@@ -455,6 +492,7 @@ def density_matrix_from_fock(
 ) -> tuple[jax.Array, jax.Array]:
     """Build a physical density matrix P(k) from a (Hermitian) Fock matrix F(k)."""
     F = hermitize(jnp.asarray(F))
+    validate_temperature(T)
     validate_electron_count(
         weights,
         F.shape[-1],

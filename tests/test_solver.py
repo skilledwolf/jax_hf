@@ -457,3 +457,74 @@ class TestSpectralCayley:
                 atol=1e-5, rtol=1e-5,
                 err_msg=f"non-unitary at tau={tau_val}",
             )
+
+
+class TestAdversarialStationarity:
+    @staticmethod
+    def _repulsive_hartree(T=0.5):
+        h = jnp.zeros((1, 1, 2, 2), dtype=jnp.complex64)
+        return HartreeFockKernel(
+            weights=jnp.ones((1, 1), dtype=jnp.float32),
+            hamiltonian=h,
+            coulomb_q=jnp.zeros((1, 1, 1, 1), dtype=jnp.complex64),
+            T=T,
+            include_hartree=True,
+            include_exchange=False,
+            reference_density=jnp.zeros_like(h),
+            hartree_matrix=jnp.eye(2, dtype=jnp.float32),
+        )
+
+    def test_zero_orbital_gradient_does_not_hide_wrong_occupations(self):
+        """Diagonal F and P have zero commutator even at a maximally wrong P."""
+        kernel = self._repulsive_hartree()
+        P0 = jnp.array([[[[1.0, 0.0], [0.0, 0.0]]]], dtype=jnp.complex64)
+        result = solve(
+            kernel, P0, 1.0,
+            config=SolverConfig(max_iter=300, tol_grad=2e-4),
+        )
+        assert bool(result.converged)
+        np.testing.assert_allclose(
+            np.asarray(result.density[0, 0]),
+            0.5 * np.eye(2),
+            atol=2e-3,
+        )
+        n = int(result.n_iter)
+        free_history = np.asarray(result.history["free_energy"][:n])
+        assert np.all(np.diff(free_history) <= 2e-5)
+
+    @pytest.mark.parametrize("n_electrons", [0.0, 2.0])
+    def test_exact_empty_and_full_fillings(self, n_electrons):
+        kernel = self._repulsive_hartree()
+        result = solve(
+            kernel, jnp.zeros_like(kernel.h), n_electrons,
+            config=SolverConfig(max_iter=20, tol_grad=1e-4),
+        )
+        assert bool(result.converged)
+        expected = np.eye(2) * (n_electrons / 2.0)
+        np.testing.assert_array_equal(np.asarray(result.density[0, 0]), expected)
+
+
+class TestSolverInputValidation:
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"max_iter": 1.5},
+            {"tol_E": np.nan},
+            {"tol_grad": np.inf},
+            {"cg_restart": 0},
+            {"bt_shrink": 1.0},
+            {"block_sizes": (1.5, 0.5)},
+        ],
+    )
+    def test_invalid_config_domains_raise(self, kwargs):
+        with pytest.raises(ValueError):
+            SolverConfig(**kwargs)
+
+    def test_wrong_P0_shape_raises_before_jit(self):
+        kernel = _make_two_band_kernel(nk=2)
+        with pytest.raises(ValueError, match="P0 must have shape"):
+            solve(kernel, jnp.zeros((2, 2, 3, 3)), 1.0)
+
+    def test_negative_kernel_temperature_raises(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            _make_two_band_kernel(T=-0.1)

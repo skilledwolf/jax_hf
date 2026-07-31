@@ -3,8 +3,8 @@
 Two solvers are available, sharing a single :class:`HartreeFockKernel`:
 
 * :func:`solve` (alias :func:`solve_direct_minimization`) — preconditioned
-  Riemannian CG on Stiefel × capped simplex.  One Fock build per iteration,
-  eigen-free inner loop, Cayley retraction.  **Default and recommended.**
+  Riemannian CG on Stiefel × capped simplex with Cayley retraction and
+  true-free-energy backtracking.  **Default and recommended.**
 * :func:`solve_scf` — reference self-consistent field iteration with linear
   mixing.  Useful as a baseline or fallback.
 

@@ -7,7 +7,8 @@ Roothaan iteration with selectable acceleration:
   4. Update the density via ``acceleration``:
        - "linear": P <- (1 - mixing) P + mixing P_new
        - "diis":   Pulay commutator-DIIS extrapolation of the Fock
-       - "oda":    optimal damping (exact analytic line search on E)
+       - "oda":    optimal damping (energy line search at T=0, free-energy
+                   backtracking at finite T)
      optionally clipped to a ``trust_radius`` step.
   5. Check convergence on density change and commutator norm.
 
@@ -17,15 +18,22 @@ serves as a reference / fallback.  DIIS and ODA mirror cpp_hf's solver_scf.hpp.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from functools import partial
+from numbers import Integral
 from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
 
-from .fock import build_fock, hf_energy
-from .utils import find_chemical_potential, fermidirac
+from .fock import build_fock, free_energy, hf_energy
+from .utils import (
+    find_chemical_potential,
+    fermidirac,
+    validate_electron_count,
+    validate_temperature,
+)
 
 
 @dataclass(frozen=True)
@@ -37,8 +45,8 @@ class SCFConfig:
     level_shift: float = 0.0
     # Acceleration scheme: "linear" (alpha-mixing, default), "diis" (Pulay
     # commutator-DIIS extrapolation of the Fock), or "oda" (optimal damping --
-    # exact analytic line search on E((1-lam)P + lam P_new), one extra Fock
-    # build per iter).
+    # exact analytic line search on E at T=0 and free-energy backtracking at
+    # finite T, with one extra endpoint Fock build per iter).
     acceleration: str = "linear"
     diis_size: int = 6        # DIIS history depth (Pulay)
     diis_start: int = 2       # begin DIIS extrapolation after this many iters
@@ -52,6 +60,14 @@ class SCFConfig:
     project_fn: Callable[[Any], Any] | None = None
 
     def __post_init__(self) -> None:
+        for name in ("density_tol", "comm_tol", "mixing", "level_shift",
+                     "diis_damping", "trust_radius"):
+            if not math.isfinite(float(getattr(self, name))):
+                raise ValueError(f"{name} must be finite")
+        for name in ("max_iter", "diis_size", "diis_start"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise ValueError(f"{name} must be an integer")
         if self.max_iter <= 0:
             raise ValueError("max_iter must be positive")
         if self.acceleration not in ("linear", "diis", "oda"):
@@ -61,6 +77,20 @@ class SCFConfig:
             )
         if self.diis_size <= 0:
             raise ValueError("diis_size must be positive")
+        if self.density_tol < 0.0:
+            raise ValueError("density_tol must be non-negative")
+        if self.comm_tol < 0.0:
+            raise ValueError("comm_tol must be non-negative")
+        if not 0.0 <= self.mixing <= 1.0:
+            raise ValueError("mixing must be between 0 and 1")
+        if self.diis_start < 0:
+            raise ValueError("diis_start must be non-negative")
+        if not 0.0 <= self.diis_damping <= 1.0:
+            raise ValueError("diis_damping must be between 0 and 1")
+        if self.trust_radius < 0.0:
+            raise ValueError("trust_radius must be non-negative")
+        if self.project_fn is not None and not callable(self.project_fn):
+            raise ValueError("project_fn must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -167,10 +197,22 @@ def solve_scf(
 
     args = kernel.as_args()
     h = args["h"]
+    P0_arr = jnp.asarray(P0)
+    if P0_arr.shape != h.shape:
+        raise ValueError(
+            f"P0 must have shape {tuple(h.shape)}, got {tuple(P0_arr.shape)}."
+        )
+    validate_electron_count(
+        kernel.w2d,
+        kernel.h.shape[-1],
+        n_electrons,
+        context="n_electrons",
+    )
+    validate_temperature(kernel.T, context="kernel.T")
 
     density, fock, energy, mu, iterations, converged, \
-        hist_E, hist_density, hist_comm = _run_scf(
-            jnp.asarray(P0, dtype=h.dtype),
+        hist_E, hist_free, hist_density, hist_comm = _run_scf(
+            jnp.asarray(P0_arr, dtype=h.dtype),
             h=h, weights_b=args["weights_b"], weight_sum=args["weight_sum"],
             VR=args["VR"], T=args["T"], refP=args["refP"], HH=args["HH"],
             w2d=kernel.w2d,
@@ -213,6 +255,7 @@ def solve_scf(
         message=message,
         history={
             "E": hist_E[:n_iter],
+            "free_energy": hist_free[:n_iter],
             "density_residual": hist_density[:n_iter],
             "commutator_residual": hist_comm[:n_iter],
         },
@@ -247,6 +290,7 @@ def _run_scf(
     tiny = jnp.asarray(1e-30, dtype=real_dtype)
 
     hist_E = jnp.zeros(max_iter, dtype=real_dtype)
+    hist_free = jnp.zeros(max_iter, dtype=real_dtype)
     hist_density = jnp.zeros(max_iter, dtype=real_dtype)
     hist_comm = jnp.zeros(max_iter, dtype=real_dtype)
 
@@ -264,13 +308,17 @@ def _run_scf(
     def _build_and_occupy(density):
         density_h = _herm(jnp.asarray(_project(density), dtype=h.dtype))
         Sigma, H, F = _fock(density_h)
-        E = hf_energy(density_h, h=h, Sigma=Sigma, H=H, weights_b=weights_b)
+        E = hf_energy(
+            density_h, h=h, Sigma=Sigma, H=H, weights_b=weights_b, refP=refP,
+        )
+        density_eigs = jnp.linalg.eigvalsh(density_h).astype(real_dtype)
+        Omega = free_energy(E, density_eigs, weights_2d, T)
         P_new, mu = _density_from_fock(
             F, weights=weights_2d, n_electrons=n_electrons,
             temperature=T, level_shift=level_shift,
         )
         P_new = _herm(jnp.asarray(_project(P_new), dtype=h.dtype))
-        return P_new, F, E, mu
+        return P_new, F, E, Omega, mu
 
     def _linear(density, delta):
         return _herm(jnp.asarray(_project(density + mixing * delta), dtype=h.dtype))
@@ -281,13 +329,13 @@ def _run_scf(
     R_hist0 = jnp.zeros((n_hist,) + h.shape, dtype=h.dtype)
 
     def cond(carry):
-        k, _, _, _, _, converged, _, _, _, _, _ = carry
+        k, _, _, _, _, converged, _, _, _, _, _, _ = carry
         return jnp.logical_and(k < max_iter, jnp.logical_not(converged))
 
     def body(carry):
-        k, density, _fk, _en, _mu, _conv, F_hist, R_hist, hE, hD, hC = carry
+        k, density, _fk, _en, _mu, _conv, F_hist, R_hist, hE, hO, hD, hC = carry
 
-        P_new, F, E, mu = _build_and_occupy(density)
+        P_new, F, E, Omega, mu = _build_and_occupy(density)
         delta = P_new - density
         comm = F @ density - density @ F
         d_res = _weighted_matrix_norm(delta, weights_2d, ws)
@@ -315,15 +363,42 @@ def _run_scf(
         elif acceleration == "oda":
             # One extra Fock build at P_new gives the energy endpoint E(lam=1).
             Sigma_n, H_n, _ = _fock(P_new)
-            E_new = hf_energy(P_new, h=h, Sigma=Sigma_n, H=H_n, weights_b=weights_b)
+            E_new = hf_energy(
+                P_new, h=h, Sigma=Sigma_n, H=H_n,
+                weights_b=weights_b, refP=refP,
+            )
             tr = jnp.real(jnp.einsum("...ij,...ji->...", F, delta))  # tr(F dP) per k
             c1 = jnp.sum(weights_2d * tr)
             c2 = (E_new - E) - c1
-            lam = jnp.where(
+            lam_zero_T = jnp.where(
                 c2 > 1e-12, jnp.clip(-c1 / (2.0 * c2), 0.0, 1.0),
                 jnp.where(c1 < 0.0, jnp.asarray(1.0, real_dtype),
                           jnp.asarray(0.0, real_dtype)),
             )
+
+            # At finite T the optimized thermodynamic objective is
+            # E[P] - T*S[P], not internal energy.  The energy along the segment
+            # is exactly quadratic; only the density-matrix entropy needs an
+            # eigensolve for each scalar backtracking candidate.
+            def omega_on_segment(lam):
+                P_lam = _herm(density + lam.astype(h.dtype) * delta)
+                eigs = jnp.linalg.eigvalsh(P_lam).astype(real_dtype)
+                E_lam = E + lam * c1 + lam * lam * c2
+                return free_energy(E_lam, eigs, weights_2d, T)
+
+            def bt_body(_i, state):
+                lam_i, accepted = state
+                accepts_i = omega_on_segment(lam_i) < Omega
+                accepted = jnp.logical_or(accepted, accepts_i)
+                lam_next = jnp.where(accepted, lam_i, 0.5 * lam_i)
+                return lam_next, accepted
+
+            lam_finite, accepted = jax.lax.fori_loop(
+                0, 12, bt_body,
+                (jnp.asarray(1.0, real_dtype), jnp.bool_(False)),
+            )
+            lam_finite = jnp.where(accepted, lam_finite, jnp.asarray(0.0, real_dtype))
+            lam = jnp.where(T > 0.0, lam_finite, lam_zero_T)
             updated = _herm(jnp.asarray(
                 _project(density + lam.astype(h.dtype) * delta), dtype=h.dtype))
         else:  # linear
@@ -341,10 +416,11 @@ def _run_scf(
         density_out = jnp.where(converged, P_new, updated)
 
         hE = hE.at[k].set(E)
+        hO = hO.at[k].set(Omega)
         hD = hD.at[k].set(d_res)
         hC = hC.at[k].set(c_res)
         return (k + 1, density_out, F, E, mu, converged,
-                F_hist, R_hist, hE, hD, hC)
+                F_hist, R_hist, hE, hO, hD, hC)
 
     carry0 = (
         jnp.int32(0),
@@ -354,12 +430,12 @@ def _run_scf(
         jnp.asarray(0.0, dtype=real_dtype),
         jnp.bool_(False),
         F_hist0, R_hist0,
-        hist_E, hist_density, hist_comm,
+        hist_E, hist_free, hist_density, hist_comm,
     )
 
-    k, density, fock, energy, mu, converged, _Fh, _Rh, hE, hD, hC = \
+    k, density, fock, energy, mu, converged, _Fh, _Rh, hE, hO, hD, hC = \
         jax.lax.while_loop(cond, body, carry0)
 
     # Final evaluation at the converged density (self-consistent density returned).
-    _P_final, F_final, E_final, mu_final = _build_and_occupy(density)
-    return density, F_final, E_final, mu_final, k, converged, hE, hD, hC
+    _P_final, F_final, E_final, _Omega_final, mu_final = _build_and_occupy(density)
+    return density, F_final, E_final, mu_final, k, converged, hE, hO, hD, hC

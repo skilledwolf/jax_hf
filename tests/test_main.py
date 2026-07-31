@@ -57,22 +57,7 @@ def test_find_chemical_potential_hits_target_multiband(method):
     assert abs(total - n_target) < 1e-4
 
 
-@pytest.mark.parametrize(
-    "method",
-    [
-        "bisection",
-        pytest.param(
-            "newton",
-            marks=pytest.mark.xfail(
-                reason="Newton chemical-potential solver diverges at low T "
-                       "when x64 is enabled (e.g. when contimod is imported). "
-                       "Pre-existing bug in the Newton branch; bisection is "
-                       "the default and works correctly.",
-                strict=False,
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("method", ["bisection", "newton"])
 def test_find_chemical_potential_cold_limit(method):
     """At low T, the chemical-potential solver must still find the correct mu."""
     bands = jnp.array([[[0.0, 1.0, 2.0]]])
@@ -82,3 +67,25 @@ def test_find_chemical_potential_cold_limit(method):
     occ = fermidirac(bands - mu, 1e-5)
     total = float(jnp.sum(weights[..., None] * occ))
     assert abs(total - 2.0) < 1e-4
+
+
+@pytest.mark.parametrize(("n_electrons", "expected_mu"), [(0.0, -jnp.inf), (3.0, jnp.inf)])
+def test_find_chemical_potential_exact_endpoint_fillings(n_electrons, expected_mu):
+    bands = jnp.array([[[0.0, 1.0, 2.0]]])
+    weights = jnp.ones((1, 1))
+    mu = find_chemical_potential(bands, weights, n_electrons, T=0.1)
+    assert mu == expected_mu
+    occupations = fermidirac(bands - mu, 0.1)
+    np.testing.assert_array_equal(
+        np.asarray(occupations),
+        np.full((1, 1, 3), n_electrons / 3.0),
+    )
+
+
+def test_fermi_utilities_reject_negative_temperature():
+    with pytest.raises(ValueError, match="non-negative"):
+        fermidirac(jnp.array([0.0]), -0.1)
+    with pytest.raises(ValueError, match="non-negative"):
+        find_chemical_potential(
+            jnp.array([[[0.0, 1.0]]]), jnp.ones((1, 1)), 1.0, -0.1,
+        )
