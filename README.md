@@ -11,11 +11,12 @@ jax_hf provides two JAX-jitted solvers for the Hartree–Fock free-energy
 minimisation problem on 2D k-meshes:
 
 * **Direct minimisation** (primary): preconditioned Riemannian CG on
-  Stiefel × capped simplex, eigen-free inner loop, Cayley retraction,
-  one Fock build per iteration.  An optional **trust-region Newton**
-  variant (`optimizer="newton"`) converges superlinearly (a handful of
-  outer steps) on stiff problems, and **deflation** (`solve_deflated`)
-  finds *distinct* self-consistent solutions on non-convex landscapes.
+  Stiefel × capped simplex with Cayley retraction and true-free-energy
+  backtracking.  An optional **trust-region Newton** variant
+  (`optimizer="newton"`) usually needs fewer outer iterations and falls
+  back to damped fixed-point steps near occupation degeneracies.
+  **Deflation** (`solve_deflated`) finds *distinct* self-consistent
+  solutions on non-convex landscapes.
 * **Reference SCF** (baseline / fallback): standard Roothaan iteration
   with linear mixing, **Pulay DIIS**, or **ODA** (optimal damping)
   acceleration, plus an optional `trust_radius` on the density step.
@@ -31,9 +32,16 @@ bilayer graphene model.
 
 ### Install
 
+Python 3.11 or newer is required. The supported runtime dependency floors are
+JAX 0.5.3 and NumPy 1.26; CI tests that minimum combination on Python 3.11
+and current dependency releases on Python 3.11–3.14.
+
 ```bash
 pip install jax-hf
 ```
+
+The default JAX installation is CPU-capable. Follow JAX's platform-specific
+installation instructions when you need a CUDA, ROCm, or TPU build.
 
 ### Minimal example
 
@@ -66,8 +74,8 @@ result_scf = jax_hf.solve_scf(kernel, P0=jnp.zeros_like(hamiltonian), n_electron
 Both solvers take a Config dataclass with sensible defaults:
 
 ```python
-jax_hf.SolverConfig(max_iter=200, tol_E=1e-7, optimizer="cg", ...)   # or optimizer="newton"
-jax_hf.SCFConfig(max_iter=200, mixing=0.3, acceleration="linear", ...)  # or "diis" / "oda"
+jax_hf.SolverConfig(max_iter=200, tol_E=1e-7, optimizer="cg")   # or optimizer="newton"
+jax_hf.SCFConfig(max_iter=200, mixing=0.3, acceleration="linear")  # or "diis" / "oda"
 ```
 
 `project_fn` lets you enforce symmetry constraints (spin, valley, time
@@ -79,7 +87,7 @@ reversal, spatial) on the density and Fock at every iteration.  See
 ```python
 from jax_hf import SolverConfig, SCFConfig, solve, solve_scf, solve_deflated
 
-# Trust-region Newton: far fewer Fock builds than CG on stiff problems.
+# Trust-region Newton: often fewer outer iterations on stiff problems.
 # (A second-order method — enable x64 / build the kernel in float64.)
 r = solve(kernel, P0, N, config=SolverConfig(optimizer="newton", tol_grad=1e-6))
 
@@ -148,9 +156,20 @@ construct both kernels themselves.
 
 ### Running tests
 
+Install the checkout and its development dependencies first:
+
 ```bash
-pytest tests/
+python -m pip install -e ".[dev]"
+pytest -q
 ```
 
 The bilayer regression tests (`tests/test_bilayer_regression.py`) require
 `contimod` and `contimod_graphene` and will be skipped otherwise.
+
+Because `contimod` is not publicly accessible, the default GitHub Actions
+suite does not attempt to install it. Repository maintainers can turn the
+bilayer matrix into an additional CI and release gate by setting the
+`RUN_BILAYER_REGRESSIONS` repository variable to `true` and adding a
+`BILAYER_REPOSITORY_TOKEN` secret with read access to both dependency
+repositories. When enabled, a failing bilayer job prevents a tagged release
+from publishing.

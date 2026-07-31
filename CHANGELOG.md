@@ -3,6 +3,42 @@
 All notable changes to **jax_hf** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+### Correctness
+- Require the full weighted `||P - P_FD(F)||` residual before either direct
+  optimizer reports convergence. Near-equal occupations can suppress the
+  commutator/orbital gradient even when the density is not self-consistent.
+- Use true finite-temperature free energy for CG/Newton decisions, reject
+  objective increases as plateaus, apply the occupation displacement used by
+  the Newton trust model, and use checked damped fixed-point steps when the
+  local parameterization stalls. `history["E"]` remains the internal HF
+  energy; `history["free_energy"]` records the optimized objective.
+- Correct reference-subtracted interaction energy so its derivative is the
+  returned Fock matrix, place nonuniform quadrature weights on the convolved
+  density, and make float32 entropy finite at occupations exactly 0 and 1.
+- Include contact interactions in embedded-reference and superlattice Fock
+  paths, including the embedded energy offset.
+- Make finite-temperature ODA descend free energy, repair low-temperature
+  Newton chemical-potential bracketing, handle exact empty/full fillings, and
+  reject negative temperatures and invalid solver inputs before JIT.
+
+### Performance notes
+- CG backtracking now evaluates the true nonlinear objective and may perform
+  multiple Fock builds per outer iteration. Newton may use a damped
+  fixed-point fallback near occupation degeneracies. These checks trade some
+  per-iteration cost for reliable stationarity and monotone free energy.
+
+### Packaging and CI
+- Require PEP 639-capable setuptools, preserve versions in tagged
+  `git archive` exports, and reject `0.0` or stale-module wheels during CI.
+- Declare the directly imported NumPy dependency, set the tested JAX/NumPy
+  floors, and remove unused Optax and Optimistix runtime dependencies.
+- Test Python 3.11–3.14 and provide a credential-gated bilayer regression job
+  that becomes a release gate when enabled.
+- Remove obsolete v1 diagnostic scripts and validate README Python snippets
+  and tracked diagnostics in the test suite.
+
 ## [2.2.1] — 2026-07-02
 
 ### Changed

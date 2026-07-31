@@ -1,3 +1,7 @@
+Historical v2.2.1 pre-correctness baseline. The tol_E=-1 forcing recipe below
+is not valid with the current SolverConfig validation and is retained only as
+measurement provenance.
+
 DM solver optimisations: measured impact
 =========================================
 
@@ -28,7 +32,7 @@ Six changes, in commit order:
       iter.
 
 
-Per-iteration wall time, slope-fit (tol_E=-1.0 forces full max_iter run)
+Historical per-iteration wall time, slope-fit (tol_E=-1.0 forced max_iter)
 ========================================================================
 Bilayer-like (nk=49, nb=16, T=0.5), linear fit on n_iter ∈ {10, 60}
 

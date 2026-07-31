@@ -36,8 +36,9 @@ def _bilayer_like_kernel(nk=49, nb=16, T=0.5):
 def _ablation(kernel, n_electrons, max_iter, *, n_warmup=2, n_repeats=5):
     """Measure full solve() time at fixed iter cap.  Returns (min wall, n_iter)."""
     P0 = jnp.zeros_like(kernel.h)
-    # tol_E=-1.0 forces dE > tol always (since dE = |E-E_prev| >= 0 > -1)
-    cfg = SolverConfig(max_iter=max_iter, tol_E=-1.0, tol_grad=0.0)
+    # A tiny positive gradient tolerance keeps the energy criterion inactive
+    # and normally runs to max_iter unless exact stationarity is reached.
+    cfg = SolverConfig(max_iter=max_iter, tol_grad=1e-30)
     res = jax_hf.solve(kernel, P0, n_electrons, config=cfg)
     jax.block_until_ready(res.energy)
     n_iter_actual = int(res.n_iter)

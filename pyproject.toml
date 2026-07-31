@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2", "wheel"]
+requires = ["setuptools>=77.0.3", "setuptools_scm[toml]>=8.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -17,14 +17,15 @@ keywords = ["physics", "condensed matter", "hartree fock", "mean field", "scf"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "Programming Language :: Python :: 3"
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "jax",
-#    "opt_einsum",
-    "optimistix",
-    "optax",
-#    "flax"
+    "jax>=0.5.3",
+    "numpy>=1.26",
 ]
 
 dynamic = ["version"]
@@ -44,7 +45,6 @@ Issues = "https://github.com/skilledwolf/jax_hf/issues"
 # Derive version from git tags similar to cpp_hf
 version_scheme = "guess-next-dev"
 local_scheme = "node-and-date"
-fallback_version = "0.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]  # list of folders that contain the packages (["."] by default)

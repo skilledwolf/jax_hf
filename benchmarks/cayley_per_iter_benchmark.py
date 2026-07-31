@@ -1,9 +1,9 @@
 """Per-iteration solver wall-time benchmark with fixed iteration cap.
 
-Disables convergence (tol_E = 0, tol_grad = 0) so the solver always runs
-exactly max_iter steps.  Reports total wall time / max_iter so we can compare
-per-iter cost across implementations without confounding it with iteration
-count differences.
+Uses a tiny positive gradient tolerance so the solver normally runs exactly
+``max_iter`` steps unless it reaches exact stationarity. Reports total wall
+time per completed iteration so implementations can be compared without
+assuming that the cap was reached.
 """
 
 import time
@@ -37,8 +37,7 @@ def _bench_fixed_iter(kernel, n_electrons: float, *, max_iter: int = 30,
                       n_warmup: int = 1, n_repeats: int = 5):
     """Force max_iter steps so we time per-iter cost only."""
     P0 = jnp.zeros_like(kernel.h)
-    # Use tol_E=0 to disable convergence — every run takes exactly max_iter steps.
-    cfg = SolverConfig(max_iter=max_iter, tol_E=0.0, tol_grad=0.0)
+    cfg = SolverConfig(max_iter=max_iter, tol_grad=1e-30)
 
     # Compile + warmup
     res = jax_hf.solve(kernel, P0, n_electrons, config=cfg)
@@ -76,8 +75,8 @@ def main():
         except Exception as e:
             print(f"{name:<10}  FAILED: {e}", flush=True)
             continue
-        per_iter = mt / max_iter * 1000.0
-        per_iter_min = mnt / max_iter * 1000.0
+        per_iter = mt / ni * 1000.0
+        per_iter_min = mnt / ni * 1000.0
         print(f"{name:<10} {mt*1000:>9.1f}ms {mnt*1000:>9.1f}ms {per_iter:>7.3f} ({per_iter_min:.3f} min)", flush=True)
 
 

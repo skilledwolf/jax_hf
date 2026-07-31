@@ -8,10 +8,15 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     env:
       JAX_PLATFORM_NAME: cpu
+      JAX_PLATFORMS: cpu
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,20 +24,81 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install development dependencies
         run: |
           python -m pip install -U pip
+          if [ "${{ matrix.python-version }}" = "3.11" ]; then
+            python -m pip install "numpy==1.26.*" "jax[cpu]==0.5.3"
+          fi
           python -m pip install -e ".[dev]"
 
       - name: Run test suite
+        run: pytest -q
+
+  bilayer_regression:
+    if: ${{ vars.RUN_BILAYER_REGRESSIONS == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      JAX_PLATFORM_NAME: cpu
+      JAX_PLATFORMS: cpu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          repository: skilledwolf/contimod_graphene
+          path: .bilayer-deps/contimod_graphene
+          token: ${{ secrets.BILAYER_REPOSITORY_TOKEN || github.token }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: skilledwolf/contimod
+          path: .bilayer-deps/contimod
+          token: ${{ secrets.BILAYER_REPOSITORY_TOKEN || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install bilayer regression dependencies
         run: |
-          pytest -q
+          python -m pip install -U pip
+          python -m pip install -e .bilayer-deps/contimod_graphene
+          python -m pip install -e .bilayer-deps/contimod
+          python -m pip install -e ".[dev]"
+
+      - name: Run bilayer regression matrix
+        run: pytest -q tests/test_bilayer_regression.py
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      JAX_PLATFORM_NAME: cpu
+      JAX_PLATFORMS: cpu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install -U pip
+          python -m pip install build
 
       - name: Build sdist and wheel
-        run: |
-          python -m build -s -w
+        run: python -m build -s -w
+
+      - name: Check wheel metadata and contents
+        run: python scripts/check_wheel.py dist/*.whl
 
       - name: Smoke-check built wheel
         run: |
@@ -44,10 +110,10 @@ jobs:
           import jax_hf
           import importlib.metadata as md
           print("jax_hf version:", md.version("jax_hf"))
-          # Smoke-check public API surface that downstream users rely on.
           for name in ("HartreeFockKernel", "solve", "solve_scf",
                        "SolverConfig", "SCFConfig", "build_fock",
-                       "hf_energy", "resample_kgrid"):
+                       "hf_energy", "resample_kgrid",
+                       "solve_continuation", "ContinuationResult"):
               assert hasattr(jax_hf, name), f"missing public symbol: {name}"
           print("public API OK:", sorted(jax_hf.__all__))
           PY
