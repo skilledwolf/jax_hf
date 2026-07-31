@@ -139,11 +139,58 @@ def test_embedded_energy_offset_is_correct():
     E_plain = float(hf_energy(jnp.asarray(refP), h=kernel_plain.h,
                               Sigma=jnp.asarray(Sigma_p),
                               H=jnp.asarray(H_p),
-                              weights_b=kernel_plain.weights_b))
+                              weights_b=kernel_plain.weights_b,
+                              refP=kernel_plain.refP))
     E_embed = float(hf_energy(jnp.asarray(refP), h=kernel_embed.h,
                               Sigma=jnp.asarray(Sigma_e),
                               H=jnp.asarray(H_e),
-                              weights_b=kernel_embed.weights_b))
+                              weights_b=kernel_embed.weights_b,
+                              refP=kernel_embed.refP))
     delta = E_embed - E_plain
     expected = 2.0 * float(kernel_embed.embedded_energy_offset)
     np.testing.assert_allclose(delta, expected, atol=1e-5, rtol=1e-6)
+
+
+def test_embedding_includes_contact_reference_potential_and_offset():
+    weights = np.ones((1, 1), dtype=np.float32)
+    h = np.zeros((1, 1, 2, 2), dtype=np.complex64)
+    Vq = np.zeros((1, 1, 1, 1), dtype=np.float32)
+    refP = np.zeros_like(h)
+    refP[..., 0, 0] = 0.8
+    refP[..., 1, 1] = 0.2
+    sigma_z = np.diag([1.0, -1.0]).astype(np.complex64)
+    contact_terms = [(1.0, sigma_z, sigma_z)]
+
+    kernel_plain = HartreeFockKernel(
+        weights,
+        h,
+        Vq,
+        T=0.1,
+        reference_density=refP,
+        contact_terms=contact_terms,
+    )
+    kernel_embed = HartreeFockKernel(
+        weights,
+        h,
+        Vq,
+        T=0.1,
+        reference_density=refP,
+        contact_terms=contact_terms,
+        embed_reference_potential=True,
+        center_embedded_hartree=False,
+    )
+
+    # For O_i = O_j = sigma_z and rho_bar = diag(0.8, 0.2):
+    # g O_i tr(O_j rho_bar) - g O_i rho_bar O_j = diag(-0.2, -0.8).
+    expected_contact = np.diag([-0.2, -0.8]).astype(np.complex64)
+    expected_shift = np.broadcast_to(expected_contact, h.shape)
+    np.testing.assert_allclose(
+        np.asarray(kernel_embed.h - kernel_plain.h),
+        expected_shift,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        float(kernel_embed.embedded_energy_offset),
+        -0.16,
+        atol=1e-6,
+    )

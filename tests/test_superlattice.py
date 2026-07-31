@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax_hf.superlattice import (
     ExtendedGridLayout,
     build_extended_layout,
+    make_superlattice_build_fock_fn,
     make_superlattice_fock_fn,
 )
 
@@ -132,6 +133,50 @@ def test_jit_streaming_fock_zero_density(small_layout):
     sigma = np.asarray(fock_fn(jnp.zeros((nk, nk, D, D), dtype=jnp.complex128))
                         .block_until_ready())
     assert np.max(np.abs(sigma)) < 1e-12
+
+
+def test_build_fock_adapter_includes_contact_terms():
+    g_frac = np.array([[0, 0]], dtype=np.int64)
+    layout = build_extended_layout(
+        g_basis_fractional=g_frac,
+        g_basis_B=np.eye(2),
+        nkx=1,
+        nky=1,
+        coulomb_V=lambda q: np.zeros_like(q),
+        w_scalar=1.0,
+    )
+    build_fock_sl = make_superlattice_build_fock_fn(
+        layout,
+        n_G=1,
+        dim_orb=2,
+        nkx=1,
+        nky=1,
+        HH_GG=np.zeros((1, 1)),
+        hartree_degeneracy=1.0,
+    )
+    P = jnp.zeros((1, 1, 2, 2), dtype=jnp.complex128)
+    P = P.at[..., 0, 0].set(0.8).at[..., 1, 1].set(0.2)
+    sigma_z = jnp.diag(jnp.array([1.0, -1.0], dtype=jnp.float64)).astype(
+        jnp.complex128
+    )
+
+    Sigma, _, _ = build_fock_sl(
+        P,
+        h=jnp.zeros_like(P),
+        VR=None,
+        refP=jnp.zeros_like(P),
+        HH=jnp.zeros((2, 2)),
+        w2d=jnp.ones((1, 1)),
+        include_exchange=True,
+        include_hartree=False,
+        exchange_hermitian_channel_packing=False,
+        contact_g=jnp.array([1.0]),
+        contact_Oi=sigma_z[None, ...],
+        contact_Oj=sigma_z[None, ...],
+    )
+
+    expected = np.diag([-0.2, -0.8]).reshape(1, 1, 2, 2)
+    np.testing.assert_allclose(np.asarray(Sigma), expected, atol=1e-12)
 
 
 def test_build_fock_orbital_hartree_reduces_to_scalar(small_layout):

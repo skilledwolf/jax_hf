@@ -28,6 +28,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from .fock import _contact_self_energy
+
 
 @dataclass(frozen=True)
 class ExtendedGridLayout:
@@ -246,7 +248,9 @@ def make_superlattice_build_fock_fn(
     ``fock_build_fn``.  It computes the streaming superlattice exchange and
     absorbs the k-independent Hartree shift directly into ``Sigma``; the
     returned ``H`` is zero so :func:`jax_hf.fock.hf_energy` (which uses
-    ``Sigma + H`` interchangeably) keeps working unchanged.
+    ``Sigma + H`` interchangeably) keeps working unchanged.  Contact terms
+    passed through the standard build-Fock signature are also accumulated
+    into ``Sigma``.
 
     Parameters
     ----------
@@ -318,6 +322,7 @@ def make_superlattice_build_fock_fn(
         exchange_offdiag_rtol=0.0,
     ):
         rho = P - refP
+        rho_bar_full = jnp.einsum("ij,ijab->ab", w2d, rho)
         # Exchange channel (streaming).
         if include_exchange:
             sigma_F = fock_fn(rho)
@@ -326,7 +331,7 @@ def make_superlattice_build_fock_fn(
 
         # Superlattice Hartree (k-independent shift), absorbed into Sigma.
         if include_hartree:
-            rho_bar = jnp.einsum("ij,ijab->ab", w2d, rho).reshape(
+            rho_bar = rho_bar_full.reshape(
                 n_G, dim_orb, n_G, dim_orb,
             )
             if orbital_path:
@@ -365,6 +370,14 @@ def make_superlattice_build_fock_fn(
             Sigma = sigma_F + sigma_H[None, None, :, :]
         else:
             Sigma = sigma_F
+
+        sigma_contact = _contact_self_energy(
+            rho_bar_full,
+            contact_g,
+            contact_Oi,
+            contact_Oj,
+        ).astype(P.dtype)
+        Sigma = Sigma + sigma_contact[None, None, :, :]
 
         H_zero = jnp.zeros_like(P)
         F = h + Sigma

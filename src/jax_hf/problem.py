@@ -8,7 +8,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from .utils import selfenergy_fft, validate_electron_count
+from .fock import _contact_self_energy
+from .utils import selfenergy_fft, validate_temperature
 
 
 class HartreeFockKernel:
@@ -49,15 +50,14 @@ class HartreeFockKernel:
             cf. ``get_shortrange_MF_valley`` in contimod.meanfield).
         embed_reference_potential : bool, default False
             When True, precompute the reference Hartree-Fock potential
-            ``V_HF[refP] = J[refP] + Σ[refP]`` (where Σ = −K is the
-            kernel-convention sign for exchange) and add it to the bare
-            ``hamiltonian`` once at construction time.  The kernel then
-            runs reference-subtracted updates ``Σ[P−refP] + H[P−refP]``
-            on this enlarged ``h_eff``, giving F = h + V_HF[P] — i.e.
-            the standard HF Fock matrix.  Without this flag, the kernel
-            solves a *modified* HF problem whose minimum differs from
-            standard HF by an amount proportional to the layer-screening
-            in V_HF[refP].  Reported energy then equals
+            ``V_HF[refP]``, including Hartree, long-range exchange, and
+            contact terms, and add it to the bare ``hamiltonian`` once at
+            construction time.  The kernel then runs reference-subtracted
+            updates on this enlarged ``h_eff``, giving
+            ``F = h + V_HF[P]`` — i.e. the standard HF Fock matrix.
+            Without this flag, the kernel solves a *modified* HF problem
+            whose minimum differs from standard HF by the reference
+            potential.  Reported energy then equals
             ``E_std + ½ Tr[V_HF[refP] · refP]`` (see
             ``embedded_energy_offset``).
         center_embedded_hartree : bool, default True
@@ -68,6 +68,7 @@ class HartreeFockKernel:
             which can be huge for strong-Coulomb dual-gate setups).
             Does not affect band asymmetries or DOS at E_F.
         """
+        validate_temperature(T, context="T")
         h = jnp.asarray(hamiltonian)
         self.h = h
         w2d = jnp.asarray(weights, dtype=h.real.dtype)
@@ -85,7 +86,10 @@ class HartreeFockKernel:
         self.exchange_hermitian_channel_packing = bool(
             Vq.shape[-2:] == (1, 1) and not jnp.iscomplexobj(Vq)
         )
-        self.VR = jnp.fft.fftn(self.weights_b * jnp.asarray(Vq, dtype=h.dtype), axes=(0, 1))
+        # The quadrature weight belongs to the integrated density P(q), not
+        # the transfer-momentum kernel V(k-q).  build_fock applies w(q) before
+        # transforming the density.
+        self.VR = jnp.fft.fftn(jnp.asarray(Vq, dtype=h.dtype), axes=(0, 1))
         # Pre-absorb ifftshift phase into VR.
         n0, n1 = int(h.shape[0]), int(h.shape[1])
         s0, s1 = n0 // 2, n1 // 2
@@ -181,21 +185,34 @@ class HartreeFockKernel:
             Sigma_ref = None
             if self.include_exchange:
                 Sigma_ref = selfenergy_fft(
-                    self._VR_shifted, ref,
+                    self._VR_shifted, self.weights_b * ref,
                     _apply_ifftshift=False,
                     hermitian_channel_packing=self.exchange_hermitian_channel_packing,
                 )
                 const_Sigma_refP_refP = float(jnp.einsum(
                     "ij,ijab,ijba->", w2d, Sigma_ref, ref,
                 ).real)
+            rho_bar_ref = jnp.einsum("ij,ijab->ab", w2d, ref)
+            Sigma_contact_ref = _contact_self_energy(
+                rho_bar_ref,
+                self.contact_g,
+                self.contact_Oi,
+                self.contact_Oj,
+            ).astype(h.dtype)
+            const_contact_refP_refP = float(
+                jnp.einsum("ab,ba->", Sigma_contact_ref, rho_bar_ref).real
+            )
             h_eff = self.h
             if Sigma_ref is not None:
                 h_eff = h_eff + Sigma_ref
+            h_eff = h_eff + Sigma_contact_ref[None, None, ...]
             # Add per-orbital diagonal in JAX-compatible way.
             h_eff = h_eff + jnp.diag(J_ref_diag.astype(h.dtype))[None, None, :, :]
             self.h = h_eff
             self.embedded_energy_offset = 0.5 * (
-                const_J_refP_refP + const_Sigma_refP_refP
+                const_J_refP_refP
+                + const_Sigma_refP_refP
+                + const_contact_refP_refP
             )
 
     def as_args(self):
