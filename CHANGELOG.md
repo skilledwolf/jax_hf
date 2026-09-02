@@ -28,6 +28,33 @@ This project adheres to [Semantic Versioning](https://semver.org).
   multiple Fock builds per outer iteration. Newton may use a damped
   fixed-point fallback near occupation degeneracies. These checks trade some
   per-iteration cost for reliable stationarity and monotone free energy.
+- Fix the finite-temperature occupation step at saturated occupations. At low
+  temperature nearly every occupation sits exactly at 0 or 1 in floating point
+  (98.5% on the bilayer graphene regression problem), and the logit of such a
+  band is clipped, so `eps + T*logit(p)` can miss the chemical potential by
+  hundreds of meV. Feeding that into the uniform particle-conservation shift
+  spread the error onto the partially filled bands and made the occupation
+  search direction an ascent direction, so the line search rejected every
+  candidate and the solver advanced only through its Fermi-Dirac fallback --
+  effectively undamped Roothaan iteration at about 10 Fock builds per step.
+  Saturated bands are now treated as active bound constraints: they are held
+  fixed and excluded from the particle-conservation projection, which is
+  enforced over the resolvable bands (curvature-weighted on the Newton path).
+- Stop the chemical-potential solve once the particle count and the update
+  reach working precision instead of always running `mu_maxiter` steps, and
+  scale its count tolerance to the target electron count rather than the band
+  capacity. The CG occupations come straight from this solve, so its accuracy
+  carries the particle count; the previous scaling left a relative particle
+  error of order `capacity / n_target` at low filling.
+- Measured on the bilayer graphene regression problem (nk=49, nb=16, float64,
+  CPU) over six branch/density points and two stopping criteria: CG spends 9.9
+  Fock builds per iteration before the fix and 2.9-4.3 after, for a 1.55x
+  wall-time reduction over the twelve CG runs (1.37x over Newton, 1.02x over
+  SCF). Every converged energy is bit-identical, and iteration counts are
+  unchanged except at PM +0.05 with `tol_grad=1e-5`, which takes 32 iterations
+  instead of 11 -- the masked gradient is a different search direction, and on
+  that one point it takes a longer route to the same solution. Synthetic
+  multiband problems are unchanged (4, 47 and 3 iterations, as before).
 
 ### Packaging and CI
 - Require PEP 639-capable setuptools, preserve versions in tagged

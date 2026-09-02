@@ -10,6 +10,12 @@ Algorithm:
   4. Polak-Ribiere CG direction with periodic restart
   5. Backtracking line search on the true nonlinear free energy
   6. Cayley retraction for orbitals, simplex projection for occupations
+
+Occupations that have saturated to 0 or 1 at the working precision are treated
+as active bound constraints: their logit is clipped, so their entropy gradient
+is not a gradient, and letting it into the particle-conservation projection
+turns the occupation step into an ascent direction (see
+:func:`_occupation_gradient`).
 """
 
 from __future__ import annotations
@@ -50,16 +56,31 @@ def _fock_in_orbital_basis(Q: jax.Array, F: jax.Array) -> jax.Array:
     return jnp.einsum("...in,...ij,...jm->...nm", jnp.conj(Q), F, Q)
 
 
-def _logit(p: jax.Array) -> jax.Array:
+def _logit_clip_eps(dtype) -> jax.Array:
     # Use the tightest symmetric bound representable by the working dtype.
     # A fixed 1e-6 bound badly distorts finite-T gradients in float64 when the
     # physical thermal tail is smaller than 1e-6.
-    eps = jnp.maximum(
-        jnp.asarray(1e-14, dtype=p.dtype),
-        jnp.asarray(jnp.finfo(p.dtype).eps, dtype=p.dtype),
+    return jnp.maximum(
+        jnp.asarray(1e-14, dtype=dtype),
+        jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype),
     )
+
+
+def _logit(p: jax.Array) -> jax.Array:
+    eps = _logit_clip_eps(p.dtype)
     p_safe = jnp.clip(p, eps, 1.0 - eps)
     return jnp.log(p_safe) - jnp.log1p(-p_safe)
+
+
+def _active_occupations(p: jax.Array) -> jax.Array:
+    """Bands whose occupation is resolvable away from the 0/1 bounds.
+
+    Occupations inside the logit clipping window are saturated: their entropy
+    gradient is numerically undefined and they cannot move at the working
+    precision, so the optimizers treat them as active bound constraints.
+    """
+    eps = _logit_clip_eps(p.dtype)
+    return jnp.logical_and(p > eps, p < 1.0 - eps)
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +95,14 @@ def _solve_mu(
     T: jax.Array,
     maxiter: int = 25,
 ) -> jax.Array:
-    """Find mu so sum_k w_k sum_i sigmoid((mu - eps)/T) = n_target_norm."""
+    """Find mu so sum_k w_k sum_i sigmoid((mu - eps)/T) = n_target_norm.
+
+    Safeguarded Newton iteration on a shrinking bracket.  ``maxiter`` is an
+    upper bound: the loop stops as soon as the particle count matches to a few
+    ULPs of the capacity or the update stops moving ``mu`` at the working
+    precision, which from a warm start takes a handful of steps rather than
+    the full budget.
+    """
     real_dtype = eps.dtype
     Tj = jnp.maximum(jnp.asarray(T, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
 
@@ -83,9 +111,27 @@ def _solve_mu(
     hi = e_max + 50.0 * Tj
     mu = jnp.clip(jnp.asarray(mu0, dtype=real_dtype), lo, hi)
     w_b = w_norm[..., None]
+    capacity = jnp.sum(w_norm) * jnp.asarray(eps.shape[-1], dtype=real_dtype)
+    eps_m = jnp.asarray(jnp.finfo(real_dtype).eps, dtype=real_dtype)
+    # Resolve the count to the precision of the *occupied* (or empty) fraction,
+    # not of the total capacity: at low filling the callers' occupations carry
+    # the target count, and a capacity-scaled tolerance would leave a relative
+    # particle error of order capacity/n_target.
+    occ_scale = jnp.minimum(n_target_norm, capacity - n_target_norm)
+    count_tol = 4.0 * eps_m * jnp.maximum(occ_scale, eps_m * capacity)
+    step_tol = 4.0 * eps_m * jnp.maximum(
+        jnp.maximum(jnp.abs(e_min), jnp.abs(e_max)), Tj,
+    )
 
-    def body(state, _):
-        mu, lo, hi = state
+    def cond(state):
+        i, _mu, _lo, _hi, g_prev, step_prev = state
+        return jnp.logical_and(
+            i < maxiter,
+            jnp.logical_and(jnp.abs(g_prev) > count_tol, step_prev > step_tol),
+        )
+
+    def body(state):
+        i, mu, lo, hi, _g_prev, _step_prev = state
         x = (mu - eps) / Tj
         p = jax.nn.sigmoid(x)
         N = jnp.sum(w_b * p)
@@ -98,14 +144,24 @@ def _solve_mu(
         Z_safe = jnp.maximum(Z, jnp.asarray(1e-18, dtype=real_dtype))
         mu_new = mu - g / Z_safe
         mu_bis = 0.5 * (lo + hi)
-        out_of = jnp.logical_or(mu_new <= lo, mu_new >= hi)
+        # A Newton update that rounds back onto ``mu`` (which has just become
+        # a bracket end) is a converged iterate, not an out-of-bracket step;
+        # bisecting from it would throw the solution away.
+        stalled = mu_new == mu
+        out_of = jnp.logical_and(
+            jnp.logical_or(mu_new <= lo, mu_new >= hi),
+            jnp.logical_not(stalled),
+        )
         mu_new = jnp.where(out_of, mu_bis, mu_new)
         mu_new = jnp.clip(mu_new, lo, hi)
         mu_new = jnp.where(jnp.isfinite(mu_new), mu_new, mu_bis)
-        return (mu_new, lo, hi), None
+        # Keep an iterate whose count already matches in place.
+        mu_new = jnp.where(jnp.abs(g) <= count_tol, mu, mu_new)
+        return (i + 1, mu_new, lo, hi, g, jnp.abs(mu_new - mu))
 
-    (mu_fin, lo_fin, hi_fin), _ = lax.scan(
-        body, (mu, lo, hi), xs=None, length=maxiter,
+    inf = jnp.asarray(jnp.inf, dtype=real_dtype)
+    _, mu_fin, lo_fin, hi_fin, _, _ = lax.while_loop(
+        cond, body, (jnp.int32(0), mu, lo, hi, inf, inf),
     )
     mu_bis = 0.5 * (lo_fin + hi_fin)
 
@@ -120,7 +176,6 @@ def _solve_mu(
     )
     neg_inf = jnp.asarray(-jnp.inf, dtype=real_dtype)
     pos_inf = jnp.asarray(jnp.inf, dtype=real_dtype)
-    capacity = jnp.sum(w_norm) * jnp.asarray(eps.shape[-1], dtype=real_dtype)
     return jnp.where(
         n_target_norm <= 0.0,
         neg_inf,
@@ -273,6 +328,72 @@ def _project_occ(dp: jax.Array, w2d: jax.Array) -> jax.Array:
     num = jnp.sum(w2d[..., None] * dp)
     den = jnp.sum(w2d) * nb
     return dp - num / den
+
+
+def _project_occ_masked(
+    dp: jax.Array, w2d: jax.Array, active: jax.Array,
+) -> jax.Array:
+    """Particle-conserving projection restricted to the ``active`` bands.
+
+    Uniform shift over the active bands only; saturated bands are held fixed
+    (zero variation).  Equals :func:`_project_occ` when every band is active,
+    which is why that unmasked form is kept: it is the reference case this
+    projection is defined against, and the tests check the two agree.
+    """
+    real_dtype = dp.dtype
+    tiny = jnp.asarray(1e-30, dtype=real_dtype)
+    wa = w2d[..., None] * active.astype(real_dtype)
+    shift = jnp.sum(wa * dp) / jnp.maximum(jnp.sum(wa), tiny)
+    return jnp.where(active, dp - shift, jnp.zeros_like(dp))
+
+
+def _project_occ_curvature(
+    v: jax.Array, w2d: jax.Array, curv: jax.Array,
+) -> jax.Array:
+    """Curvature-preconditioned particle-conserving projection.
+
+    Returns ``curv * (v - lam)`` with ``lam`` chosen so that
+    ``sum_k w_k sum_i curv_i (v_i - lam) = 0``: the projection of ``v`` onto
+    the fixed-particle tangent space under the metric ``1/curv``.  Bands with
+    ``curv = 0`` (saturated occupations) receive no variation and do not
+    influence ``lam``, so an unresolvable entropy gradient on a saturated band
+    cannot leak into the partially occupied ones.
+    """
+    real_dtype = v.dtype
+    tiny = jnp.asarray(1e-30, dtype=real_dtype)
+    wc = w2d[..., None] * curv
+    lam = jnp.sum(wc * v) / jnp.maximum(jnp.sum(wc), tiny)
+    return curv * (v - lam)
+
+
+def _occupation_gradient(
+    eps: jax.Array, p: jax.Array, T: jax.Array, w2d: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Projected occupation gradient of ``Omega = E - T S`` and its preconditioned form.
+
+    The raw gradient with respect to ``p_i`` is ``eps_i + T logit(p_i)``.  At a
+    Fermi-Dirac state it equals the chemical potential for every band, but a
+    band whose occupation has saturated to 0 or 1 at the working precision has
+    a clipped logit, so its raw gradient is off by up to ``|eps_i - mu|``.  On
+    low-temperature problems most bands are saturated; if that error enters the
+    uniform particle-conservation shift it is spread onto the partially filled
+    bands and turns the occupation step into an ascent direction.  Saturated
+    bands are therefore masked out of the Euclidean projection, get zero
+    curvature, and the particle constraint is enforced over the active bands.
+
+    Returns ``(g, h, curv, active)``: ``g`` is the masked particle-conserving
+    gradient, ``h = curv * (g_raw - lam)`` its Fermi-Dirac-curvature
+    preconditioned form with ``sum_k w_k sum_i h_i = 0`` (a descent direction:
+    ``<g_raw, h> = sum w curv (g_raw - lam)^2 >= 0``), ``curv = p(1-p)/T`` on
+    active bands and 0 elsewhere, and ``active`` the band mask.
+    """
+    real_dtype = eps.dtype
+    active = _active_occupations(p)
+    g_raw = (eps + T * _logit(p)).astype(real_dtype)
+    curv = jnp.where(active, p * (1.0 - p) / T, jnp.zeros_like(p)).astype(real_dtype)
+    g = _project_occ_masked(g_raw, w2d, active)
+    h = _project_occ_curvature(g_raw, w2d, curv)
+    return g, h, curv, active
 
 
 def _project_capped_occupations(
@@ -643,11 +764,9 @@ def _solve_impl(
         diff_p = p[..., None, :] - p[..., :, None]
         G_Q = _skew_hermitian(diff_p * Ft) * offdiag
 
-        # Occupation gradient on the fixed-particle tangent space.  The
-        # chemical-potential term is constant and is removed by the projection.
-        g_p = _project_occ(
-            (eps + T_r * _logit(p)).astype(real_dtype), w_norm,
-        )
+        # Occupation gradient on the fixed-particle tangent space, with
+        # saturated bands masked out (see _occupation_gradient).
+        g_p, h_p, _curv_p, _active_p = _occupation_gradient(eps, p, T_r, w_norm)
 
         # A Fermi-Dirac fixed-point residual remains well-defined at saturated
         # occupations, where the logit gradient is numerically singular.  Both
@@ -670,11 +789,6 @@ def _solve_impl(
         lam = jnp.maximum(T_r, denom_scale_r * eps_scale)
         denom = jnp.sqrt(gap ** 2 + lam ** 2)
         H_Q = G_Q / denom
-
-        # Occupation: scale by inverse FD curvature  (d²S/dp² = 1/(p(1-p)T))
-        p_safe = jnp.clip(p, 1e-8, 1.0 - 1e-8)
-        fd_curv = p_safe * (1.0 - p_safe) / T_r
-        h_p = _project_occ(g_p * fd_curv, w_norm)
 
         # ========== 4. CG direction (Polak-Ribiere) ==========
         # On first iteration (k=0), just use steepest descent
@@ -1189,9 +1303,7 @@ def _solve_newton_impl(
         eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
         diff_p = p[..., None, :] - p[..., :, None]
         G = _skew_hermitian(diff_p * Ft) * offdiag
-        g_p = _project_occ(
-            (eps + T_r * _logit(p)).astype(real_dtype), w2d,
-        )
+        g_p, _h_p, curv_p, active_p = _occupation_gradient(eps, p, T_r, w2d)
 
         eps_scale = jnp.sqrt(jnp.mean(eps ** 2) + tiny)
         lam_pc = jnp.maximum(T_r, denom_scale_r * eps_scale)
@@ -1201,10 +1313,9 @@ def _solve_newton_impl(
         gap = eps[..., :, None] - eps[..., None, :]
         denomX = jnp.sqrt(gap ** 2 + lam_pc ** 2)
         pc = jnp.clip(p, occ_clip, 1.0 - occ_clip)
-        fd_curv = pc * (1.0 - pc) / T_r
 
         def _prec(aX, ap):
-            return aX / denomX, _project_occ(ap * fd_curv, w2d)
+            return aX / denomX, _project_occ_curvature(ap, w2d, curv_p)
 
         # Joint (Q, p) Hessian-vector product (one Fock build via _fock_response).
         def _hvp(X, dp):
@@ -1221,7 +1332,7 @@ def _solve_newton_impl(
             HX = _skew_hermitian(C) * offdiag
             A_diag = jnp.real(jnp.diagonal(A, axis1=-2, axis2=-1)).astype(real_dtype)
             Hp = A_diag + (T_r / (pc * (1.0 - pc))) * dp
-            return HX, _project_occ(Hp, w2d)
+            return HX, _project_occ_masked(Hp, w2d, active_p)
 
         # ---- Steihaug truncated CG on the joint quadratic model ----
         rX0 = -G
