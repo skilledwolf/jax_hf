@@ -120,6 +120,12 @@ is `jax_hf.stability_analysis(kernel, P, N)`. These outer routines use NumPy/Sci
 host orchestration with JAX Fock kernels; they are not themselves JIT-compatible.
 They support affine, variational, JAX-differentiable `fock_build_fn` callbacks.
 
+Saddle recovery first applies a fixed-particle Fermi map to the perturbed Fock
+field, retaining the unstable tangent while respecting saturated occupation
+bounds. If these trials do not give significant free-energy descent, the solver
+tries projected-density perturbations. Both constructions evaluate and retain
+the actual kernel-dtype density; unresolved descent remains a reported failure.
+
 RDIIS/Anderson remain JAX-native and preserve custom Fock support. Their history
 stores two density-sized arrays per history slot, plus working buffers; choose
 the history size with the problem's memory cost in mind. Existing CG and linear

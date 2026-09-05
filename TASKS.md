@@ -82,3 +82,5 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done.
 - [x] Correct joint Newton geometry, occupation steps and interaction curvature with finite-difference regressions.
 - [x] Restore exchange reciprocity and add finite-temperature local stability checks and bounded saddle recovery.
 - [x] Validate parity against cpp_hf and document measured scope and limitations. (211 core tests passed in the actual checkout; eight independent C++ parity cases agreed to <1e-12. The saved optional bilayer fixture remains a separately tracked pre-existing issue.)
+
+- [x] Preserve finite-temperature saddle-escape descent near saturated occupations using a fixed-particle Fermi-map retraction, with projected-density fallback and verified free-energy acceptance. (19 focused minima/stability tests passed; coupled saturated-band finite differences verify the retraction tangent and actual free-energy curvature.)

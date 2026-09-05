@@ -104,5 +104,99 @@ def test_float32_escape_requires_descent_above_kernel_precision(monkeypatch):
     result = solve_minimum(kernel, density, 1., eigen_tol=1e-4,
         config=SCFConfig(acceleration="rdiis", density_tol=1e-4, comm_tol=1e-4))
     assert not result.converged and result.escapes == 0
-    assert len(evaluated) == 12 and all(dtype == jnp.complex64 for dtype in evaluated)
+    # Both the Fermi retraction and projected fallback fail the significant
+    # descent test. Neither may accept float64-only progress.
+    assert len(evaluated) == 24 and all(dtype == jnp.complex64 for dtype in evaluated)
     assert "no finite feasible descent" in result.message
+
+
+def test_fermi_escape_preserves_saturated_coupled_tangent_and_energy_curvature():
+    from scipy.special import expit, xlogy
+    from jax_hf import stability_analysis
+    from jax_hf.minima import _fermi_escape_density
+    from jax_hf.stability import (
+        _evaluate_fock, _fock_kwargs, _host_fermi_density, _response_fock,
+    )
+
+    # The outer bands are numerically saturated, while the inner occupations
+    # respond to a common chemical potential across nonuniform k weights.
+    # A rank-one interaction couples their populations and outer-band coherence.
+    w = np.array([[.25, .75]])
+    h = np.broadcast_to(np.diag([-20., -.01, .015, 20.]), (1, 2, 4, 4)).astype(complex).copy()
+    h[0, 1, 1, 1] = -.02
+    temperature = .05
+    number = float(np.sum(w[..., None]*expit(-np.diagonal(h, axis1=-2, axis2=-1).real/temperature)))
+    P = _host_fermi_density(h, w, number, temperature)[0]
+    observable = np.zeros_like(h)
+    observable[..., 0, 3] = observable[..., 3, 0] = 1.
+    observable[..., 1, 1], observable[..., 2, 2] = .15, -.15
+    kernel = HartreeFockKernel(w, h, np.zeros((1, 2, 1, 1)),
+                              T=temperature, reference_density=P)
+    def interaction(strength):
+        def custom(P, *, h, refP, w2d, **kwargs):
+            value = jnp.sum(w2d[..., None, None]
+                            * (jnp.conj(jnp.asarray(observable))*(P-refP)).real)
+            sigma = -strength*jnp.asarray(observable)*value
+            return sigma, jnp.zeros_like(P), h+sigma
+        return custom
+    unit = stability_analysis(kernel, P, number, fock_build_fn=interaction(1.))
+    fock_fn = interaction(1.05/(1-unit.lowest_eigenvalue))
+    stability = stability_analysis(kernel, P, number, fock_build_fn=fock_fn)
+    np.testing.assert_allclose(stability.lowest_eigenvalue, -.05, atol=1e-12)
+    assert stability.stationary and stability.stable is False
+    direction = stability.direction
+    norm = np.sqrt(np.sum(w*np.sum(abs(direction)**2, axis=(-2, -1)))/w.sum())
+    direction = direction/norm
+    args = _fock_kwargs(kernel, fock_fn)
+    response = np.asarray(_response_fock(jnp.asarray(P), jnp.asarray(direction), **args))
+    response = response/(1-stability.lowest_eigenvalue)
+    def trial(step):
+        return _fermi_escape_density(h, response, w, number, temperature, step)
+    def omega(density):
+        E = float(_evaluate_fock(jnp.asarray(density), **args)[1])
+        p = np.clip(np.linalg.eigvalsh(density), 0., 1.)
+        return E+temperature*np.sum(w[..., None]*(xlogy(p, p)+xlogy(1-p, 1-p)))
+    step = 1e-4
+    plus, minus = trial(step), trial(-step)
+    np.testing.assert_allclose((plus-minus)/(2*step), direction, atol=1e-8)
+    curvature = (omega(plus)+omega(minus)-2*omega(P))/step**2
+    np.testing.assert_allclose(curvature, stability.lowest_eigenvalue/norm**2,
+                               rtol=1e-4, atol=1e-6)
+    for step in (-.25, .25):
+        candidate = trial(step)
+        spectrum = np.linalg.eigvalsh(candidate)
+        assert spectrum.min() >= -1e-14 and spectrum.max() <= 1+1e-14
+        np.testing.assert_allclose(np.sum(w[..., None]*spectrum), number, atol=1e-13)
+        np.testing.assert_allclose(candidate, candidate.conj().swapaxes(-2, -1), atol=1e-14)
+    assert omega(trial(.25)) < omega(P)-1e-7
+
+
+def test_fermi_retraction_escapes_without_using_density_projection(monkeypatch):
+    import jax_hf.minima as module
+    def forbidden_projection(*args, **kwargs):
+        raise AssertionError("Fermi trials already provide a feasible descent")
+    monkeypatch.setattr(module, "_feasible_density", forbidden_projection)
+    response_calls = []
+    original_response = module._response_fock
+    def counted_response(*args, **kwargs):
+        response_calls.append(None)
+        return original_response(*args, **kwargs)
+    monkeypatch.setattr(module, "_response_fock", counted_response)
+    result = solve_minimum(saddle_kernel(), np.eye(2)[None, None]/2, 1.)
+    assert result.converged and result.stability.stable and result.escapes == 1
+    assert len(response_calls) == 1
+    assert np.all(np.diff(result.free_energies) < 0)
+
+
+def test_projected_density_fallback_remains_available_when_fermi_trials_stall(monkeypatch):
+    import jax_hf.minima as module
+    P = np.eye(2)[None, None]/2
+    fermi_calls = []
+    def unresolved_fermi_step(*args, **kwargs):
+        fermi_calls.append(None)
+        return P.copy()
+    monkeypatch.setattr(module, "_fermi_escape_density", unresolved_fermi_step)
+    result = solve_minimum(saddle_kernel(), P, 1.)
+    assert len(fermi_calls) == 12
+    assert result.converged and result.stability.stable and result.escapes == 1
+    assert np.all(np.diff(result.free_energies) < 0)

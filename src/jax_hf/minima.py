@@ -4,7 +4,10 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.special import xlogy
 from .reference_scf import SCFConfig, SCFResult, solve_scf
-from .stability import StabilityResult, stability_analysis, _evaluate_fock, _fock_kwargs
+from .stability import (
+    StabilityResult, stability_analysis, _evaluate_fock, _fock_kwargs,
+    _host_fermi_density, _response_fock,
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,20 @@ def _feasible_density(P, weights, number):
     return np.ascontiguousarray((Q*p[...,None,:])@Q.conj().swapaxes(-2,-1))
 
 
+def _fermi_escape_density(fock, response_field, weights, number, temperature, step):
+    """Retract a response-field step through fixed-particle Fermi occupation.
+
+    For an unstable congruence eigenmode dP with eigenvalue lambda, use
+    response_field = L(dP)/(1-lambda). Since -B L(dP)=(1-lambda)dP,
+    the derivative at a stationary density is dP. Re-occupation respects
+    spectral bounds smoothly even when density projection would clip a
+    tangent perturbation at saturated occupations.
+    """
+    field = np.asarray(fock) + step*np.asarray(response_field)
+    field = .5*(field+field.conj().swapaxes(-2, -1))
+    return _host_fermi_density(field, weights, number, temperature)[0]
+
+
 def solve_minimum(kernel, P0, n_electrons, *, config=None, max_escapes=4,
                   eigen_tol=1e-7, stability_maxiter=200,
                   fock_build_fn=None) -> MinimumResult:
@@ -47,6 +64,12 @@ def solve_minimum(kernel, P0, n_electrons, *, config=None, max_escapes=4,
     ``converged`` requires both a converged local solve and a conclusive stable
     Hessian test. This is a local minimum check within the supplied basis, not
     a global ground-state certificate or a test of omitted spin/valley sectors.
+
+    Negative-curvature recovery first re-occupies a perturbed Fock field at
+    fixed particle number. This retains the unstable tangent while respecting
+    saturated occupation bounds. Spectral projection of a density perturbation
+    is retained as a fallback. Every accepted trial must lower the actual
+    free energy by more than the kernel precision threshold.
 
     Extra symmetry callbacks are not supported: recovery must be allowed to
     break symmetry. ``fock_build_fn`` follows the affine, variational,
@@ -124,25 +147,42 @@ def solve_minimum(kernel, P0, n_electrons, *, config=None, max_escapes=4,
         norm = np.sqrt(np.sum(w*np.sum(abs(direction)**2,axis=(-2,-1)))/w.sum())
         direction = direction/max(norm,np.finfo(float).tiny)
         best, best_energy = None, omega
-        # Projection restores occupation bounds, including saturated bands.
-        # Check actual free energies: negative tangent curvature by itself is
-        # insufficient to justify a finite, projected perturbation.
+        # At stationarity the Fermi map has derivative -B. The congruence
+        # eigen-equation gives -B L(dP)=(1-lambda)dP, including the chemical
+        # potential response that enforces the weighted particle constraint.
+        # The actual finite-step energy check also covers slightly stalled,
+        # nonstationary starting densities where this tangent equality is
+        # approximate. Count the exact JVP response as one additional build.
+        device_density = jnp.asarray(result.density_matrix, dtype=kernel.h.dtype)
+        device_direction = jnp.asarray(direction, dtype=device_density.dtype)
+        response_field = np.asarray(_response_fock(
+            device_density, device_direction, **args)) / (1-stability.lowest_eigenvalue)
+        if builds >= 0:
+            builds += 1
         noise = 64*precision*max(1.,abs(omega))
-        for amplitude in (.25,.1,.03,.01,.003,.001):
-            for sign in (-1.,1.):
-                trial = _feasible_density(result.density_matrix+sign*amplitude*direction,w,n_electrons)
-                # Judge and retain exactly the density representable by this
-                # kernel. A host float64 perturbation must not silently change
-                # the precision of a float32 custom Fock builder.
-                device_trial = jnp.asarray(trial, dtype=kernel.h.dtype)
-                trial = np.asarray(device_trial)
-                E = float(_evaluate_fock(device_trial, **args)[1])
-                if builds >= 0:
-                    builds += 1
-                p = np.clip(np.linalg.eigvalsh(trial),0.,1.)
-                trial_energy = E+kernel.T*np.sum(w[...,None]*(xlogy(p,p)+xlogy(1-p,1-p)))
-                if trial_energy < best_energy-noise:
-                    best, best_energy = trial, float(trial_energy)
+        for use_fermi in (True, False):
+            for amplitude in (.25,.1,.03,.01,.003,.001):
+                for sign in (-1.,1.):
+                    step = sign*amplitude
+                    if use_fermi:
+                        trial = _fermi_escape_density(result.fock_matrix, response_field,
+                            w, n_electrons, kernel.T, step)
+                    else:
+                        trial = _feasible_density(result.density_matrix+step*direction,w,n_electrons)
+                    # Judge and retain exactly the density representable by this
+                    # kernel. A host float64 perturbation must not silently change
+                    # the precision of a float32 custom Fock builder.
+                    device_trial = jnp.asarray(trial, dtype=kernel.h.dtype)
+                    trial = np.asarray(device_trial)
+                    E = float(_evaluate_fock(device_trial, **args)[1])
+                    if builds >= 0:
+                        builds += 1
+                    p = np.clip(np.linalg.eigvalsh(trial),0.,1.)
+                    trial_energy = E+kernel.T*np.sum(w[...,None]*(xlogy(p,p)+xlogy(1-p,1-p)))
+                    if trial_energy < best_energy-noise:
+                        best, best_energy = trial, float(trial_energy)
+            if best is not None:
+                break
         if best is None:
             message = 'Negative curvature found, but no finite feasible descent step resolved'
             break
