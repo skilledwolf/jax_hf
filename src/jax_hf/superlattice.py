@@ -14,7 +14,11 @@ self-contained extended-grid layout builder (pure NumPy) and a
 function streaming one ΔG channel at a time through a single small scratch
 buffer.  Peak device memory is O(N_ext^2 · dim_orb^2), independent of
 n_delta — the HLO graph is also smaller than a single batched FFT over all
-channels, which cuts compile time on moderate-to-large layouts.
+channels, which cuts compile time on moderate-to-large layouts. An optional
+orbital kernel replaces V by V_{αβ} and streams one (ΔG, α, β) channel at
+a time through a 2D scratch buffer. Its kernel table costs
+O(N_ext_x N_ext_y dim_orb²); scratch memory is O(N_ext_x N_ext_y), without
+an additional n_delta factor. Both paths retain every orbital coherence.
 """
 
 from __future__ import annotations
@@ -53,6 +57,9 @@ class ExtendedGridLayout:
     V_lag_fft : (N_ext_x, N_ext_y) complex128 array
         FFT of the Cartesian Coulomb kernel on the FFT-natural lag grid,
         scaled by the BZ-integration weight scalar.
+    V_lag_fft_orbital : (N_ext_x, N_ext_y, dim_orb, dim_orb) complex array, optional
+        Orbital-pair interaction on the same weighted lag grid. When
+        supplied it replaces the scalar exchange kernel.
     delta_pair_count : (n_delta,) int64 array
     delta_pair_i, delta_pair_j : (n_pairs,) int64 arrays
         (G_a, G_b) index pairs grouped by ΔG.
@@ -72,6 +79,9 @@ class ExtendedGridLayout:
     delta_pair_i: np.ndarray
     delta_pair_j: np.ndarray
     delta_pair_start: np.ndarray
+    # Optional density-density interaction resolved over orbital pairs.
+    # Appended so existing positional construction remains compatible.
+    V_lag_fft_orbital: np.ndarray | None = None
 
 
 def build_extended_layout(
@@ -81,12 +91,17 @@ def build_extended_layout(
     nky: int,
     coulomb_V: Callable[[np.ndarray], np.ndarray],
     w_scalar: float,
+    *,
+    coulomb_V_orbital: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> ExtendedGridLayout:
     """Precompute index arrays + FFT'd Coulomb kernel for the extended grid.
 
     Parameters mirror :func:`cpp_hf.superlattice.build_extended_layout` so
     contimod (or any external wrapper) can swap backends without rebuilding
-    its layout-construction call.
+    its layout-construction call. ``coulomb_V_orbital(qmag)`` optionally
+    returns ``(*qmag.shape, dim_orb, dim_orb)`` and takes precedence over
+    the scalar Coulomb for exchange. A physical radial density-density
+    interaction is real and symmetric in the orbital indices.
     """
     g_frac = np.asarray(g_basis_fractional, dtype=np.int64)
     n_G = int(g_frac.shape[0])
@@ -149,6 +164,24 @@ def build_extended_layout(
     qmag = np.sqrt(lag_cart_x ** 2 + lag_cart_y ** 2)
     V_lag = np.asarray(coulomb_V(qmag), dtype=float)
     V_lag_fft = np.fft.fftn(float(w_scalar) * V_lag, axes=(0, 1))
+    V_lag_fft_orbital = None
+    if coulomb_V_orbital is not None:
+        if not callable(coulomb_V_orbital):
+            raise ValueError("coulomb_V_orbital must be callable or None")
+        V_orbital = np.asarray(coulomb_V_orbital(qmag))
+        if (V_orbital.ndim != 4 or V_orbital.shape[:2] != qmag.shape
+                or V_orbital.shape[-2] != V_orbital.shape[-1]
+                or V_orbital.shape[-1] == 0):
+            raise ValueError(
+                "coulomb_V_orbital must return shape "
+                f"{qmag.shape} + (dim_orb, dim_orb); got {V_orbital.shape}"
+            )
+        if not np.all(np.isfinite(V_orbital)):
+            raise ValueError("coulomb_V_orbital must return finite values")
+        V_lag_fft_orbital = np.ascontiguousarray(
+            np.fft.fftn(float(w_scalar) * V_orbital, axes=(0, 1)),
+            dtype=np.complex128,
+        )
 
     return ExtendedGridLayout(
         N_ext_x=N_ext_x,
@@ -163,6 +196,7 @@ def build_extended_layout(
         delta_pair_i=delta_pair_i,
         delta_pair_j=delta_pair_j,
         delta_pair_start=delta_pair_start,
+        V_lag_fft_orbital=V_lag_fft_orbital,
     )
 
 
@@ -172,6 +206,8 @@ def make_superlattice_fock_fn(
     dim_orb: int,
     nkx: int,
     nky: int,
+    *,
+    V_lag_fft_orbital: np.ndarray | None = None,
 ) -> Callable[[jax.Array], jax.Array]:
     """Build a JIT-compiled streaming superlattice Fock function.
 
@@ -180,8 +216,19 @@ def make_superlattice_fock_fn(
     self-energy with the same shape.  The JIT'd body iterates ΔG channels
     with one shared ``(N_ext_x, N_ext_y, dim_orb, dim_orb)`` scratch buffer
     — XLA reuses the buffer across iterations so peak device memory is
-    O(N_ext^2 · dim_orb^2), independent of n_delta.
+    O(N_ext^2 · dim_orb^2), independent of n_delta. If an orbital kernel
+    is supplied explicitly or stored in ``layout.V_lag_fft_orbital``, it
+    replaces the scalar exchange kernel. That path uses structured JAX
+    loops and one 2D scratch buffer per (ΔG, α, β), with no tensor carrying
+    all ΔG channels. Input/output densities still require
+    O(nkx nky (n_G dim_orb)²) memory. The returned map supports JIT and JVP.
     """
+    if V_lag_fft_orbital is None:
+        V_lag_fft_orbital = getattr(layout, "V_lag_fft_orbital", None)
+    if V_lag_fft_orbital is not None:
+        return _make_orbital_superlattice_fock_fn(
+            layout, n_G, dim_orb, nkx, nky, V_lag_fft_orbital,
+        )
     g_a_off = np.asarray(layout.g_a_off)
     delta_pair_i = np.asarray(layout.delta_pair_i)
     delta_pair_j = np.asarray(layout.delta_pair_j)
@@ -232,6 +279,76 @@ def make_superlattice_fock_fn(
     return fock_fn
 
 
+def _make_orbital_superlattice_fock_fn(
+    layout, n_G, dim_orb, nkx, nky, V_lag_fft_orbital,
+):
+    """Stream orbital-pair channels without unrolling the ΔG layout in HLO."""
+    nx, ny, n_delta = int(layout.N_ext_x), int(layout.N_ext_y), int(layout.n_delta)
+    expected = (nx, ny, dim_orb, dim_orb)
+    V_np = np.asarray(V_lag_fft_orbital)
+    if V_np.shape != expected:
+        raise ValueError(f"V_lag_fft_orbital must have shape {expected}; got {V_np.shape}")
+    if not np.all(np.isfinite(V_np)):
+        raise ValueError("V_lag_fft_orbital must contain only finite values")
+    V_fft = jnp.asarray(V_np)
+    pair_i = jnp.asarray(layout.delta_pair_i, dtype=jnp.int32)
+    pair_j = jnp.asarray(layout.delta_pair_j, dtype=jnp.int32)
+    pair_start = jnp.asarray(layout.delta_pair_start, dtype=jnp.int32)
+    offsets = jnp.asarray(layout.g_a_off, dtype=jnp.int32)
+    D = n_G * dim_orb
+    expected_density = (nkx, nky, D, D)
+
+    @jax.jit
+    def orbital_fock(rho_kk):
+        if rho_kk.shape != expected_density:
+            raise ValueError(f"density must have shape {expected_density}; got {rho_kk.shape}")
+        dtype = jnp.result_type(rho_kk.dtype, jnp.complex64)
+        rho = jnp.asarray(rho_kk, dtype=dtype).reshape(nkx, nky, n_G, dim_orb, n_G, dim_orb)
+        zero = jnp.int32(0)
+
+        def channel_body(channel, sigma):
+            channel = jnp.asarray(channel, dtype=jnp.int32)
+            d = channel // (dim_orb * dim_orb)
+            alpha = (channel // dim_orb) % dim_orb
+            beta = channel % dim_orb
+
+            def scatter(k, scratch):
+                i, j = pair_i[k], pair_j[k]
+                tile = jax.lax.dynamic_slice(
+                    rho, (zero, zero, i, alpha, j, beta), (nkx, nky, 1, 1, 1, 1),
+                ).reshape(nkx, nky)
+                return jax.lax.dynamic_update_slice(
+                    scratch, tile, (nkx * offsets[i, 0], nky * offsets[i, 1]),
+                )
+
+            scratch = jax.lax.fori_loop(
+                pair_start[d], pair_start[d + 1], scatter,
+                jnp.zeros((nx, ny), dtype=dtype),
+            )
+            interaction = jax.lax.dynamic_slice(
+                V_fft, (zero, zero, alpha, beta), (nx, ny, 1, 1),
+            ).reshape(nx, ny).astype(dtype)
+            response = -jnp.fft.ifftn(jnp.fft.fftn(scratch) * interaction)
+
+            def gather(k, result):
+                i, j = pair_i[k], pair_j[k]
+                tile = jax.lax.dynamic_slice(
+                    response, (nkx * offsets[i, 0], nky * offsets[i, 1]), (nkx, nky),
+                ).reshape(nkx, nky, 1, 1, 1, 1)
+                return jax.lax.dynamic_update_slice(
+                    result, tile, (zero, zero, i, alpha, j, beta),
+                )
+
+            return jax.lax.fori_loop(pair_start[d], pair_start[d + 1], gather, sigma)
+
+        sigma = jax.lax.fori_loop(
+            0, n_delta * dim_orb * dim_orb, channel_body, jnp.zeros_like(rho),
+        )
+        return sigma.reshape(expected_density)
+
+    return orbital_fock
+
+
 def make_superlattice_build_fock_fn(
     layout: ExtendedGridLayout,
     n_G: int,
@@ -241,6 +358,8 @@ def make_superlattice_build_fock_fn(
     HH_GG: np.ndarray,
     hartree_degeneracy: float,
     HH_GG_orbital: np.ndarray | None = None,
+    *,
+    V_lag_fft_orbital: np.ndarray | None = None,
 ) -> Callable:
     """Adapter matching the signature of :func:`jax_hf.fock.build_fock`.
 
@@ -250,7 +369,8 @@ def make_superlattice_build_fock_fn(
     returned ``H`` is zero so :func:`jax_hf.fock.hf_energy` (which uses
     ``Sigma + H`` interchangeably) keeps working unchanged.  Contact terms
     passed through the standard build-Fock signature are also accumulated
-    into ``Sigma``.
+    into ``Sigma``. Orbital exchange is read from the layout or from the
+    optional ``V_lag_fft_orbital`` override, including response-Fock JVPs.
 
     Parameters
     ----------
@@ -274,7 +394,9 @@ def make_superlattice_build_fock_fn(
         stray nonzero diagonal is also a common bug (forgetting to drop q=0).
         Matches the CPU ``cpp_hf.superlattice`` semantics.
     """
-    fock_fn = make_superlattice_fock_fn(layout, n_G, dim_orb, nkx, nky)
+    fock_fn = make_superlattice_fock_fn(
+        layout, n_G, dim_orb, nkx, nky, V_lag_fft_orbital=V_lag_fft_orbital,
+    )
     pair_to_delta_jax = jnp.asarray(np.asarray(layout.pair_to_delta, dtype=np.int64))
     HH_GG_jax = jnp.asarray(np.asarray(HH_GG, dtype=np.float64))
     n_delta = int(layout.n_delta)

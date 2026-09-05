@@ -62,7 +62,7 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done.
 - [ ] Update Contimod example 11's branch-tracker convergence export for the current JAX history schema: `dC_final` is now saved as all `NaN` because `jax_hf` no longer exposes the old `dC` diagnostic, even though the solves and order-parameter outputs remain finite.
 - [ ] Regenerate Contimod example 53's hard-coded reference narrative and plots for the current model artifact: current `hf.py`, `cpp_hf`, and `jax_hf` agree near `-2751.7041862` meV/cell, while the documented `-2755.6632` result and plots predate the current model file.
 - [ ] Give Contimod example 50's `--nk` option a plotting-safe lower bound (at least 4) or handle smaller meshes explicitly; the `nk=3` JAX solve converges, but its `RectBivariateSpline` contour plot fails after the solve.
-- [ ] Remove the misleading `superlattice_jax` CLI option from Contimod example 63, or implement orbital-resolved exchange in the JAX superlattice adapter; the example requires `coulomb_V_orbital` and currently raises `NotImplementedError` immediately.
+- [x] Implement orbital-resolved exchange in the JAX superlattice adapter used by Contimod example 63; the full orbital tensor now reaches streaming exchange, Hartree construction, reference embedding and custom-Fock/JVP solvers.
 
 ## Discovered during 2026-09-02 performance assessment
 
@@ -84,3 +84,5 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done.
 - [x] Validate parity against cpp_hf and document measured scope and limitations. (211 core tests passed in the actual checkout; eight independent C++ parity cases agreed to <1e-12. The saved optional bilayer fixture remains a separately tracked pre-existing issue.)
 
 - [x] Preserve finite-temperature saddle-escape descent near saturated occupations using a fixed-particle Fermi-map retraction, with projected-density fallback and verified free-energy acceptance from the actual returned density and energy. (Final full actual-checkout validation: 215 core tests passed in 87.63 seconds with no warnings, including saturated coupled-band curvature and stale legacy SCF history regressions.)
+
+- [x] Implement memory-bounded orbital-resolved superlattice exchange, preserving scalar behavior and supporting custom-Fock/JVP adapters. Validation: 57 focused JAX/Contimod tests passed; the reduced 228-band hexalayer Fock agrees with C++ to 5.7e-14. Its cold RDIIS solve reaches the 80-iteration budget without convergence, so this validates the operator and does not establish phase-diagram convergence.

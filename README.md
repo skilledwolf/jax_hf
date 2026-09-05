@@ -132,6 +132,29 @@ the history size with the problem's memory cost in mind. Existing CG and linear
 SCF defaults remain unchanged. The [port validation note](notes/solver_study_port_2026-09-05.md)
 documents the kernel/Newton corrections, parity checks, and scope.
 
+### Orbital-resolved superlattices
+
+`jax_hf.superlattice.build_extended_layout(..., coulomb_V_orbital=V_orbital)`
+tabulates the full `V_orbital(qmag)` tensor of shape
+`(*qmag.shape, dim_orb, dim_orb)`. The returned layout carries it into
+`make_superlattice_fock_fn` and `make_superlattice_build_fock_fn`; an explicit
+`V_lag_fft_orbital=` override is also accepted by both factories. The scalar
+path and its defaults are unchanged. Radial density-density interactions
+should be real and symmetric in their orbital indices.
+
+The orbital path streams one `(delta_G, alpha, beta)` channel through a 2D
+FFT buffer, retaining every inter-orbital and inter-G coherence. Working FFT
+memory scales as `N_ext_x * N_ext_y`; the shared orbital kernel table scales
+as `N_ext_x * N_ext_y * dim_orb**2`, with no `n_delta` multiplier. Density,
+Fock, solver history and eigensystem storage remain additional costs. This
+memory bound does not promise faster execution than the C++ backend.
+
+The custom build-Fock adapter includes orbital Hartree, reference subtraction
+and contact terms and supports JAX forward-mode response (`jax.jvp`), including
+at zero density. Supply it through `fock_build_fn=` to SCF, Newton or stability
+analysis. Its orbital Hartree matrix is supplied separately as
+`HH_GG_orbital`; keeping or dropping finite q=0 blocks is the caller's choice.
+
 ### Public API
 
 | Name | Purpose |
