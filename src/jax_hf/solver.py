@@ -318,6 +318,74 @@ def _joint_predicted_reduction(
     return -(linear + 0.5 * quadratic)
 
 
+def _joint_inner_product(aX, ap, bX, bp, w_norm):
+    """One normalized quadrature metric for both Newton tangent sectors."""
+    return _ip_matrix(aX, bX, w_norm) + _ip_vec(ap, bp, w_norm)
+
+
+def _joint_hvp(Q, p, Ft, X, dp, T, w2d, response_fn, project_fn=None):
+    """Covariant Hessian action on the fixed-particle unitary/occupation space.
+
+    ``response_fn`` is the derivative of the effective Fock at the current
+    density, including any deflation force. Symmetry projections must be
+    linear, orthogonal, trace preserving and map onto a matrix algebra.
+    """
+    project = project_fn if project_fn is not None else (lambda A: A)
+    eye = jnp.eye(p.shape[-1], dtype=Q.dtype)
+    offdiag = 1.0 - jnp.eye(p.shape[-1], dtype=p.dtype)
+    diff_p = p[..., None, :] - p[..., :, None]
+    M = X * diff_p + dp[..., :, None] * eye
+    dP = _herm(project(Q @ M @ jnp.conj(jnp.swapaxes(Q, -1, -2))))
+    St = _fock_in_orbital_basis(Q, _herm(project(response_fn(dP))))
+    A = Ft @ X - X @ Ft + St
+    G = diff_p * Ft
+    C = (dp[..., None, :] - dp[..., :, None]) * Ft + diff_p * A
+    # Parallel transport from Q exp(tX) back to Q contributes 1/2 [X,G].
+    # Without this connection the operator is not self-adjoint off stationarity.
+    C = C + 0.5 * (X @ G - G @ X)
+    HX = _skew_hermitian(C) * offdiag
+    clip = _logit_clip_eps(p.dtype)
+    pc = jnp.clip(p, clip, 1.0 - clip)
+    Hp = jnp.real(jnp.diagonal(A, axis1=-2, axis2=-1)) + T / (pc * (1.0 - pc)) * dp
+    return HX, _project_occ_masked(Hp, w2d, _active_occupations(p))
+
+
+def _deflation_bias(P, targets, w2d, sigma, length):
+    """Gaussian bias, its density gradient, and its diagonal response part."""
+    diff = P[None] - targets
+    d2 = jnp.sum(w2d[None, ..., None, None] * jnp.abs(diff) ** 2, axis=(1, 2, 3, 4))
+    invL2 = 1.0 / jnp.asarray(length, dtype=P.real.dtype) ** 2
+    phi = sigma * jnp.exp(-0.5 * d2 * invL2)
+    coeff = -phi * invL2
+    force = jnp.sum(coeff[:, None, None, None, None] * diff, axis=0)
+    return jnp.sum(phi), force, jnp.sum(coeff)
+
+
+def _deflation_response(P, dP, targets, w2d, sigma, length):
+    """Full Gaussian force derivative, including its nonlocal outer product."""
+    diff = P[None] - targets
+    wb = w2d[None, ..., None, None]
+    d2 = jnp.sum(wb * jnp.abs(diff) ** 2, axis=(1, 2, 3, 4))
+    directional = jnp.sum(wb * jnp.real(jnp.conj(diff) * dP[None]), axis=(1, 2, 3, 4))
+    invL2 = 1.0 / jnp.asarray(length, dtype=P.real.dtype) ** 2
+    phi = sigma * jnp.exp(-0.5 * d2 * invL2)
+    diagonal = -jnp.sum(phi) * invL2 * dP
+    outer = jnp.sum(
+        (phi * invL2 ** 2 * directional)[:, None, None, None, None] * diff,
+        axis=0,
+    )
+    return diagonal + outer
+
+
+def _scale_joint_step_to_bounds(p, vX, vp, HvX, Hvp):
+    """Apply one fraction-to-boundary factor to the entire Newton model step."""
+    nonzero = jnp.where(vp != 0.0, vp, jnp.ones_like(vp))
+    limits = jnp.where(vp < 0.0, -0.99 * p / nonzero, 0.99 * (1.0 - p) / nonzero)
+    limits = jnp.where(vp != 0.0, limits, jnp.ones_like(limits))
+    fraction = jnp.minimum(1.0, jnp.min(limits))
+    return fraction * vX, fraction * vp, fraction * HvX, fraction * Hvp
+
+
 def _project_occ(dp: jax.Array, w2d: jax.Array) -> jax.Array:
     """Project an occupation variation onto the particle-conserving subspace.
 
@@ -470,7 +538,7 @@ class SolverConfig:
     # Newton is a second-order method and needs float64 precision (enable x64);
     # in float32 it warns and may not converge.  CG works in either precision.
     optimizer: str = "cg"
-    tr_delta0: float = 0.5      # Newton: initial trust radius
+    tr_delta0: float = 0.5      # Newton: radius in the normalized weighted joint norm
     tr_cg_max: int = 20         # Newton: max Steihaug inner CG iters per outer step
     # Deflation (optimizer="newton" only): add a repulsive Gaussian bias around
     # each density in ``deflation_targets`` so the solve is pushed out of those
@@ -483,6 +551,8 @@ class SolverConfig:
     deflation_sigma: float = 0.0
     deflation_length: float = 1.0
     block_sizes: tuple[int, ...] | None = None
+    # Newton requires a linear orthogonal, trace-preserving symmetry projection
+    # onto a matrix algebra; its density, Fock and response are all projected.
     project_fn: Any = None
 
     def __post_init__(self) -> None:
@@ -1130,7 +1200,7 @@ def _solve_newton_impl(
 
     Minimizes the same free energy as :func:`_solve_impl`, but with a
     second-order step: the joint (Q, p) Hessian-vector product uses the exact
-    linear interaction response ``Sigma[dP] = F[dP] - h`` (one Fock build each),
+    interaction response (one Fock build, or a JVP for a custom builder),
     and a Steihaug truncated-CG solves the trust-region subproblem. Convergence
     requires both the orbital gradient and the full Fermi-Dirac fixed-point
     residual. It often needs fewer outer iterations than CG on stiff problems.
@@ -1146,7 +1216,6 @@ def _solve_newton_impl(
     w2d = jnp.asarray(weights_b[..., 0, 0], dtype=real_dtype)
     weight_sum_r = jnp.asarray(weight_sum, dtype=real_dtype)
     w_norm = w2d / jnp.maximum(weight_sum_r, tiny)
-    ones_w = jnp.ones_like(w2d)
 
     n_target = jnp.asarray(n_electrons, dtype=real_dtype)
     n_target_norm = n_target / jnp.maximum(weight_sum_r, tiny)
@@ -1156,7 +1225,6 @@ def _solve_newton_impl(
     denom_scale_r = jnp.asarray(denom_scale, dtype=real_dtype)
     delta0 = jnp.asarray(tr_delta0, dtype=real_dtype)
     delta_min = jnp.asarray(1e-10, dtype=real_dtype)
-    occ_clip = jnp.asarray(1e-8, dtype=real_dtype)
     # Relative energy-noise floor for the trust-region ratio: ~4500 * machine
     # epsilon, i.e. ~1e-12 in float64 (cpp_hf's hard-coded value) and ~5e-4 in
     # float32, tracking the precision of the Fock build that produces E.
@@ -1166,7 +1234,6 @@ def _solve_newton_impl(
     )
 
     nb = h.shape[-1]
-    eye = jnp.eye(nb, dtype=target_dtype)
     offdiag = (1.0 - jnp.eye(nb, dtype=real_dtype))[None, None, ...]
     refP_zero = jnp.zeros_like(refP)
 
@@ -1179,21 +1246,26 @@ def _solve_newton_impl(
             exchange_block_specs=block_specs, project_fn=None,
         )
 
-    def _fock_response(dP):
-        # Linear interaction response Sigma[dP] = F[dP] - h, with refP = 0 so
-        # the interaction sees dP directly (exact since Sigma is linear in P).
+    def _fock_response(P, dP):
+        # A custom builder may capture reference/one-body terms internally.
+        # Differentiate its actual Fock instead of assuming F[dP] - h.
+        if fock_build_fn is not None:
+            return jax.jvp(lambda density: _fock_full(density)[2], (P,), (dP,))[1]
+        # Standard HF response is linear: omit the one-body/reference terms
+        # directly to avoid cancellation against a large one-body matrix.
         _, _, F_resp = _fock_fn(
-            dP, h=h, VR=VR, refP=refP_zero, HH=HH, w2d=w2d,
+            dP, h=jnp.zeros_like(h), VR=VR, refP=refP_zero, HH=HH, w2d=w2d,
             include_exchange=include_exchange, include_hartree=include_hartree,
             exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
             contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
             exchange_block_specs=block_specs, project_fn=None,
         )
-        return F_resp - h
+        return F_resp
 
-    # Joint metric: orbital part unweighted, occupation part weighted by w2d.
+    # The gradient and Hessian represent Omega / weight_sum in this metric.
+    # Different weights in the two sectors break Hessian self-adjointness.
     def _jip(aX, ap, bX, bp):
-        return _ip_matrix(aX, bX, ones_w) + _ip_vec(ap, bp, w2d)
+        return _joint_inner_product(aX, ap, bX, bp, w_norm)
 
     def _jip_norm(aX, ap):
         return jnp.sqrt(jnp.maximum(0.0, _jip(aX, ap, aX, ap)))
@@ -1205,23 +1277,10 @@ def _solve_newton_impl(
     #   d_i^2    = sum_k w_k ||P_k - target_{i,k}||_F^2   (gauge-invariant in P)
     #   S_pen    = sum_i 2 phi'(d_i^2) (P - target_i),    phi'(x) = -phi(x)/(2L^2)
     # The force S_pen is folded into the Fock (F_eff = F + S_pen) so the gradient
-    # sees the bias, and pen_diag = 2 sum_i phi'(d_i^2) is the diagonal penalty
-    # curvature injected into the Hessian-vector product.  ``has_deflation`` is a
+    # sees the bias. Both diagonal and outer-product penalty curvature are
+    # included in the Hessian-vector product. ``has_deflation`` is a
     # static flag, so a normal Newton solve compiles with none of this.
-    defl_inv2L2 = 1.0 / (2.0 * jnp.maximum(
-        jnp.asarray(deflation_length, dtype=real_dtype),
-        jnp.asarray(1e-12, dtype=real_dtype)) ** 2)
     defl_sigma = jnp.asarray(deflation_sigma, dtype=real_dtype)
-
-    def _deflation_bias(P):
-        diff = P[None] - deflation_targets               # (n_defl, nk1, nk2, nb, nb)
-        per_k = jnp.sum(jnp.abs(diff) ** 2, axis=(-2, -1))       # (n_defl, nk1, nk2)
-        d2 = jnp.sum(w2d[None] * per_k, axis=(1, 2))             # (n_defl,)
-        phi = defl_sigma * jnp.exp(-d2 * defl_inv2L2)
-        phip = -phi * defl_inv2L2                                # phi'(d^2) < 0
-        coeff = (2.0 * phip).astype(target_dtype)
-        S_pen = jnp.sum(coeff[:, None, None, None, None] * diff, axis=0)
-        return jnp.sum(phi), S_pen, 2.0 * jnp.sum(phip)
 
     def _eval_state(Q, p):
         """Objectives, orbital-basis Fock, stationarity, and penalty curvature.
@@ -1239,12 +1298,14 @@ def _solve_newton_impl(
         )
         Omega = free_energy(E, p, w2d, T_r)
         if has_deflation:
-            Phi, S_pen, pen_diag = _deflation_bias(P)
+            Phi, S_pen, pen_diag = _deflation_bias(
+                P, deflation_targets, w2d, defl_sigma, deflation_length,
+            )
             Omega = Omega + Phi
             F = F + S_pen
         else:
             pen_diag = jnp.zeros((), dtype=real_dtype)
-        Ft = _fock_in_orbital_basis(Q, F)
+        Ft = _fock_in_orbital_basis(Q, _herm(_project(F)))
         diff_p = p[..., None, :] - p[..., :, None]
         G = _skew_hermitian(diff_p * Ft) * offdiag
         eps, V_fd = jnp.linalg.eigh(Ft)
@@ -1263,8 +1324,9 @@ def _solve_newton_impl(
         return E, Omega, Ft, grad_norm, pen_diag
 
     # ---- Initialize (Q, p) from Fock at P0 ----
-    P0_h = _herm(jnp.asarray(P0, dtype=target_dtype))
+    P0_h = _herm(_project(jnp.asarray(P0, dtype=target_dtype)))
     _, _, F0 = _fock_full(P0_h)
+    F0 = _herm(_project(F0))
     eps0, Q0 = jnp.linalg.eigh(F0)
     eps0 = eps0.astype(real_dtype)
     Q0 = Q0.astype(target_dtype)
@@ -1303,7 +1365,7 @@ def _solve_newton_impl(
         eps = jnp.real(jnp.diagonal(Ft, axis1=-2, axis2=-1)).astype(real_dtype)
         diff_p = p[..., None, :] - p[..., :, None]
         G = _skew_hermitian(diff_p * Ft) * offdiag
-        g_p, _h_p, curv_p, active_p = _occupation_gradient(eps, p, T_r, w2d)
+        g_p, _h_p, curv_p, _active_p = _occupation_gradient(eps, p, T_r, w2d)
 
         eps_scale = jnp.sqrt(jnp.mean(eps ** 2) + tiny)
         lam_pc = jnp.maximum(T_r, denom_scale_r * eps_scale)
@@ -1312,27 +1374,22 @@ def _solve_newton_impl(
         # p(1-p)/T, then project the occupation onto particle conservation.
         gap = eps[..., :, None] - eps[..., None, :]
         denomX = jnp.sqrt(gap ** 2 + lam_pc ** 2)
-        pc = jnp.clip(p, occ_clip, 1.0 - occ_clip)
 
         def _prec(aX, ap):
             return aX / denomX, _project_occ_curvature(ap, w2d, curv_p)
 
-        # Joint (Q, p) Hessian-vector product (one Fock build via _fock_response).
-        def _hvp(X, dp):
-            M = X * diff_p + dp[..., :, None] * eye  # [X, diag p] off-diag + diag(dp)
-            dP = jnp.einsum("...in,...nm,...jm->...ij", Q, M, jnp.conj(Q))
-            dP = _herm(dP)
-            resp = _fock_response(dP)
+        P_base = _herm(_project(_density_from_Qp(Q, p)))
+
+        def _response(dP):
+            resp = _fock_response(P_base, dP)
             if has_deflation:
-                resp = resp + pen_diag * dP             # diagonal penalty curvature
-            St = _fock_in_orbital_basis(Q, resp)        # response in orbital basis
-            A = jnp.matmul(Ft, X) - jnp.matmul(X, Ft) + St  # [Ft, X] + St
-            diff_dp = dp[..., None, :] - dp[..., :, None]
-            C = diff_dp * Ft + diff_p * A
-            HX = _skew_hermitian(C) * offdiag
-            A_diag = jnp.real(jnp.diagonal(A, axis1=-2, axis2=-1)).astype(real_dtype)
-            Hp = A_diag + (T_r / (pc * (1.0 - pc))) * dp
-            return HX, _project_occ_masked(Hp, w2d, active_p)
+                resp = resp + _deflation_response(
+                    P_base, dP, deflation_targets, w2d, defl_sigma, deflation_length,
+                )
+            return resp
+
+        def _hvp(X, dp):
+            return _joint_hvp(Q, p, Ft, X, dp, T_r, w2d, _response, project_fn)
 
         # ---- Steihaug truncated CG on the joint quadratic model ----
         rX0 = -G
@@ -1375,7 +1432,7 @@ def _solve_newton_impl(
             HvX_a, Hvp_a = HvX + alpha * HdX, Hvp + alpha * Hdp
             rX_a, rp_a = rX - alpha * HdX, rp - alpha * Hdp
             rn = _jip_norm(rX_a, rp_a)
-            inner_conv = rn < 0.05 * residual0
+            inner_conv = rn < jnp.minimum(0.5, jnp.sqrt(residual0)) * residual0
             zX_a, zp_a = _prec(rX_a, rp_a)
             rz_new = _jip(rX_a, rp_a, zX_a, zp_a)
             beta = rz_new / jnp.where(jnp.abs(rz) > tiny, rz, jnp.ones_like(rz))
@@ -1397,27 +1454,16 @@ def _solve_newton_impl(
         cg_fin = lax.while_loop(cg_cond, cg_body, cg_carry0)
         _, _, vX, vp, HvX, Hvp, _, _, _, _, _ = cg_fin
 
-        # Retract the orbital sector first, then exactly minimize the frozen-F
-        # occupation block at those trial orbitals.  This is the stable reduced
-        # occupation step used by the original method.  Crucially, all model
-        # quantities below are recomputed for the *actual* displacement
-        # ``p_trial - p``; the raw Steihaug ``vp`` is not left in ``pred`` or
-        # the trust-radius norm when it is not the applied trial step.
+        # Preserve the coupled Newton direction. One fraction-to-boundary
+        # factor keeps the occupations feasible and cannot enlarge the trust
+        # region step; scale its stored Hessian action by the same factor.
+        vX, vp, HvX, Hvp = _scale_joint_step_to_bounds(p, vX, vp, HvX, Hvp)
+        p_trial = p + vp
         V_v, lam_v = _cayley_spectral_setup(vX)
         U = _cayley_unitary_from_spectrum(
             V_v, lam_v, jnp.asarray(-1.0, dtype=real_dtype),
         )
         Qt = Q @ U
-        Ft_frozen = _fock_in_orbital_basis(U, Ft)
-        eps_frozen = jnp.real(
-            jnp.diagonal(Ft_frozen, axis1=-2, axis2=-1)
-        ).astype(real_dtype)
-        mu_t = _solve_mu(
-            eps_frozen, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter,
-        )
-        p_trial = jax.nn.sigmoid((mu_t - eps_frozen) / T_r).astype(real_dtype)
-        vp = p_trial - p
-        HvX, Hvp = _hvp(vX, vp)
 
         # Predicted reduction m(0) - m(v) in TRUE energy units: the orbital
         # gradient/Hessian action are per-k (unweighted) but the energy carries
@@ -1433,7 +1479,7 @@ def _solve_newton_impl(
         eps_t = jnp.real(
             jnp.diagonal(Ft_trial, axis1=-2, axis2=-1)
         ).astype(real_dtype)
-        mu_t = _solve_mu(eps_t, w_norm, n_target_norm, mu_t, T_r, maxiter=mu_maxiter)
+        mu_t = _solve_mu(eps_t, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter)
 
         # Energy-noise floor below which the predicted reduction is meaningless
         # and the step is judged on the gradient instead.  Scaled to the working
@@ -1568,6 +1614,7 @@ def _solve_newton_impl(
     E_fin = hf_energy(
         P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b, refP=refP,
     )
+    F_fin = _herm(_project(F_fin))
     eps_check, Q_check = jnp.linalg.eigh(F_fin)
     mu_check = _solve_mu(
         eps_check.astype(real_dtype), w_norm, n_target_norm, mu_fin, T_r,

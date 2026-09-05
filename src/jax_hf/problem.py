@@ -72,6 +72,15 @@ class HartreeFockKernel:
         h = jnp.asarray(hamiltonian)
         self.h = h
         w2d = jnp.asarray(weights, dtype=h.real.dtype)
+        weights_host = np.asarray(w2d)
+        if weights_host.shape != h.shape[:2]:
+            raise ValueError(f"weights must have shape {h.shape[:2]}, got {w2d.shape}")
+        if not np.all(np.isfinite(weights_host)):
+            raise ValueError("weights must be finite")
+        if np.any(weights_host < 0):
+            raise ValueError("weights must be non-negative")
+        if float(weights_host.sum()) <= 0:
+            raise ValueError("weights must have a positive sum")
         self.weights_b = w2d[..., None, None]
         self.weight_sum = jnp.sum(w2d)
         self.w2d = w2d
@@ -99,7 +108,20 @@ class HartreeFockKernel:
             (phase0[:, None] * phase1[None, :])[..., None, None],
             dtype=self.VR.dtype,
         )
-        self._VR_shifted = self.VR * shift_phase
+        shifted = self.VR * shift_phase
+        # A sampled radial V(q) need not obey *periodic* inversion on even
+        # oblique grids. The quadratic energy uses only the self-adjoint
+        # convolution; retaining its skew part in F breaks dE/dP = F.
+        # Convolution's adjoint multiplier is shifted.conj(). This preserves
+        # the scalar quadratic energy at fixed h and reference density.
+        shifted_host = np.asarray(shifted)
+        self.exchange_reciprocity_defect = float(
+            np.linalg.norm(shifted_host.imag)
+            / max(np.linalg.norm(shifted_host), np.finfo(float).tiny)
+        )
+        self._VR_shifted = shifted.real.astype(shifted.dtype)
+        # Keep the public unshifted representation consistent with as_args().
+        self.VR = self._VR_shifted / shift_phase
         self.T = float(T)
         self.include_hartree = bool(include_hartree)
         self.include_exchange = bool(include_exchange)
