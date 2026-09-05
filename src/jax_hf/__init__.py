@@ -4,9 +4,11 @@ Two solvers are available, sharing a single :class:`HartreeFockKernel`:
 
 * :func:`solve` (alias :func:`solve_direct_minimization`) — preconditioned
   Riemannian CG on Stiefel × capped simplex with Cayley retraction and
-  true-free-energy backtracking.  **Default and recommended.**
-* :func:`solve_scf` — reference self-consistent field iteration with linear
-  mixing.  Useful as a baseline or fallback.
+  true-free-energy backtracking. The legacy default is preserved.
+* :func:`solve_scf` — self-consistent field iteration, including safeguarded
+  full-density residual DIIS and Anderson acceleration.
+* :func:`solve_minimum` — RDIIS followed by local density stability checks
+  and bounded saddle recovery. Recommended for checked local minimization.
 
 Both return rich NamedTuples (:class:`SolveResult`, :class:`SCFResult`) with
 the converged density, Fock matrix, energy, and full iteration history.
@@ -63,6 +65,18 @@ from .superlattice import (  # noqa: F401
     make_superlattice_build_fock_fn,
 )
 
+
+def __getattr__(name):
+    # Stability/minimum orchestration imports SciPy only when requested, and
+    # does not allocate JAX arrays or initialize devices during package import.
+    if name in ("StabilityResult", "stability_analysis"):
+        from . import stability
+        return getattr(stability, name)
+    if name in ("MinimumResult", "solve_minimum"):
+        from . import minima
+        return getattr(minima, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 __all__ = [
     # Kernel (problem definition + precomputed arrays)
     "HartreeFockKernel",
@@ -75,6 +89,10 @@ __all__ = [
     "SCFConfig",
     "SCFResult",
     "solve_scf",
+    "StabilityResult",
+    "stability_analysis",
+    "MinimumResult",
+    "solve_minimum",
     # HF objective building blocks
     "build_fock",
     "hf_energy",

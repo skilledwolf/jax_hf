@@ -7,6 +7,8 @@ Roothaan iteration with selectable acceleration:
   4. Update the density via ``acceleration``:
        - "linear": P <- (1 - mixing) P + mixing P_new
        - "diis":   Pulay commutator-DIIS extrapolation of the Fock
+       - "rdiis":  safeguarded full-density-residual Fock extrapolation
+       - "anderson": safeguarded full-density-residual density extrapolation
        - "oda":    optimal damping (energy line search at T=0, free-energy
                    backtracking at finite T)
      optionally clipped to a ``trust_radius`` step.
@@ -58,6 +60,10 @@ class SCFConfig:
     # iteration to unphysical states (e.g. ungated Coulomb at high doping).
     trust_radius: float = 0.0
     project_fn: Callable[[Any], Any] | None = None
+    # RDIIS/Anderson: accept finite-temperature free-energy descent, with
+    # residual improvement permitted within floating-point objective noise.
+    # Appended to preserve the existing positional configuration prefix.
+    safeguard: bool = True
 
     def __post_init__(self) -> None:
         for name in ("density_tol", "comm_tol", "mixing", "level_shift",
@@ -70,9 +76,10 @@ class SCFConfig:
                 raise ValueError(f"{name} must be an integer")
         if self.max_iter <= 0:
             raise ValueError("max_iter must be positive")
-        if self.acceleration not in ("linear", "diis", "oda"):
+        if self.acceleration not in ("linear", "diis", "oda", "rdiis", "anderson"):
             raise ValueError(
-                "SCFConfig.acceleration must be 'linear', 'diis', or 'oda'; "
+                "SCFConfig.acceleration must be 'linear', 'diis', 'oda', "
+                "'rdiis', or 'anderson'; "
                 f"got {self.acceleration!r}"
             )
         if self.diis_size <= 0:
@@ -91,6 +98,8 @@ class SCFConfig:
             raise ValueError("trust_radius must be non-negative")
         if self.project_fn is not None and not callable(self.project_fn):
             raise ValueError("project_fn must be callable or None")
+        if not isinstance(self.safeguard, bool):
+            raise ValueError("safeguard must be a bool")
 
 
 @dataclass(frozen=True)
@@ -176,7 +185,8 @@ def solve_scf(
     n_electrons
         Target electron count.
     config
-        :class:`SCFConfig`.  ``acceleration`` selects linear / diis / oda;
+        :class:`SCFConfig`.  ``acceleration`` selects linear / diis / oda /
+        rdiis / anderson;
         ``diis_size``, ``diis_start``, ``diis_damping`` tune DIIS; ``trust_radius``
         clips the per-iteration density step.  Defaults to ``SCFConfig()``.
     fock_build_fn
@@ -185,6 +195,20 @@ def solve_scf(
         :func:`jax_hf.fock.build_fock`'s call site.  ``None`` uses the default
         k-space FFT exchange.  Captured at trace time, so the JIT'd inner loop
         stays fully XLA-native.
+
+    Notes
+    -----
+    ``rdiis`` fits the full fixed-particle Fermi-density residual and
+    extrapolates Focks; ``anderson`` extrapolates densities. Both repair
+    occupation bounds and particle count, and safeguard the actual
+    finite-temperature free energy. ``mixing`` controls Anderson's base
+    update; RDIIS uses ``diis_damping`` for its Fock extrapolation instead.
+    Their convergence residual is always the unshifted Fermi map;
+    ``level_shift`` only modifies an RDIIS proposal. Custom Fock builders
+    must be affine and variational, matching ``hf_energy``. A symmetry
+    ``project_fn`` must be a linear, orthogonal, trace- and positivity-
+    preserving projection onto a matrix algebra, as for group averaging.
+    These are fixed-point solvers and do not certify a local minimum.
 
     Returns
     -------
@@ -210,8 +234,16 @@ def solve_scf(
     )
     validate_temperature(kernel.T, context="kernel.T")
 
-    density, fock, energy, mu, iterations, converged, \
-        hist_E, hist_free, hist_density, hist_comm = _run_scf(
+    run_scf = _run_scf
+    extra_args = {}
+    if config.acceleration in ("rdiis", "anderson"):
+        from .scf_acceleration import _run_accelerated_scf
+        if not bool(jnp.all(jnp.isfinite(P0_arr))):
+            raise ValueError("P0 must contain only finite values")
+        run_scf = _run_accelerated_scf
+        extra_args["safeguard"] = config.safeguard
+
+    run_result = run_scf(
             jnp.asarray(P0_arr, dtype=h.dtype),
             h=h, weights_b=args["weights_b"], weight_sum=args["weight_sum"],
             VR=args["VR"], T=args["T"], refP=args["refP"], HH=args["HH"],
@@ -234,7 +266,15 @@ def solve_scf(
             diis_size=int(config.diis_size),
             project_fn=config.project_fn,
             fock_build_fn=fock_build_fn if fock_build_fn is not None else build_fock,
+            **extra_args,
         )
+
+    density, fock, energy, mu, iterations, converged, \
+        hist_E, hist_free, hist_density, hist_comm = run_result[:10]
+    diagnostics = {}
+    if len(run_result) > 10:
+        diagnostics = {"fock_builds": int(run_result[10]),
+                       "line_search_rejections": int(run_result[11])}
 
     n_iter = int(iterations)
     is_converged = bool(converged)
@@ -258,6 +298,7 @@ def solve_scf(
             "free_energy": hist_free[:n_iter],
             "density_residual": hist_density[:n_iter],
             "commutator_residual": hist_comm[:n_iter],
+            **diagnostics,
         },
     )
 

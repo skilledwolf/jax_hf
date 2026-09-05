@@ -17,9 +17,9 @@ minimisation problem on 2D k-meshes:
   back to damped fixed-point steps near occupation degeneracies.
   **Deflation** (`solve_deflated`) finds *distinct* self-consistent
   solutions on non-convex landscapes.
-* **Reference SCF** (baseline / fallback): standard Roothaan iteration
-  with linear mixing, **Pulay DIIS**, or **ODA** (optimal damping)
-  acceleration, plus an optional `trust_radius` on the density step.
+* **Self-consistent field**: safeguarded full-density-residual **RDIIS** and
+  **Anderson**, alongside linear mixing, commutator DIIS and ODA.
+  `solve_minimum` adds local stability checks and bounded saddle recovery.
 
 Exchange and Hartree can both be included, and the exchange kernel may
 be layer-resolved.  See `examples/` for density-scan scripts on a
@@ -33,7 +33,7 @@ bilayer graphene model.
 ### Install
 
 Python 3.11 or newer is required. The supported runtime dependency floors are
-JAX 0.5.3 and NumPy 1.26; CI tests that minimum combination on Python 3.11
+JAX 0.5.3, NumPy 1.26 and SciPy 1.12; CI tests the JAX/NumPy minimum combination on Python 3.11
 and current dependency releases on Python 3.11–3.14.
 
 ```bash
@@ -75,7 +75,7 @@ Both solvers take a Config dataclass with sensible defaults:
 
 ```python
 jax_hf.SolverConfig(max_iter=200, tol_E=1e-7, optimizer="cg")   # or optimizer="newton"
-jax_hf.SCFConfig(max_iter=200, mixing=0.3, acceleration="linear")  # or "diis" / "oda"
+jax_hf.SCFConfig(max_iter=200, acceleration="rdiis", diis_size=8)
 ```
 
 `project_fn` lets you enforce symmetry constraints (spin, valley, time
@@ -96,9 +96,35 @@ r = solve(kernel, P0, N, config=SolverConfig(optimizer="newton", tol_grad=1e-6))
 res = solve_deflated(kernel, P0, N, n_solutions=4)
 print(res.energies, res.best.energy)
 
-# SCF with Pulay DIIS (typically ~10x fewer iterations than linear mixing):
-r = solve_scf(kernel, P0, N, config=SCFConfig(acceleration="diis"))
+# Safeguarded full-residual DIIS includes the occupation residual.
+r = solve_scf(kernel, P0, N, config=SCFConfig(acceleration="rdiis", diis_size=8))
+print(r.history["fock_builds"])
 ```
+
+Enable double precision **before constructing the kernel** for tight Newton or
+stability tolerances:
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)
+# Construct a float64/complex128 kernel, then:
+minimum = jax_hf.solve_minimum(kernel, P0, N)
+print(minimum.converged, minimum.solution.energy, minimum.escapes)
+```
+
+Small fixed-point residuals do not rule out saddles. `solve_minimum` checks
+curvature in the supplied basis and accepts only feasible, free-energy-lowering
+escape steps. Distinct stable phases still require multiple seeds or
+continuation and comparison of their **free energies**. The standalone diagnostic
+is `jax_hf.stability_analysis(kernel, P, N)`. These outer routines use NumPy/SciPy
+host orchestration with JAX Fock kernels; they are not themselves JIT-compatible.
+They support affine, variational, JAX-differentiable `fock_build_fn` callbacks.
+
+RDIIS/Anderson remain JAX-native and preserve custom Fock support. Their history
+stores two density-sized arrays per history slot, plus working buffers; choose
+the history size with the problem's memory cost in mind. Existing CG and linear
+SCF defaults remain unchanged. The [port validation note](notes/solver_study_port_2026-09-05.md)
+documents the kernel/Newton corrections, parity checks, and scope.
 
 ### Public API
 
@@ -107,7 +133,9 @@ r = solve_scf(kernel, P0, N, config=SCFConfig(acceleration="diis"))
 | `HartreeFockKernel` | Problem + precomputed arrays |
 | `solve` (alias `solve_direct_minimization`), `SolverConfig`, `SolveResult` | Primary solver (CG + trust-region Newton) |
 | `solve_deflated`, `DeflatedResult` | Find distinct HF solutions (deflated Newton) |
-| `solve_scf`, `SCFConfig`, `SCFResult` | Reference SCF solver (linear / DIIS / ODA) |
+| `solve_scf`, `SCFConfig`, `SCFResult` | SCF (RDIIS / Anderson / linear / DIIS / ODA) |
+| `solve_minimum`, `MinimumResult` | Local stability checks and bounded saddle recovery |
+| `stability_analysis`, `StabilityResult` | Fixed-particle finite-temperature density Hessian diagnostic |
 | `build_fock`, `hf_energy`, `free_energy`, `occupation_entropy` | HF objective building blocks |
 | `solve_continuation`, `ContinuationResult`, `resample_kgrid` | Coarse → fine multigrid driver + k-grid resampler |
 
