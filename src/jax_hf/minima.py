@@ -114,7 +114,13 @@ def solve_minimum(kernel, P0, n_electrons, *, config=None, max_escapes=4,
         local_builds = result.history.get('fock_builds', -1)
         if builds >= 0:
             builds = builds + int(local_builds) if local_builds >= 0 else -1
-        omega = float(result.history['free_energy'][-1])
+        # Legacy SCF histories can stop before the final density/Fock rebuild.
+        # Compare every escape against the actual returned state's free energy,
+        # using the same spectral entropy as the accepted finite-step trials.
+        p = np.clip(np.linalg.eigvalsh(np.asarray(result.density_matrix)), 0., 1.)
+        omega = float(result.energy) + kernel.T*np.sum(
+            w[..., None]*(xlogy(p, p)+xlogy(1-p, 1-p)))
+        omega = float(omega)
         energies.append(omega)
         # A saddle can stall just above a tight requested residual. A nearby
         # Fermi-response Hessian can still propose an escape direction; actual

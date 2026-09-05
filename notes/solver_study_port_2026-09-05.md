@@ -19,6 +19,15 @@ Affine, variational, JAX-differentiable custom Fock builders are supported throu
 SCF, exact JVP response, and finite-step energy evaluation. The full stability and
 minimum drivers are not JIT-compatible.
 
+Saddle recovery first uses the fixed-particle Fermi map of a perturbed Fock
+field, `P_FD(F + alpha L(dP)/(1-lambda))`, for an unstable density eigenmode.
+Its derivative at stationarity is `dP`, including the chemical-potential
+response, and re-occupation respects saturated spectral bounds. Projected
+density perturbations remain a fallback when the Fermi trials do not resolve
+descent. The baseline and trial free energies use their actual returned
+densities and electronic energies, independently of possibly stale legacy SCF
+histories. Every retained trial is judged at the kernel's precision.
+
 The kernel now removes the skew-adjoint part of the FFT exchange multiplier.
 Radial sampling on an even oblique grid need not obey periodic inversion; the
 old Fock could therefore differ from the derivative of the reported quadratic
@@ -36,8 +45,11 @@ The legacy CG implementation and JIT configuration were kept unchanged.
 
 ## Validation and scope
 
-**211 core tests passed** in the actual sibling checkout, including the new
-regressions. The optional saved bilayer fixture is reported separately below.
+**214 core tests passed** in the actual sibling checkout after the Fermi
+retraction change, including the new regressions. The only warning was a
+sandbox restriction on pytest's cache write. The follow-up stale-history
+baseline correction passed 20 focused minima/stability tests. The optional
+saved bilayer fixture is reported separately below.
 
 The independent eight-case [C++ comparison](solver_study_parity_2026-09-05.jsonl)
 uses four complex, coupled Hartree/exchange/reference-subtracted kernels and two
@@ -50,6 +62,9 @@ New regressions cover transported Hessian finite differences and adjointness,
 full deflation, custom Fock response, occupation feasibility and saturation,
 fixed-particle response at degeneracy, kernel reciprocity/energy preservation,
 false stability certificates, failed eigensolves, and bounded saddle recovery.
+Saturated coupled-band finite differences check the Fermi retraction's tangent
+and true free-energy curvature, and a stale legacy-history regression prevents
+unchanged trials from being mistaken for descent.
 The optional saved bilayer reference still predates the corrected energy
 convention; its pre-existing mismatch is tracked in TASKS.md and its fixture was
 not rewritten as part of this port.

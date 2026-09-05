@@ -200,3 +200,35 @@ def test_projected_density_fallback_remains_available_when_fermi_trials_stall(mo
     assert len(fermi_calls) == 12
     assert result.converged and result.stability.stable and result.escapes == 1
     assert np.all(np.diff(result.free_energies) < 0)
+
+
+def test_stale_legacy_history_cannot_make_an_unchanged_trial_look_like_descent(monkeypatch):
+    from dataclasses import replace
+    from scipy.special import xlogy
+    import jax_hf.minima as module
+    kernel = saddle_kernel()
+    P = np.eye(2)[None, None]/2
+    actual_solve = module.solve_scf
+    local_results = []
+    def stale_history_solve(*args, **kwargs):
+        result = actual_solve(*args, **kwargs)
+        history = dict(result.history)
+        history["free_energy"] = np.asarray(history["free_energy"])+1.
+        result = replace(result, history=history)
+        local_results.append(result)
+        return result
+    monkeypatch.setattr(module, "solve_scf", stale_history_solve)
+    # The saddle diagnosis is real. Neither escape construction resolves any
+    # motion, so neither may pass the actual finite-step descent safeguard.
+    monkeypatch.setattr(module, "_fermi_escape_density", lambda *args, **kwargs: P.copy())
+    monkeypatch.setattr(module, "_feasible_density", lambda *args, **kwargs: P.copy())
+    result = solve_minimum(kernel, P, 1., config=SCFConfig(acceleration="diis"))
+    assert len(local_results) == 1
+    assert result.solution.converged and result.stability.stable is False
+    assert not result.converged and result.escapes == 0
+    assert "no finite feasible descent" in result.message
+    p = np.linalg.eigvalsh(P)
+    actual_omega = float(result.solution.energy)+kernel.T*np.sum(
+        np.asarray(kernel.w2d)[..., None]*(xlogy(p, p)+xlogy(1-p, 1-p)))
+    np.testing.assert_allclose(result.free_energies, [actual_omega], atol=1e-14)
+    assert abs(float(result.solution.history["free_energy"][-1])-actual_omega) > .9
