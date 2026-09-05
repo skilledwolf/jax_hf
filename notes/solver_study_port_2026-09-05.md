@@ -45,11 +45,10 @@ The legacy CG implementation and JIT configuration were kept unchanged.
 
 ## Validation and scope
 
-**214 core tests passed** in the actual sibling checkout after the Fermi
-retraction change, including the new regressions. The only warning was a
-sandbox restriction on pytest's cache write. The follow-up stale-history
-baseline correction passed 20 focused minima/stability tests. The optional
-saved bilayer fixture is reported separately below.
+**215 core tests passed in 87.63 seconds** in the final actual-checkout run,
+including both the Fermi retraction and actual-state free-energy baseline
+correction. Pytest's cache provider was disabled, and the run had no warnings.
+The optional saved bilayer fixture is reported separately below.
 
 The independent eight-case [C++ comparison](solver_study_parity_2026-09-05.jsonl)
 uses four complex, coupled Hartree/exchange/reference-subtracted kernels and two
