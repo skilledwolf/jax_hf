@@ -171,3 +171,31 @@ class TestSCFConfigValidation:
         np.testing.assert_array_equal(
             np.asarray(result.density_matrix[0, 0]), expected,
         )
+
+
+@pytest.mark.parametrize("level_shift,expected_solves", [(0.0, 1), (0.2, 2)])
+def test_density_from_fock_only_resolves_mu_for_nonzero_shift(
+    monkeypatch, level_shift, expected_solves,
+):
+    import jax
+    import jax_hf.reference_scf as scf
+
+    calls = []
+    original = scf.find_chemical_potential
+
+    def counted_solve(*args, **kwargs):
+        # Count actual executions inside JIT branches, not tracing calls.
+        jax.debug.callback(lambda: calls.append(1), ordered=True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(scf, "find_chemical_potential", counted_solve)
+    fock = jnp.diag(jnp.array([-.3, .4]))[None, None].astype(jnp.complex64)
+    evaluate = jax.jit(lambda shift: scf._density_from_fock(
+        fock, weights=jnp.ones((1, 1)), n_electrons=1.0,
+        temperature=.2, level_shift=shift,
+    ))
+    density, _ = evaluate(jnp.asarray(level_shift))
+    density.block_until_ready()
+    jax.effects_barrier()
+    assert len(calls) == expected_solves
+    np.testing.assert_allclose(jnp.trace(density[0, 0]), 1.0, atol=1e-6)

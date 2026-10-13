@@ -187,3 +187,27 @@ def test_complex_coupled_problem_damping_trust_and_precision(method, dtype):
     assert p.min() >= -tol and p.max() <= 1 + tol
     np.testing.assert_allclose(np.sum(np.asarray(kernel.w2d)[..., None] * p), 1.6, atol=tol)
     assert np.max(np.abs(np.asarray(result.density_matrix).imag)) > .01
+
+
+@pytest.mark.parametrize("method", ["linear", "diis", "oda"])
+def test_legacy_scf_returns_the_density_whose_residual_was_certified(method):
+    # This Fermi map amplifies density errors by 500.  A final undamped step
+    # would move a certified state outside the requested tolerance.
+    h = np.zeros((1, 1, 2, 2), dtype=complex)
+    kernel = HartreeFockKernel(
+        np.ones((1, 1)), h, np.zeros((1, 1, 1, 1)), T=.5,
+        include_hartree=True, include_exchange=False,
+        reference_density=h, hartree_matrix=1000.0 * np.eye(2),
+    )
+    initial = np.diag([.5 + 1e-10, .5 - 1e-10]).astype(complex)[None, None]
+    tolerance = 1e-7
+    result = solve_scf(kernel, initial, 1.0, config=SCFConfig(
+        acceleration=method, max_iter=1,
+        density_tol=tolerance, comm_tol=tolerance,
+    ))
+    assert result.converged
+    F, E, dr, cr = independent_state(kernel, result.density_matrix, 1.0)
+    assert max(dr, cr) <= tolerance
+    np.testing.assert_allclose(result.fock_matrix, F, atol=1e-12)
+    np.testing.assert_allclose(result.energy, E, atol=1e-12)
+    np.testing.assert_allclose(result.history["density_residual"][-1], dr, atol=1e-12)

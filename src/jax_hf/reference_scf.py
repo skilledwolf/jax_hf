@@ -128,9 +128,18 @@ def _density_from_fock(fock, *, weights, n_electrons, temperature, level_shift):
     eigenvalues, orbitals = jnp.linalg.eigh(_herm(fock))
     mu_raw = find_chemical_potential(eigenvalues, weights, n_electrons, temperature)
     occ_raw = fermidirac(eigenvalues - mu_raw, temperature)
-    shifted = eigenvalues + level_shift * (1.0 - occ_raw)
-    mu = find_chemical_potential(shifted, weights, n_electrons, temperature)
-    occupations = fermidirac(shifted - mu, temperature)
+    level_shift = jnp.asarray(level_shift, dtype=eigenvalues.dtype)
+
+    def shifted_occupations(_):
+        shifted = eigenvalues + level_shift * (1.0 - occ_raw)
+        mu = find_chemical_potential(shifted, weights, n_electrons, temperature)
+        return fermidirac(shifted - mu, temperature), mu
+
+    # Level shifts are dynamic JIT inputs.  Reuse the occupations at zero
+    # shift without executing a second chemical-potential solve.
+    occupations, mu = jax.lax.cond(
+        level_shift == 0.0, lambda _: (occ_raw, mu_raw), shifted_occupations, None,
+    )
     density = jnp.einsum("...in,...n,...jn->...ij", orbitals, occupations, jnp.conj(orbitals))
     return _herm(density), mu
 
@@ -242,6 +251,15 @@ def solve_scf(
             raise ValueError("P0 must contain only finite values")
         run_scf = _run_accelerated_scf
         extra_args["safeguard"] = config.safeguard
+
+    # At either exact filling endpoint the physical density is known.  Seed
+    # it directly so mixing cannot leave a one-ULP particle deficit in a
+    # state whose fixed-point residual already passes the stopping tolerance.
+    capacity = float(kernel.weight_sum) * h.shape[-1]
+    if n_electrons <= 0.0:
+        P0_arr = jnp.zeros_like(h)
+    elif n_electrons >= capacity:
+        P0_arr = jnp.broadcast_to(jnp.eye(h.shape[-1], dtype=h.dtype), h.shape)
 
     run_result = run_scf(
             jnp.asarray(P0_arr, dtype=h.dtype),
@@ -454,7 +472,9 @@ def _run_scf(
             _project(density + scale.astype(h.dtype) * step), dtype=h.dtype))
         updated = jnp.where(do_clip, clipped, updated)
 
-        density_out = jnp.where(converged, P_new, updated)
+        # The residual above certifies density.  An undamped Fermi-map step
+        # can amplify its error and invalidate that convergence certificate.
+        density_out = jnp.where(converged, density, updated)
 
         hE = hE.at[k].set(E)
         hO = hO.at[k].set(Omega)
