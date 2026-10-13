@@ -211,6 +211,7 @@ def make_project_fn(
     G = None if unitary_group is None else jnp.asarray(unitary_group)
     S = None if spatial_group is None else jnp.asarray(spatial_group)
     U = None if time_reversal_U is None else jnp.asarray(time_reversal_U)
+    requires_complex = any(jnp.iscomplexobj(op) for op in (G, S, U) if op is not None)
     s_k_conv = str(spatial_k_convention)
     s_k_axes = tuple(spatial_k_flip_axes)
     t_k_conv = str(time_reversal_k_convention)
@@ -254,7 +255,9 @@ def make_project_fn(
         t_idx_i = t_idx_j = t_valid = None
 
     def project(A: jax.Array) -> jax.Array:
-        out = A
+        out = jnp.asarray(A)
+        if requires_complex and not jnp.iscomplexobj(out):
+            out = out.astype(jnp.result_type(out.dtype, jnp.complex64))
         if s_idx_i is not None:
             avg = _avg_spatial_group_via_k_maps(out, S, s_idx_i, s_idx_j)
             if s_orbit_mask is not None:

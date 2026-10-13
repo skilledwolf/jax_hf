@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import jax
 import jax.numpy as jnp
@@ -366,3 +367,33 @@ def test_time_reversal_k_index_map_path_with_invalid_mask():
     # (1,2) was averaged with conj(A[(-1) % nk, (-2) % nk]) = conj(A[3, 2])
     expected = 0.5 * (A[1, 2] + np.conj(A[3, 2]))
     np.testing.assert_allclose(out[1, 2], expected, atol=1e-12)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+@pytest.mark.parametrize("gemm_threshold", [0, 24])
+@pytest.mark.parametrize("kind", ["unitary", "spatial", "spatial_map", "time_reversal", "time_reversal_map"])
+def test_complex_symmetry_promotes_real_density_without_losing_operator(
+    dtype, gemm_threshold, kind, monkeypatch,
+):
+    with jax.experimental.enable_x64(dtype == jnp.float64):
+        import jax_hf.symmetry as module
+        monkeypatch.setattr(module, "_GEMM_MAX_NB", gemm_threshold, raising=False)
+        sigma_y = np.array([[0.0, -1j], [1j, 0.0]])
+        unitary = (np.diag([1.0, -1.0]) + sigma_y) / np.sqrt(2.0)
+        group = jnp.asarray([np.eye(2), unitary])
+        index = jnp.zeros((1, 1), dtype=jnp.int32)
+        kwargs = {
+            "unitary": dict(unitary_group=group),
+            "spatial": dict(spatial_group=group[1:]),
+            "spatial_map": dict(spatial_group=group, spatial_k_index_maps=(
+                jnp.stack([index, index]), jnp.stack([index, index]))),
+            "time_reversal": dict(time_reversal_U=jnp.asarray(sigma_y)),
+            "time_reversal_map": dict(time_reversal_U=jnp.asarray(sigma_y),
+                time_reversal_k_index_map=(index, index, jnp.ones((1, 1), dtype=bool))),
+        }[kind]
+        density = jnp.diag(jnp.asarray([0.7, 0.3], dtype=dtype))[None, None]
+        op = sigma_y if kind.startswith("time_reversal") else unitary
+        expected = 0.5 * (np.asarray(density) + op @ np.asarray(density) @ op.conj().T)
+        projected = jax.jit(make_project_fn(**kwargs))(density)
+        np.testing.assert_allclose(projected, expected, atol=1e-7, rtol=0.0)
+        assert projected.dtype == jnp.result_type(dtype, jnp.complex64)
