@@ -125,30 +125,42 @@ def test_embedding_no_op_when_refP_zero(with_hartree):
     assert float(kernel.embedded_energy_offset) == 0.0
 
 
-def test_embedded_energy_offset_is_correct():
-    kernel_embed = _make_kernels(
-        embed=True, with_hartree=True, refP_arg=None,
-        center_embedded_hartree=False,
+@pytest.mark.parametrize("center", [False, True])
+@pytest.mark.parametrize("density_scale", [0.6, 1.4])
+def test_embedded_energy_correction_uses_the_current_particle_count(center, density_scale):
+    weights, h, Vq, HH, T, refP = _setup(nk=2)
+    weights *= .3  # The gauge correction uses physical, unnormalized counts.
+    common = dict(weights=weights, hamiltonian=h, coulomb_q=Vq, T=T,
+                  include_hartree=True, hartree_matrix=HH)
+    embedded = HartreeFockKernel(
+        **common, reference_density=refP, embed_reference_potential=True,
+        center_embedded_hartree=center,
     )
-    kernel_plain = _make_kernels(
-        embed=False, with_hartree=True, refP_arg=None,
+    standard = HartreeFockKernel(**common, reference_density=np.zeros_like(refP))
+    P = density_scale * refP
+
+    def evaluate(kernel, density):
+        Sigma, H, F = _build_F(kernel, density)
+        E = hf_energy(jnp.asarray(density), h=kernel.h, Sigma=jnp.asarray(Sigma),
+                      H=jnp.asarray(H), weights_b=kernel.weights_b, refP=kernel.refP)
+        return F, float(E)
+
+    F_standard, E_standard = evaluate(standard, P)
+    F_embedded, E_embedded = evaluate(embedded, P)
+    count = float(np.einsum("ij,ijaa->", weights, P).real)
+    corrected = (E_embedded - embedded.embedded_energy_offset
+                 + embedded.embedded_hartree_shift * count)
+    np.testing.assert_allclose(corrected, E_standard, atol=1e-6)
+    np.testing.assert_allclose(
+        F_embedded + embedded.embedded_hartree_shift * np.eye(h.shape[-1]),
+        F_standard, atol=1e-6,
     )
-    refP = np.asarray(kernel_plain.refP)
-    Sigma_p, H_p, _ = _build_F(kernel_plain, refP)
-    Sigma_e, H_e, _ = _build_F(kernel_embed, refP)
-    E_plain = float(hf_energy(jnp.asarray(refP), h=kernel_plain.h,
-                              Sigma=jnp.asarray(Sigma_p),
-                              H=jnp.asarray(H_p),
-                              weights_b=kernel_plain.weights_b,
-                              refP=kernel_plain.refP))
-    E_embed = float(hf_energy(jnp.asarray(refP), h=kernel_embed.h,
-                              Sigma=jnp.asarray(Sigma_e),
-                              H=jnp.asarray(H_e),
-                              weights_b=kernel_embed.weights_b,
-                              refP=kernel_embed.refP))
-    delta = E_embed - E_plain
-    expected = 2.0 * float(kernel_embed.embedded_energy_offset)
-    np.testing.assert_allclose(delta, expected, atol=1e-5, rtol=1e-6)
+    Sigma_ref, H_ref, _ = _build_F(standard, refP)
+    expected_offset = .5 * np.einsum(
+        "ij,ijab,ijba->", weights, Sigma_ref + H_ref, refP,
+    ).real
+    np.testing.assert_allclose(embedded.embedded_energy_offset, expected_offset, atol=1e-6)
+    assert (embedded.embedded_hartree_shift != 0.0) == center
 
 
 def test_embedding_includes_contact_reference_potential_and_offset():

@@ -57,9 +57,14 @@ class HartreeFockKernel:
             ``F = h + V_HF[P]`` — i.e. the standard HF Fock matrix.
             Without this flag, the kernel solves a *modified* HF problem
             whose minimum differs from standard HF by the reference
-            potential.  Reported energy then equals
-            ``E_std + ½ Tr[V_HF[refP] · refP]`` (see
-            ``embedded_energy_offset``).
+            potential.  Recover standard HF energy using
+            ``E_standard = E_reported - embedded_energy_offset
+            + embedded_hartree_shift * n_electrons``.  The offset is the
+            uncentered ``½ Tr[V_HF[refP] · refP]``; the shift is the removed
+            Hartree mean, or zero without centering.  Here ``n_electrons``
+            is ``sum_k weights[k] Tr[P[k]]``, not divided by weight_sum.
+            Similarly, ``mu_standard = mu_reported + embedded_hartree_shift``.
+            Phase energy differences at fixed particle number are unaffected.
         center_embedded_hartree : bool, default True
             When ``embed_reference_potential`` is True, subtract the
             orbital-uniform mean of ``J[refP]`` from ``h_eff``.  This
@@ -187,6 +192,7 @@ class HartreeFockKernel:
         self.embed_reference_potential = bool(embed_reference_potential)
         self.center_embedded_hartree = bool(center_embedded_hartree)
         self.embedded_energy_offset = 0.0
+        self.embedded_hartree_shift = 0.0
         if self.embed_reference_potential:
             if reference_density is None:
                 raise ValueError(
@@ -200,9 +206,12 @@ class HartreeFockKernel:
             if self.include_hartree:
                 diag_R = jnp.einsum("ij,ijaa->a", w2d, ref).real
                 J_ref_diag = self.HH @ diag_R
-                if self.center_embedded_hartree:
-                    J_ref_diag = J_ref_diag - jnp.mean(J_ref_diag)
+                # The constant offset uses the uncentered potential;
+                # centering separately subtracts c*N(P) from reported energy.
                 const_J_refP_refP = float(jnp.sum(J_ref_diag * diag_R))
+                if self.center_embedded_hartree:
+                    self.embedded_hartree_shift = float(jnp.mean(J_ref_diag))
+                    J_ref_diag = J_ref_diag - self.embedded_hartree_shift
             const_Sigma_refP_refP = 0.0
             Sigma_ref = None
             if self.include_exchange:
