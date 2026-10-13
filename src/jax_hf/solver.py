@@ -31,7 +31,9 @@ import jax.numpy as jnp
 from jax import lax
 
 from .fock import build_fock, hf_energy, free_energy
-from .utils import validate_electron_count, validate_temperature
+from .utils import (
+    _chemical_potential_bounds, validate_electron_count, validate_temperature,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +51,28 @@ def _skew_hermitian(A: jax.Array) -> jax.Array:
 def _density_from_Qp(Q: jax.Array, p: jax.Array) -> jax.Array:
     """P = Q diag(p) Q†."""
     return jnp.einsum("...in,...n,...jn->...ij", Q, p, jnp.conj(Q))
+
+
+def _project_density_eigensystem(Q, p, project_fn):
+    """Project a density and keep its orbital/occupation representation consistent.
+
+    Symmetry projection can change a trial's spectrum, especially when a
+    degenerate density has an arbitrary orbital basis. Only re-diagonalize
+    when that change exceeds roundoff; entropy must use the projected spectrum.
+    """
+    raw = _density_from_Qp(Q, p)
+    if project_fn is None:
+        return _herm(raw), Q, p, jnp.bool_(False)
+    P = _herm(jnp.asarray(project_fn(raw), dtype=Q.dtype))
+    roundoff = (64.0 * jnp.finfo(p.dtype).eps) * jnp.max(jnp.abs(raw))
+    changed = jnp.max(jnp.abs(P - raw)) > roundoff
+
+    def repair(_):
+        p_new, Q_new = jnp.linalg.eigh(P)
+        return Q_new.astype(Q.dtype), p_new.astype(p.dtype)
+
+    Q, p = lax.cond(changed, repair, lambda _: (Q, p), operand=None)
+    return P, Q, p, changed
 
 
 def _fock_in_orbital_basis(Q: jax.Array, F: jax.Array) -> jax.Array:
@@ -99,35 +123,30 @@ def _solve_mu(
 
     Safeguarded Newton iteration on a shrinking bracket.  ``maxiter`` is an
     upper bound: the loop stops as soon as the particle count matches to a few
-    ULPs of the capacity or the update stops moving ``mu`` at the working
+    ULPs of the occupied or empty fraction, or stops moving ``mu`` at the working
     precision, which from a warm start takes a handful of steps rather than
     the full budget.
     """
     real_dtype = eps.dtype
     Tj = jnp.maximum(jnp.asarray(T, dtype=real_dtype), jnp.asarray(1e-12, dtype=real_dtype))
 
-    e_min, e_max = jnp.min(eps), jnp.max(eps)
-    lo = e_min - 50.0 * Tj
-    hi = e_max + 50.0 * Tj
-    mu = jnp.clip(jnp.asarray(mu0, dtype=real_dtype), lo, hi)
     w_b = w_norm[..., None]
     capacity = jnp.sum(w_norm) * jnp.asarray(eps.shape[-1], dtype=real_dtype)
+    lo, hi = _chemical_potential_bounds(eps, capacity, n_target_norm, Tj)
+    mu = jnp.clip(jnp.asarray(mu0, dtype=real_dtype), lo, hi)
     eps_m = jnp.asarray(jnp.finfo(real_dtype).eps, dtype=real_dtype)
     # Resolve the count to the precision of the *occupied* (or empty) fraction,
     # not of the total capacity: at low filling the callers' occupations carry
     # the target count, and a capacity-scaled tolerance would leave a relative
     # particle error of order capacity/n_target.
     occ_scale = jnp.minimum(n_target_norm, capacity - n_target_norm)
-    count_tol = 4.0 * eps_m * jnp.maximum(occ_scale, eps_m * capacity)
-    step_tol = 4.0 * eps_m * jnp.maximum(
-        jnp.maximum(jnp.abs(e_min), jnp.abs(e_max)), Tj,
-    )
+    count_tol = 4.0 * eps_m * occ_scale
 
     def cond(state):
         i, _mu, _lo, _hi, g_prev, step_prev = state
         return jnp.logical_and(
             i < maxiter,
-            jnp.logical_and(jnp.abs(g_prev) > count_tol, step_prev > step_tol),
+            jnp.logical_and(jnp.abs(g_prev) > count_tol, step_prev > 0.0),
         )
 
     def body(state):
@@ -141,9 +160,9 @@ def _solve_mu(
         lo = jnp.where(g < 0, mu, lo)
         hi = jnp.where(g > 0, mu, hi)
 
-        Z_safe = jnp.maximum(Z, jnp.asarray(1e-18, dtype=real_dtype))
-        mu_new = mu - g / Z_safe
         mu_bis = 0.5 * (lo + hi)
+        Z_safe = jnp.where(Z > 0.0, Z, jnp.ones_like(Z))
+        mu_new = jnp.where(Z > 0.0, mu - g / Z_safe, mu_bis)
         # A Newton update that rounds back onto ``mu`` (which has just become
         # a bracket end) is a converged iterate, not an out-of-bracket step;
         # bisecting from it would throw the solution away.
@@ -551,8 +570,9 @@ class SolverConfig:
     deflation_sigma: float = 0.0
     deflation_length: float = 1.0
     block_sizes: tuple[int, ...] | None = None
-    # Newton requires a linear orthogonal, trace-preserving symmetry projection
-    # onto a matrix algebra; its density, Fock and response are all projected.
+    # Both optimizers require a linear orthogonal, trace-preserving symmetry
+    # projection onto a matrix algebra. Densities and Focks are projected,
+    # along with the Newton response.
     project_fn: Any = None
 
     def __post_init__(self) -> None:
@@ -708,7 +728,7 @@ def _solve_impl(
     # ---- Initialize (Q, p) from Fock at P0 ----
     # Build initial Fock matrix and diagonalize to get a good starting point.
     # This handles P0=0 gracefully (gives non-interacting ground state).
-    P0_h = _herm(jnp.asarray(P0, dtype=target_dtype))
+    P0_h = _herm(_project(jnp.asarray(P0, dtype=target_dtype)))
     Sigma0, H0, F0 = _fock_fn(
         P0_h, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
         include_exchange=include_exchange, include_hartree=include_hartree,
@@ -807,20 +827,16 @@ def _solve_impl(
          hE, hO, hG) = carry
 
         # ========== 1. Build Fock matrix (THE expensive step) ==========
-        # P_cur is already projected to the symmetric subspace above.  When
-        # h, V_q, and the contact terms are themselves symmetric (the only
-        # use case where project_fn makes physical sense), F[symmetric P]
-        # is automatically symmetric to FFT roundoff (verified ~5e-16 on
-        # the bilayer regression).  Skip the redundant inner projection of
-        # F to save one symmetry-group sweep per outer iter.
-        P_cur = _herm(_project(_density_from_Qp(Q, p)))
+        # The constrained gradient uses the projected full Fock, even when
+        # the bare Hamiltonian or interaction does not share the symmetry.
+        P_cur, Q, p, chart_changed = _project_density_eigensystem(Q, p, project_fn)
         Sigma, H_h, F = _fock_fn(
             P_cur, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
             include_exchange=include_exchange, include_hartree=include_hartree,
             exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
             contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
             exchange_block_specs=block_specs,
-            project_fn=None,
+            project_fn=project_fn,
         )
         E = hf_energy(
             P_cur, h=h, Sigma=Sigma, H=H_h, weights_b=weights_b, refP=refP,
@@ -878,7 +894,7 @@ def _solve_impl(
         beta = jnp.minimum(beta, 5.0)  # cap to prevent runaway
         # Reset to steepest descent on first step and every cg_restart steps
         beta = jnp.where(
-            jnp.logical_or(k == 0, k % cg_restart == 0),
+            jnp.logical_or(chart_changed, jnp.logical_or(k == 0, k % cg_restart == 0)),
             0.0, beta,
         )
 
@@ -897,9 +913,8 @@ def _solve_impl(
         # Spectral Cayley path: eigendecompose (i * d_Q) once and pre-rotate Ft
         # into the d_Q eigenbasis.  Each line-search trial then costs one
         # Hadamard scaling + one matmul (versus an LU solve + two matmuls in
-        # the LU-based Cayley).  The accepted U(tau_final) is reconstructed
-        # spectrally afterwards, and eps_new is read from the same spectral
-        # form so we never materialise U†FtU explicitly.
+        # the LU-based Cayley). Cache the accepted trial's (Q,p), including
+        # any eigensystem repair after symmetry projection.
         V_d, lam_d = _cayley_spectral_setup(d_Q)
         Ft_eig = jnp.conj(jnp.swapaxes(V_d, -2, -1)) @ Ft @ V_d
 
@@ -912,7 +927,9 @@ def _solve_impl(
             p_trial = _project_capped_occupations(
                 p - tau_val * d_p, w_norm, n_target_norm,
             )
-            P_trial = _herm(_project(_density_from_Qp(Q_trial, p_trial)))
+            P_trial, Q_trial, p_trial, recharted = _project_density_eigensystem(
+                Q_trial, p_trial, project_fn,
+            )
             Sigma_trial, H_trial, _ = _fock_fn(
                 P_trial, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
                 include_exchange=include_exchange, include_hartree=include_hartree,
@@ -924,41 +941,51 @@ def _solve_impl(
                 P_trial, h=h, Sigma=Sigma_trial, H=H_trial,
                 weights_b=weights_b, refP=refP,
             )
-            return free_energy(E_trial, p_trial, w2d, T_r)
+            return free_energy(E_trial, p_trial, w2d, T_r), Q_trial, p_trial, recharted
 
         def bt_cond(state):
-            i, tau, accepted, _Omega_trial = state
+            i, _tau, accepted, *_ = state
             return jnp.logical_and(i < bt_max, jnp.logical_not(accepted))
 
         def bt_body(state):
-            i, tau, _accepted, _Omega_trial = state
-            Omega_trial = trial_free_energy(tau)
+            i, tau, _accepted, *_ = state
+            Omega_trial, Q_trial, p_trial, recharted = trial_free_energy(tau)
             accepted = Omega_trial < Omega
             tau_next = jnp.where(accepted, tau, tau * bt_shrink_r)
-            return (i + 1, tau_next, accepted, Omega_trial)
+            return i + 1, tau_next, accepted, Omega_trial, Q_trial, p_trial, recharted
 
-        _, tau_final, bt_accepted, Omega_bt = lax.while_loop(
+        _, tau_final, bt_accepted, Omega_bt, Q_bt, p_bt, recharted = lax.while_loop(
             bt_cond, bt_body,
-            (jnp.int32(0), tau0, jnp.bool_(False), Omega),
+            (jnp.int32(0), tau0, jnp.bool_(False), Omega, Q, p, jnp.bool_(False)),
         )
-        # If no candidate descends, leave the state unchanged.  Taking an
-        # unchecked "tiny" step is exactly what allowed objective climbs.
+        recharted = jnp.logical_and(bt_accepted, recharted)
         tau_final = jnp.where(bt_accepted, tau_final, jnp.asarray(0.0, real_dtype))
-
-        # ========== 6. Retraction ==========
-        # Apply the same joint orbital/occupation step that the line search
-        # accepted.  Replacing it by a frozen-F Fermi re-occupation turns the
-        # occupation update into an SCF map and can oscillate while the orbital
-        # gradient remains identically zero.
-        U = _cayley_unitary_from_spectrum(V_d, lam_d, tau_final)
-        Q_new = Q @ U
-        # eps_new = diag(Q_new† F Q_new) = diag(U† Ft U) — read directly from
-        # the cached spectral form without an extra matmul triple-product.
-        eps_new = _diag_UFU_from_spectrum(V_d, Ft_eig, lam_d, tau_final).astype(real_dtype)
-        mu_new = _solve_mu(eps_new, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter)
-        p_new = _project_capped_occupations(
-            p - tau_final * d_p, w_norm, n_target_norm,
+        if project_fn is None:
+            # Retain the original unprojected retraction order: reusing trial
+            # arrays changes rounding enough to stall float32 convergence.
+            # The compiled line search need not carry unused trial orbitals.
+            U = _cayley_unitary_from_spectrum(V_d, lam_d, tau_final)
+            Q_new = Q @ U
+            p_new = _project_capped_occupations(
+                p - tau_final * d_p, w_norm, n_target_norm,
+            )
+        else:
+            # Projection may replace the eigensystem. Reuse the accepted one
+            # so its entropy and orbital chart remain consistent.
+            Q_new = jnp.where(bt_accepted, Q_bt, Q)
+            p_new = jnp.where(bt_accepted, p_bt, p)
+        # The spectral shortcut applies until projection changes the chart.
+        eps_new = lax.cond(
+            recharted,
+            lambda _: jnp.real(jnp.diagonal(
+                _fock_in_orbital_basis(Q_new, F), axis1=-2, axis2=-1,
+            )).astype(real_dtype),
+            lambda _: _diag_UFU_from_spectrum(
+                V_d, Ft_eig, lam_d, tau_final,
+            ).astype(real_dtype),
+            operand=None,
         )
+        mu_new = _solve_mu(eps_new, w_norm, n_target_norm, mu, T_r, maxiter=mu_maxiter)
 
         # When near-equal occupations hide a large full FD residual, the local
         # (Q,p) direction can make negligible progress.  Compare it with a
@@ -982,7 +1009,7 @@ def _solve_impl(
                 p_mix.astype(real_dtype), w_norm, n_target_norm,
             )
             Q_mix = Q_mix.astype(target_dtype)
-            P_mix = _herm(_project(_density_from_Qp(Q_mix, p_mix)))
+            P_mix, Q_mix, p_mix, repaired = _project_density_eigensystem(Q_mix, p_mix, project_fn)
             Sigma_mix, H_mix, _ = _fock_fn(
                 P_mix, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
                 include_exchange=include_exchange, include_hartree=include_hartree,
@@ -997,13 +1024,13 @@ def _solve_impl(
             O_mix = free_energy(E_mix, p_mix, w2d, T_r)
             accepted_fb = O_mix < Omega
             lam_next = jnp.where(accepted_fb, lam_fb, 0.5 * lam_fb)
-            return i + 1, lam_next, accepted_fb, Q_mix, p_mix, O_mix
+            return i + 1, lam_next, accepted_fb, Q_mix, p_mix, O_mix, repaired
 
         fb0 = (
             jnp.int32(0), jnp.asarray(1.0, real_dtype), jnp.bool_(False),
-            Q, p, Omega,
+            Q, p, Omega, jnp.bool_(False),
         )
-        _fbi, _fbl, fb_accepted, Q_fb, p_fb, Omega_fb = lax.while_loop(
+        _fbi, _fbl, fb_accepted, Q_fb, p_fb, Omega_fb, repaired_fb = lax.while_loop(
             fb_cond, fb_body, fb0,
         )
         use_fb = jnp.logical_and(fb_accepted, Omega_fb < Omega_direct)
@@ -1024,6 +1051,13 @@ def _solve_impl(
         hG = hG.at[k].set(grad_norm)
         dE = E_prev - Omega
 
+        # A material projection repair replaces the orbital chart; its CG
+        # history cannot be reused. Keep ordinary fallback behavior unchanged.
+        restart = jnp.where(use_fb, repaired_fb, recharted)
+        d_Q = jnp.where(restart, zeros_Q, d_Q)
+        d_p = jnp.where(restart, zeros_p, d_p)
+        G_Q = jnp.where(restart, zeros_Q, G_Q)
+        g_p = jnp.where(restart, zeros_p, g_p)
         return (k + 1, Q_new, p_new, mu_new, d_Q, d_p, G_Q, g_p, grad_norm,
                 Omega, dE, hE, hO, hG)
 
@@ -1035,14 +1069,14 @@ def _solve_impl(
     # A previous finalize diagonalized F[P] and re-occupied it, which is an
     # additional, unchecked SCF step rather than a gauge cleanup.  It could
     # materially change both density and energy after convergence.
-    P_fin = _herm(_project(_density_from_Qp(Q_fin, p_fin)))
+    P_fin, Q_fin, p_fin, _ = _project_density_eigensystem(Q_fin, p_fin, project_fn)
     Sigma_fin, H_fin, F_fin = _fock_fn(
         P_fin, h=h, VR=VR, refP=refP, HH=HH, w2d=w2d,
         include_exchange=include_exchange, include_hartree=include_hartree,
         exchange_hermitian_channel_packing=exchange_hermitian_channel_packing,
         contact_g=contact_g, contact_Oi=contact_Oi, contact_Oj=contact_Oj,
         exchange_block_specs=block_specs,
-        project_fn=None,
+        project_fn=project_fn,
     )
     E_fin = hf_energy(
         P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b, refP=refP,
@@ -1291,7 +1325,7 @@ def _solve_newton_impl(
         and ``Omega`` is the biased free energy (the physical internal energy
         is recomputed unbiased at finalize).
         """
-        P = _herm(_project(_density_from_Qp(Q, p)))
+        P, Q, p, _ = _project_density_eigensystem(Q, p, project_fn)
         Sigma, H_h, F = _fock_full(P)
         E = hf_energy(
             P, h=h, Sigma=Sigma, H=H_h, weights_b=weights_b, refP=refP,
@@ -1321,7 +1355,7 @@ def _solve_newton_impl(
             _norm_matrix(G, w_norm),
             _norm_matrix(P - P_fd, w_norm),
         )
-        return E, Omega, Ft, grad_norm, pen_diag
+        return E, Omega, Ft, grad_norm, pen_diag, Q, p
 
     # ---- Initialize (Q, p) from Fock at P0 ----
     P0_h = _herm(_project(jnp.asarray(P0, dtype=target_dtype)))
@@ -1333,7 +1367,7 @@ def _solve_newton_impl(
     mu0 = _solve_mu(eps0, w_norm, n_target_norm,
                     jnp.asarray(0.0, dtype=real_dtype), T_r, maxiter=mu_maxiter)
     p0 = jax.nn.sigmoid((mu0 - eps0) / T_r).astype(real_dtype)
-    E0, Omega0, Ft0, grad0, pen0 = _eval_state(Q0, p0)
+    E0, Omega0, Ft0, grad0, pen0, Q0, p0 = _eval_state(Q0, p0)
 
     hist_E = jnp.zeros(max_iter, dtype=real_dtype)
     hist_free = jnp.zeros(max_iter, dtype=real_dtype)
@@ -1475,7 +1509,7 @@ def _solve_newton_impl(
 
         # True free energy + gradient at the trial point (one Fock build for
         # this evaluation).
-        E_trial, Omega_trial, Ft_trial, grad_trial, pen_trial = _eval_state(Qt, p_trial)
+        E_trial, Omega_trial, Ft_trial, grad_trial, pen_trial, Qt, p_trial = _eval_state(Qt, p_trial)
         eps_t = jnp.real(
             jnp.diagonal(Ft_trial, axis1=-2, axis2=-1)
         ).astype(real_dtype)
@@ -1538,7 +1572,7 @@ def _solve_newton_impl(
                 p_mix.astype(real_dtype), w2d, n_target,
             )
             Q_mix = Q_mix.astype(target_dtype)
-            E_mix, O_mix, Ft_mix, g_mix, pen_mix = _eval_state(Q_mix, p_mix)
+            E_mix, O_mix, Ft_mix, g_mix, pen_mix, Q_mix, p_mix = _eval_state(Q_mix, p_mix)
             eps_mix = jnp.real(
                 jnp.diagonal(Ft_mix, axis1=-2, axis2=-1)
             ).astype(real_dtype)
@@ -1609,7 +1643,7 @@ def _solve_newton_impl(
     # would move the density away from the stationary point the loop reached.
     # Reporting the loop's own (Q, p) keeps the solution self-consistent
     # (mirrors cpp_hf's solve_rtr finalize).
-    P_fin = _herm(_project(_density_from_Qp(Q_fin, p_fin)))
+    P_fin, Q_fin, p_fin, _ = _project_density_eigensystem(Q_fin, p_fin, project_fn)
     Sigma_fin, H_fin, F_fin = _fock_full(P_fin)
     E_fin = hf_energy(
         P_fin, h=h, Sigma=Sigma_fin, H=H_fin, weights_b=weights_b, refP=refP,

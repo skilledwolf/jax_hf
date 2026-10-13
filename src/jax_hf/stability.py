@@ -75,7 +75,9 @@ def _host_fermi_density(fock, weights, number, temperature):
     if number == 0 or number == capacity:
         mu = -np.inf if number == 0 else np.inf
     else:
-        lo, hi = float(eps.min()) - 100*temperature, float(eps.max()) + 100*temperature
+        shift = temperature * (np.log(number) - np.log(capacity - number))
+        lo = np.nextafter(float(eps.min()) + shift, -np.inf)
+        hi = np.nextafter(float(eps.max()) + shift, np.inf)
         for _ in range(100):
             mid = .5*(lo+hi)
             count = np.sum(weights[..., None]*expit((mid-eps)/temperature))

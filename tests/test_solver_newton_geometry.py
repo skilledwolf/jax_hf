@@ -124,13 +124,15 @@ def test_stiff_coupled_occupation_problem_converges():
     assert int(result.n_iter) < 30
 
 
-def test_projected_newton_keeps_density_spectrum_and_stationarity_consistent():
+@pytest.mark.parametrize("optimizer", ["cg", "newton"])
+def test_projected_solver_keeps_density_spectrum_and_stationarity_consistent(optimizer):
     h = jnp.array([[[[-0.3, 0.4j], [-0.4j, 0.2]]]], dtype=jnp.complex128)
     K = HartreeFockKernel(weights=jnp.ones((1, 1)), hamiltonian=h,
                          coulomb_q=jnp.full((1, 1, 1, 1), 0.3), T=0.4)
     project = lambda A: A * jnp.eye(2)
+    tolerance = 1e-8 if optimizer == "cg" else 1e-9
     result = solve(K, jnp.zeros_like(h), 1.0, config=SolverConfig(
-        optimizer="newton", max_iter=100, tol_grad=1e-9, project_fn=project))
+        optimizer=optimizer, max_iter=100, tol_grad=tolerance, project_fn=project))
     assert bool(result.converged)
     np.testing.assert_allclose(result.density, _density_from_Qp(result.Q, result.p), atol=1e-13)
     np.testing.assert_allclose(result.fock, project(result.fock), atol=1e-13)
@@ -156,3 +158,46 @@ def test_custom_fock_with_captured_reference_has_exact_newton_response():
     assert bool(standard.converged) and bool(custom.converged)
     np.testing.assert_allclose(custom.density, standard.density, atol=1e-11)
     np.testing.assert_allclose(custom.energy, standard.energy, atol=1e-12)
+
+
+@pytest.mark.parametrize("optimizer", ["cg", "newton"])
+def test_projected_degenerate_trials_use_the_physical_entropy(optimizer):
+    from scipy.special import xlogy
+
+    theta = 0.7
+    symmetry = jnp.asarray([[np.cos(theta), np.sin(theta)],
+                            [np.sin(theta), -np.cos(theta)]])
+    project = lambda A: 0.5 * (A + symmetry @ A @ symmetry)
+    h = jnp.zeros((1, 1, 2, 2), dtype=jnp.complex128)
+    kernel = HartreeFockKernel(
+        weights=jnp.ones((1, 1)), hamiltonian=h,
+        coulomb_q=jnp.zeros((1, 1, 1, 1)), T=0.1,
+        reference_density=jnp.zeros_like(h), include_exchange=False,
+        include_hartree=True, hartree_matrix=jnp.diag(jnp.array([2.0, 0.0])),
+    )
+
+    def run(max_iter):
+        return solve(kernel, jnp.zeros_like(h), 1.0, config=SolverConfig(
+            optimizer=optimizer, max_iter=max_iter, tol_grad=1e-7,
+            project_fn=project,
+        ))
+
+    def physical_free_energy(result):
+        occupations = np.linalg.eigvalsh(np.asarray(result.density))
+        entropy = -np.sum(xlogy(occupations, occupations)
+                          + xlogy(1.0 - occupations, 1.0 - occupations))
+        return float(result.energy) - kernel.T * entropy
+
+    first, second = run(1), run(2)
+    for result in (first, second):
+        np.testing.assert_allclose(result.density, _density_from_Qp(result.Q, result.p), atol=1e-13)
+        np.testing.assert_allclose(result.density, project(result.density), atol=1e-13)
+    np.testing.assert_allclose(second.history["free_energy"][1], physical_free_energy(first), atol=2e-13)
+    assert physical_free_energy(second) <= physical_free_energy(first) + 2e-13
+    result = run(200)
+    assert bool(result.converged)
+    eps, Q = jnp.linalg.eigh(result.fock)
+    expected = _density_from_Qp(Q, jax.nn.sigmoid((result.mu - eps) / kernel.T))
+    np.testing.assert_allclose(result.density, expected, atol=2e-7)
+    history = np.asarray(result.history["free_energy"])[:int(result.n_iter)]
+    assert np.max(np.diff(history)) <= 2e-12

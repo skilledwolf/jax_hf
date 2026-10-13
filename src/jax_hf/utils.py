@@ -377,6 +377,24 @@ def find_chemical_potential(
     return jnp.where(target <= 0.0, neg_inf, jnp.where(target >= capacity, pos_inf, mu))
 
 
+def _chemical_potential_bounds(bands, capacity, target, temperature):
+    """Bracket μ using a flat spectrum at each band edge, preserving dtype."""
+    dtype = bands.real.dtype
+    capacity = jnp.asarray(capacity, dtype=dtype)
+    target = jnp.asarray(target, dtype=dtype)
+    temperature = jnp.asarray(temperature, dtype=dtype)
+    # Callers mask exact empty/full fillings to infinity after solving. Keep
+    # the unused branch finite while tracing those endpoints through JIT.
+    interior = (target > 0.0) & (target < capacity)
+    safe_target = jnp.where(interior, target, 0.5 * capacity)
+    shift = temperature * (jnp.log(safe_target) - jnp.log(capacity - safe_target))
+    lo, hi = jnp.min(bands) + shift, jnp.max(bands) + shift
+    # Round outward locally without nextafter, whose JAX derivative is absent.
+    epsilon = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+    return (lo - epsilon * jnp.maximum(jnp.abs(lo), temperature),
+            hi + epsilon * jnp.maximum(jnp.abs(hi), temperature))
+
+
 def _find_mu_bisection(
     bands: jax.Array,
     weights: jax.Array,
@@ -388,12 +406,10 @@ def _find_mu_bisection(
     """Pure bracket bisection — unconditionally stable."""
     if maxiter is None:
         maxiter = 30 if bands.dtype in (jnp.float32, jnp.complex64) else 54
-    bands_min = jnp.min(bands)
-    bands_max = jnp.max(bands)
-    Tj = jnp.asarray(T, dtype=bands.real.dtype)
-    span = bands_max - bands_min + 10.0 * jnp.maximum(Tj, jnp.array(1e-6, dtype=bands.real.dtype))
-    lo = bands_min - span
-    hi = bands_max + span
+    real_dtype = bands.real.dtype
+    capacity = jnp.sum(jnp.asarray(weights, dtype=real_dtype)) * bands.shape[-1]
+    temperature = jnp.asarray(T, dtype=real_dtype) + jnp.asarray(1e-12, dtype=real_dtype)
+    lo, hi = _chemical_potential_bounds(bands, capacity, n_electrons, temperature)
 
     def body(state, _):
         lo_curr, hi_curr = state
@@ -422,14 +438,11 @@ def _find_mu_newton(
         maxiter = 15 if bands.dtype in (jnp.float32, jnp.complex64) else 25
     real_dtype = bands.real.dtype
     Tj = jnp.asarray(T, dtype=real_dtype)
-    Tj = jnp.maximum(Tj, jnp.asarray(1e-12, dtype=real_dtype))
+    Tj = Tj + jnp.asarray(1e-12, dtype=real_dtype)
     n_target = jnp.asarray(n_electrons, dtype=real_dtype)
 
-    bands_min = jnp.min(bands)
-    bands_max = jnp.max(bands)
-    span = bands_max - bands_min + 10.0 * jnp.maximum(Tj, jnp.asarray(1e-6, dtype=real_dtype))
-    lo = bands_min - span
-    hi = bands_max + span
+    capacity = jnp.sum(jnp.asarray(weights, dtype=real_dtype)) * bands.shape[-1]
+    lo, hi = _chemical_potential_bounds(bands, capacity, n_target, Tj)
     mu = 0.5 * (lo + hi)
 
     w_b = jnp.asarray(weights)[..., None]
@@ -450,15 +463,16 @@ def _find_mu_newton(
         lo = jnp.where(g < 0, mu, lo)
         hi = jnp.where(g > 0, mu, hi)
 
-        Z_safe = jnp.maximum(Z, jnp.asarray(1e-18, dtype=real_dtype))
-        mu_new = mu - g / Z_safe
-
         mu_bis = 0.5 * (lo + hi)
-        out_of = jnp.logical_or(mu_new <= lo, mu_new >= hi)
-        mu_new = jnp.where(out_of, mu_bis, mu_new)
-
+        has_slope = Z > 0.0
+        mu_new = mu - g / jnp.where(has_slope, Z, jnp.ones_like(Z))
+        mu_new = jnp.where(has_slope, mu_new, mu_bis)
+        # An update that rounds onto μ must not restart at a distant midpoint.
+        stalled = mu_new == mu
+        out_of = ((mu_new <= lo) | (mu_new >= hi)) & ~stalled
+        mu_new = jnp.where(out_of | ~jnp.isfinite(mu_new), mu_bis, mu_new)
         mu_new = jnp.clip(mu_new, lo, hi)
-        mu_new = jnp.where(jnp.isfinite(mu_new), mu_new, mu_bis)
+        mu_new = jnp.where(g == 0.0, mu, mu_new)
         return (mu_new, lo, hi), None
 
     (mu_fin, lo_fin, hi_fin), _ = jax.lax.scan(body, (mu, lo, hi), xs=None, length=int(maxiter))

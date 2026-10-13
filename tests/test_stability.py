@@ -117,3 +117,13 @@ def test_eigenvalue_requires_an_independently_verified_residual(monkeypatch):
     result = stability_analysis(kernel, np.eye(9)[None, None]/2, 4.5)
     assert result.stationary and not result.eigen_converged and result.stable is None
     np.testing.assert_allclose(result.eigen_residual, 1., atol=1e-12)
+
+
+@pytest.mark.parametrize("number", [1e-60, 1e-6, 2.0 - 1e-6])
+def test_host_fermi_density_preserves_particle_count_in_extreme_tails(number):
+    from jax_hf.stability import _host_fermi_density
+    fock = np.zeros((1, 1, 2, 2), complex)
+    weights = np.ones((1, 1))
+    density, _, _, occupations = _host_fermi_density(fock, weights, number, 0.1)
+    np.testing.assert_allclose(np.trace(density[0, 0]).real, number, rtol=1e-13, atol=0.0)
+    np.testing.assert_allclose(occupations, number / 2, rtol=1e-13, atol=0.0)

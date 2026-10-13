@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import jax
 import jax.numpy as jnp
 
 from jax_hf.utils import density_matrix_from_fock, fermidirac, find_chemical_potential, selfenergy_fft
@@ -89,3 +90,33 @@ def test_fermi_utilities_reject_negative_temperature():
         find_chemical_potential(
             jnp.array([[[0.0, 1.0]]]), jnp.ones((1, 1)), 1.0, -0.1,
         )
+
+
+@pytest.mark.parametrize("method", ["bisection", "newton"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+@pytest.mark.parametrize("target", [1e-25, 1e-6, 2.0 - 1e-3])
+@pytest.mark.parametrize("bandwidth", [0.0, 0.2])
+def test_jitted_chemical_bounds_cover_dilute_and_full_fillings(method, dtype, target, bandwidth):
+    with jax.experimental.enable_x64(dtype == jnp.float64):
+        bands = jnp.asarray([[[0.0, bandwidth]]], dtype=dtype)
+        weights = jnp.ones((1, 1), dtype=dtype)
+        target = jnp.asarray(target, dtype=dtype)
+        find_mu = jax.jit(lambda eps, w, n: find_chemical_potential(eps, w, n, 0.1, method=method))
+        mu = find_mu(bands, weights, target)
+        assert mu.dtype == dtype
+        if target > 1.0:
+            count = jnp.sum(fermidirac(mu - bands, 0.1))
+            expected = 2.0 - target
+        else:
+            count = jnp.sum(fermidirac(bands - mu, 0.1))
+            expected = target
+        tolerance = 3e-4 if dtype == jnp.float32 else 2e-10
+        np.testing.assert_allclose(count, expected, rtol=tolerance, atol=0.0)
+
+
+@pytest.mark.parametrize("method", ["bisection", "newton"])
+def test_jitted_chemical_solver_masks_exact_endpoints(method):
+    bands = jnp.zeros((1, 1, 2))
+    weights = jnp.ones((1, 1))
+    find_mu = jax.jit(jax.vmap(lambda n: find_chemical_potential(bands, weights, n, 0.1, method=method)))
+    np.testing.assert_array_equal(find_mu(jnp.array([0.0, 2.0])), [-np.inf, np.inf])

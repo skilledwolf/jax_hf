@@ -491,3 +491,28 @@ class TestSolveMuEarlyStop:
         w_norm = jnp.ones((2, 2)) / 4.0
         assert float(S._solve_mu(eps, w_norm, 0.0, 0.0, 0.1, maxiter=50)) == -np.inf
         assert float(S._solve_mu(eps, w_norm, 2.0, 0.0, 0.1, maxiter=50)) == np.inf
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+@pytest.mark.parametrize("remote_energy", [100.0, 1000.0])
+def test_chemical_potential_resolves_low_temperature_despite_remote_bands(dtype, remote_energy):
+    eps = jnp.asarray([[[0.0, remote_energy]]], dtype=dtype)
+    weights = jnp.ones((1, 1), dtype=dtype)
+    target = jnp.asarray(0.1, dtype=dtype)
+    temperature = jnp.asarray(1e-12, dtype=dtype)
+    mu = S._solve_mu(eps, weights, target, 0.0, temperature, maxiter=50)
+    count = jnp.sum(jax.nn.sigmoid((mu - eps) / temperature))
+    assert mu.dtype == dtype
+    np.testing.assert_allclose(count, target, rtol=16 * np.finfo(dtype).eps, atol=0.0)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+def test_chemical_potential_bracket_reaches_dilute_filling(dtype):
+    eps = jnp.zeros((1, 1, 2), dtype=dtype)
+    weights = jnp.ones((1, 1), dtype=dtype)
+    target = jnp.asarray(1e-25, dtype=dtype)
+    temperature = jnp.asarray(0.1, dtype=dtype)
+    mu = S._solve_mu(eps, weights, target, 0.0, temperature, maxiter=50)
+    count = jnp.sum(jax.nn.sigmoid((mu - eps) / temperature))
+    assert mu.dtype == dtype
+    np.testing.assert_allclose(count, target, rtol=64 * np.finfo(dtype).eps, atol=0.0)
