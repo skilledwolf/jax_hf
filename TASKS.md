@@ -74,7 +74,7 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done.
   - *Reusing the `lam = 1` eigendecomposition* in the fallback, where `P_mix` equals the already-decomposed `P_fd`. Not numerically neutral when a `project_fn` is supplied: the reused spectrum is that of the unprojected `P_fd`, and the bilayer PM +0.05 trajectory changed (11 -> 12 iterations at `tol_grad=1e-5`; it helped there, but by luck). It would be sound if restricted to `project_fn is None`, which excludes the production case.
 - [ ] Speed up the CG path on the hard doped points. `SVP -0.42` still needs 105 iterations to `tol_E=1e-7` and does not reach `tol_grad=1e-5` in 200, while SCF DIIS converges in 18. A redesign that replaces the occupation gradient step with a damped frozen-Fock Fermi-Dirac re-occupation inside the line search was prototyped: it reaches 2.0 Fock builds per iteration and 3.0x wall time on the bilayer, but converges 15x more slowly on a warm, weakly interacting synthetic problem (4 -> 62 iterations at `tol_grad=1e-6`), because it replaces a genuine joint CG direction with a linearly convergent fixed-point map wherever occupations are unsaturated. Reviving it needs CG acceleration over the Fermi-Dirac direction, not just the direction itself.
 - [ ] Investigate CPU parallelism and a GPU path. Solves use ~1.2 of 14 cores. Sharding k over host devices speeds batched matmuls ~7x but the LAPACK `eigh` FFI only ~1.3x (serialized), and k-sharded FFTs are slower. Batched Jacobi `eigh` on an NVIDIA GPU is the natural path; Metal lacks batched complex `eigh`.
-- [ ] Regenerate `tests/data/bilayer_reference.npz`. It was written at v2.0.0 (commit fa10f85) and predates the interaction-energy convention fix (commit e12e051), so all 30 bilayer regression assertions fail on unmodified `main` as well: the reference stores -6.3287 for `PM_+0.05` where both the current and the pre-change solvers return -5.9820. A pristine `git worktree` at `aab89a2` reproduces exactly the same 30 failures. Regenerate with `tests/generate_bilayer_reference.py` once the current convention is confirmed as intended.
+- [x] Restore reproducible bilayer references across contimod grid defaults. The saved energies agree with the current solvers on the original endpoint grid; persist `kx`, `ky`, and the quadrature weight and replay them explicitly. All 30 converged reference assertions pass without regenerating expected energies.
 
 ## 2026-09-05 solver-study port
 
@@ -86,3 +86,12 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done.
 - [x] Preserve finite-temperature saddle-escape descent near saturated occupations using a fixed-particle Fermi-map retraction, with projected-density fallback and verified free-energy acceptance from the actual returned density and energy. (Final full actual-checkout validation: 215 core tests passed in 87.63 seconds with no warnings, including saturated coupled-band curvature and stale legacy SCF history regressions.)
 
 - [x] Implement memory-bounded orbital-resolved superlattice exchange, preserving scalar behavior and supporting custom-Fock/JVP adapters. Validation: 57 focused JAX/Contimod tests passed; the reduced 228-band hexalayer Fock agrees with C++ to 5.7e-14. Its cold RDIIS solve reaches the 80-iteration budget without convergence, so this validates the operator and does not establish phase-diagram convergence.
+
+## 2026-10-13 cpp_hf fixes parity
+
+- [x] Correct direct-solver projection/entropy consistency and low-temperature/dilute chemical-potential accuracy, with JAX regression coverage.
+- [x] Preserve the density certified by legacy SCF and reuse the chemical potential when level shifting is disabled.
+- [x] Preserve complex symmetry operators on real densities and correct the centered embedded reference energy conversion.
+- [x] Check applicable performance improvements, validate the optional bilayer quadrature, and rerun the test suite.
+
+Validation: 286 core tests and 30 bilayer tests passed on CPU (Python 3.12, JAX 0.7.2); the two existing skips are the saved unconverged SVP reference point. Focused float32 checks also passed with x64 disabled. JAX already reused the stability eigensystem and installed editable source in CI; FFTW thread controls do not apply to this backend.

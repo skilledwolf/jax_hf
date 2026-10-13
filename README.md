@@ -79,8 +79,19 @@ jax_hf.SCFConfig(max_iter=200, acceleration="rdiis", diis_size=8)
 ```
 
 `project_fn` lets you enforce symmetry constraints (spin, valley, time
-reversal, spatial) on the density and Fock at every iteration.  See
+reversal, spatial) on the density and Fock at every iteration. For CG and
+Newton, it must be a linear orthogonal, particle-preserving projection onto
+a symmetry matrix algebra. The solvers keep the projected density and its
+occupations consistent when evaluating entropy. See
 `jax_hf.symmetry.make_project_fn`.
+
+With `embed_reference_potential=True`, recover standard HF energies as
+`E_standard = result.energy - kernel.embedded_energy_offset
++ kernel.embedded_hartree_shift * N`, where `N` is the raw quadrature-weighted
+particle count. Recover the chemical potential by adding
+`kernel.embedded_hartree_shift` to the reported value. The shift is zero when
+Hartree centering is disabled; the energy offset uses the uncentered
+reference potential.
 
 ### Newton, deflation, and SCF acceleration
 

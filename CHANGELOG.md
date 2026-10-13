@@ -6,6 +6,15 @@ This project adheres to [Semantic Versioning](https://semver.org).
 ## Unreleased
 
 ### Correctness
+- Project the CG Fock consistently with the density, and keep CG/Newton
+  occupations synchronized with projected trial densities before evaluating
+  entropy or accepting a step.
+- Return the density actually certified by legacy SCF. Use occupation-aware
+  chemical-potential brackets and representable-update stopping to preserve
+  dilute fillings and resolve low-temperature occupations near remote bands.
+- Preserve complex symmetry operators on real densities. Expose
+  `embedded_hartree_shift` and correct the centered reference energy conversion
+  using the actual quadrature-weighted particle count.
 - Require the full weighted `||P - P_FD(F)||` residual before either direct
   optimizer reports convergence. Near-equal occupations can suppress the
   commutator/orbital gradient even when the density is not self-consistent.
@@ -24,6 +33,9 @@ This project adheres to [Semantic Versioning](https://semver.org).
   reject negative temperatures and invalid solver inputs before JIT.
 
 ### Performance notes
+- Reuse the initial SCF chemical-potential solve when level shifting is zero.
+- Reuse accepted projected CG trial eigensystems, while retaining the original
+  unprojected reconstruction order for float32 convergence.
 - CG backtracking now evaluates the true nonlinear objective and may perform
   multiple Fock builds per outer iteration. Newton may use a damped
   fixed-point fallback near occupation degeneracies. These checks trade some
@@ -57,6 +69,8 @@ This project adheres to [Semantic Versioning](https://semver.org).
   multiband problems are unchanged (4, 47 and 3 iterations, as before).
 
 ### Packaging and CI
+- Replay the saved bilayer quadrature explicitly so contimod grid-default
+  changes do not invalidate the existing reference energies.
 - Require PEP 639-capable setuptools, preserve versions in tagged
   `git archive` exports, and reject `0.0` or stale-module wheels during CI.
 - Declare the directly imported NumPy dependency, set the tested JAX/NumPy
