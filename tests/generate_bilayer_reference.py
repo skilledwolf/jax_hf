@@ -57,8 +57,9 @@ BRANCHES = ("PM", "SVP")
 def build_problem():
     """Set up bilayer graphene HF problem via contimod."""
     model = cm.graphene.MultilayerAB(valleyful=True, spinful=True, U=float(U_MEV))
-    h_template = model.discretize(nk=NK, kmax=KMAX)
-    h_template.fermi = FermiParams(T=TEMPERATURE, mu=0.0)
+    h_template = model.discretize(
+        nk=NK, kmax=KMAX, fermi=FermiParams(T=TEMPERATURE, mu=0.0),
+    )
 
     ne_cn = float(h_template.state.compute_density_from_filling(0.5 - 1e-6))
     weights = np.asarray(h_template.kmesh.weights)
@@ -179,6 +180,9 @@ def main():
     save_dict = {
         "nk": NK,
         "kmax": KMAX,
+        "kx": np.asarray(h_template.kmesh.kx),
+        "ky": np.asarray(h_template.kmesh.ky),
+        "weight": float(h_template.kmesh.weight),
         "U_meV": U_MEV,
         "temperature": TEMPERATURE,
         "epsilon_r": EPSILON_R,
