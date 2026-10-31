@@ -3,7 +3,14 @@
 All notable changes to **jax_hf** are documented here.
 This project adheres to [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## [2.3.0] — 2026-10-31
+
+### Added
+- Orbital-resolved streaming exchange for superlattice models: `build_extended_layout`
+  accepts an orbital interaction table of shape `(*qmag.shape, dim_orb, dim_orb)`, and
+  `make_superlattice_fock_fn` / `make_superlattice_build_fock_fn` accept an explicit
+  `V_lag_fft_orbital=` override. The scalar path and its defaults are unchanged.
+  contimod's orbital JAX superlattice backend requires this release.
 
 ### Correctness
 - Project the CG Fock consistently with the density, and keep CG/Newton
