@@ -130,8 +130,10 @@ class TestSaturatedOccupationGradient:
         p_t = S._project_capped_occupations(p - tau * h, w_norm, ntn)
         fd_slope = (float(_free_energy(kernel, Q, p_t)) - Om0) / tau
         np.testing.assert_allclose(fd_slope, slope, rtol=2e-2)
-        # Particle number is preserved by the direction itself.
-        assert abs(float(jnp.sum(w_norm[..., None] * h))) < 1e-12 * float(S._norm_vec(h, w_norm))
+        # Particle number is preserved by the direction itself, up to the
+        # rounding of the band-scale shift that was subtracted to form h.
+        scale = float(S._norm_vec(eps, w_norm))
+        assert abs(float(jnp.sum(w_norm[..., None] * h))) < 1e-13 * scale
 
     def test_masked_projection_reduces_to_uniform_when_all_active(self):
         rng = np.random.default_rng(3)
