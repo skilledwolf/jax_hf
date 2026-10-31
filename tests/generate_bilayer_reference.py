@@ -56,7 +56,7 @@ BRANCHES = ("PM", "SVP")
 
 def build_problem():
     """Set up bilayer graphene HF problem via contimod."""
-    model = cm.graphene.MultilayerAB(valleyful=True, spinful=True, U=float(U_MEV))
+    model = cm.graphene.Bernal(2, valleyful=True, spinful=True, U=float(U_MEV))
     h_template = model.discretize(
         nk=NK, kmax=KMAX, fermi=FermiParams(T=TEMPERATURE, mu=0.0),
     )

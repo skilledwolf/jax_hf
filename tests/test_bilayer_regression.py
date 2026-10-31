@@ -54,7 +54,7 @@ def _build_bilayer_setup(ref):
     mesh.dk = np.array([mesh.kx[1] - mesh.kx[0], mesh.ky[1] - mesh.ky[0]])
     mesh.dk_sq = float(np.prod(mesh.dk))
     mesh.weight = float(ref["weight"])
-    model = cm.graphene.MultilayerAB(valleyful=True, spinful=True, U=U_meV)
+    model = cm.graphene.Bernal(2, valleyful=True, spinful=True, U=U_meV)
     h_template = model.discretize(
         ks=mesh, fermi=FermiParams(T=temperature, mu=0.0),
     )
