@@ -15,8 +15,8 @@ from jax_hf.superlattice import (
 
 
 @pytest.fixture(autouse=True)
-def double_precision():
-    with jax.experimental.enable_x64():
+def double_precision(enable_x64):
+    with enable_x64():
         yield
 
 

@@ -96,8 +96,10 @@ def test_fermi_utilities_reject_negative_temperature():
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
 @pytest.mark.parametrize("target", [1e-25, 1e-6, 2.0 - 1e-3])
 @pytest.mark.parametrize("bandwidth", [0.0, 0.2])
-def test_jitted_chemical_bounds_cover_dilute_and_full_fillings(method, dtype, target, bandwidth):
-    with jax.experimental.enable_x64(dtype == jnp.float64):
+def test_jitted_chemical_bounds_cover_dilute_and_full_fillings(
+    method, dtype, target, bandwidth, enable_x64,
+):
+    with enable_x64(dtype == jnp.float64):
         bands = jnp.asarray([[[0.0, bandwidth]]], dtype=dtype)
         weights = jnp.ones((1, 1), dtype=dtype)
         target = jnp.asarray(target, dtype=dtype)
