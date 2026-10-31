@@ -492,6 +492,37 @@ class TestSolveMuEarlyStop:
         assert float(S._solve_mu(eps, w_norm, 0.0, 0.0, 0.1, maxiter=50)) == -np.inf
         assert float(S._solve_mu(eps, w_norm, 2.0, 0.0, 0.1, maxiter=50)) == np.inf
 
+    def test_converged_warm_start_is_kept(self):
+        """A warm start already at the solution must come back unchanged.
+
+        The Newton update from a converged mu rounds back onto mu, which has
+        just become a bracket end.  Treating that as an out-of-bracket step and
+        bisecting from it throws the solution away, after which the iterate
+        cycles through bisection midpoints for the rest of the budget and the
+        returned mu depends on where the budget happens to run out.  (Ported
+        from cpp_hf, where the unguarded solver showed exactly that.)
+        """
+        rng = np.random.default_rng(3)
+        eps = jnp.asarray(rng.uniform(-20.0, 20.0, size=(6, 6, 4)))
+        w_norm = jnp.ones((6, 6)) / 36.0
+        T, target = 0.01, 1.5
+        mu = float(S._solve_mu(eps, w_norm, target, 0.0, T, maxiter=50))
+        tol = 4.0 * np.finfo(np.float64).eps * max(1.0, abs(mu))
+        for maxiter in (1, 2, 3, 5, 8, 13, 25, 50):
+            mu_warm = float(S._solve_mu(eps, w_norm, target, mu, T, maxiter=maxiter))
+            assert abs(mu_warm - mu) <= tol, (maxiter, mu_warm, mu)
+
+    def test_result_is_independent_of_the_iteration_budget(self):
+        """Once converged the iterate stays put, so any sufficient budget agrees."""
+        rng = np.random.default_rng(5)
+        eps = jnp.asarray(rng.uniform(-20.0, 20.0, size=(6, 6, 4)))
+        w_norm = jnp.ones((6, 6)) / 36.0
+        T, target = 0.05, 1.5
+        mus = [float(S._solve_mu(eps, w_norm, target, 0.0, T, maxiter=m)) for m in (25, 50, 200)]
+        tol = 8.0 * np.finfo(np.float64).eps * max(1.0, abs(mus[0]))
+        for m in mus[1:]:
+            assert abs(m - mus[0]) <= tol, mus
+
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
 @pytest.mark.parametrize("remote_energy", [100.0, 1000.0])
