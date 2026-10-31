@@ -26,12 +26,13 @@ from jax_hf import (
 # ---------------------------------------------------------------------------
 
 
-def _two_band_kernel(nk: int, *, T: float = 0.2, exchange: float = 0.25):
-    weights = jnp.ones((nk, nk), dtype=jnp.float32)
-    hamiltonian = np.zeros((nk, nk, 2, 2), dtype=np.complex64)
+def _two_band_kernel(nk: int, *, T: float = 0.2, exchange: float = 0.25, dtype=jnp.complex64):
+    real_dtype = jnp.finfo(dtype).dtype
+    weights = jnp.ones((nk, nk), dtype=real_dtype)
+    hamiltonian = np.zeros((nk, nk, 2, 2), dtype=dtype)
     hamiltonian[..., 0, 0] = -0.5
     hamiltonian[..., 1, 1] = 0.5
-    coulomb_q = jnp.full((nk, nk, 1, 1), exchange, dtype=jnp.complex64)
+    coulomb_q = jnp.full((nk, nk, 1, 1), exchange, dtype=dtype)
     return HartreeFockKernel(
         weights=weights,
         hamiltonian=jnp.asarray(hamiltonian),
@@ -129,19 +130,25 @@ class TestContinuationMatchesManualDriver:
 
 
 class TestContinuationConvergesToSameFixedPoint:
-    def test_fine_solve_matches_cold_start_result(self):
-        """Continuation + cold fine solve should land at the same fixed point."""
-        kc = _two_band_kernel(4, exchange=0.6)
-        kf = _two_band_kernel(8, exchange=0.6)
-        P0_c = jnp.zeros_like(kc.h)
-        P0_f_cold = jnp.zeros_like(kf.h)
+    def test_fine_solve_matches_cold_start_result(self, enable_x64):
+        """Continuation + cold fine solve should land at the same fixed point.
 
-        cfg = SolverConfig(max_iter=200, tol_E=1e-10)
-        cold = solve(kf, P0_f_cold, 1.0, config=cfg)
-        continued = solve_continuation(
-            kc, kf, P0_c, 1.0, 1.0,
-            coarse_config=cfg, fine_config=cfg,
-        )
+        Run in float64: with ``tol_E=1e-10`` a float32 solve stops on
+        representable-update grounds, and two such solves from different
+        seeds can legitimately differ by tens of ulp (about 4e-6 here).
+        """
+        with enable_x64():
+            kc = _two_band_kernel(4, exchange=0.6, dtype=jnp.complex128)
+            kf = _two_band_kernel(8, exchange=0.6, dtype=jnp.complex128)
+            P0_c = jnp.zeros_like(kc.h)
+            P0_f_cold = jnp.zeros_like(kf.h)
+
+            cfg = SolverConfig(max_iter=200, tol_E=1e-10)
+            cold = solve(kf, P0_f_cold, 1.0, config=cfg)
+            continued = solve_continuation(
+                kc, kf, P0_c, 1.0, 1.0,
+                coarse_config=cfg, fine_config=cfg,
+            )
 
         assert bool(cold.converged)
         assert bool(continued.fine.converged)

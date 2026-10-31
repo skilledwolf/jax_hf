@@ -333,8 +333,16 @@ class TestLineSearchAcceptsWhenSaturated:
         assert best_unmasked >= Omega, (best_unmasked, Omega)
 
     def test_cg_costs_fewer_fock_builds_than_an_exhausted_line_search(self):
-        """End to end: the line search must not burn its whole budget every step."""
-        kernel = _wide_band_kernel()
+        """End to end: the line search must not burn its whole budget every step.
+
+        The default fixture is essentially converged after one CG iteration;
+        the remaining iterations sit at the rounding floor, where the number of
+        rejected trials depends on the platform (5 to 10 builds per iteration
+        across jax versions and CPUs). A stronger exchange keeps the solver
+        descending for several iterations, where the masked occupation step
+        accepts after about three builds everywhere it was measured.
+        """
+        kernel = _wide_band_kernel(ex=4.0)
         n_e = 1.5 * float(kernel.weight_sum)
         P0 = jnp.zeros_like(kernel.h)
         counter = {"n": 0}
