@@ -369,13 +369,89 @@ def test_time_reversal_k_index_map_path_with_invalid_mask():
     np.testing.assert_allclose(out[1, 2], expected, atol=1e-12)
 
 
+def _random_unitary_group(rng, nb, n):
+    """``n`` random unitaries (not a group; the average is still a well-defined linear map)."""
+    mats = []
+    for _ in range(n):
+        Z = rng.normal(size=(nb, nb)) + 1j * rng.normal(size=(nb, nb))
+        Q, _ = np.linalg.qr(Z)
+        mats.append(Q)
+    return np.stack(mats)
+
+
+def _loop_average(A, G):
+    return np.mean([g @ A @ np.conj(g.T) for g in G], axis=0)
+
+
+def test_gemm_group_average_matches_the_conjugation_loop(enable_x64):
+    """Below _GEMM_MAX_NB the unitary average is one precomputed GEMM; it must
+    reproduce the per-element conjugation loop to rounding, and the loop must
+    still be selected above the threshold."""
+    with enable_x64():
+        from jax_hf import symmetry as sym
+
+        rng = np.random.default_rng(0)
+        for nb in (6, sym._GEMM_MAX_NB + 2):
+            G = _random_unitary_group(rng, nb, 4)
+            A = rng.normal(size=(3, 2, nb, nb)) + 1j * rng.normal(size=(3, 2, nb, nb))
+            pf = make_project_fn(unitary_group=jnp.asarray(G))
+            out = np.asarray(jax.jit(pf)(jnp.asarray(A)))
+            ref = np.stack([[_loop_average(A[i, j], G) for j in range(2)] for i in range(3)])
+            np.testing.assert_allclose(out, ref, atol=1e-13, rtol=0)
+        M = sym._conj_sum_matrix(jnp.asarray(G[:1]))
+        assert M.shape == (nb * nb, nb * nb)
+
+
+def test_gemm_combined_group_matches_loop_form(enable_x64):
+    with enable_x64():
+        from jax_hf import symmetry as sym
+
+        rng = np.random.default_rng(1)
+        nb = 4
+        G = _random_unitary_group(rng, nb, 3)
+        S = _random_unitary_group(rng, nb, 2)
+        A = rng.normal(size=(4, 4, nb, nb)) + 1j * rng.normal(size=(4, 4, nb, nb))
+        Aj = jnp.asarray(A)
+        fast = sym._avg_combined_group(
+            Aj, jnp.asarray(G), jnp.asarray(S), "mod", (0, 1),
+            M_same=sym._conj_sum_matrix(jnp.asarray(G)), M_flip=sym._conj_sum_matrix(jnp.asarray(S)),
+        )
+        slow = sym._avg_combined_group(Aj, jnp.asarray(G), jnp.asarray(S), "mod", (0, 1))
+        np.testing.assert_allclose(np.asarray(fast), np.asarray(slow), atol=1e-13, rtol=0)
+
+
+def test_projector_follows_the_density_dtype():
+    """A complex128 group applied to a complex64 density must not promote it
+    (with x64 enabled this used to raise a fori_loop carry-dtype error)."""
+    from jax_hf import symmetry as sym
+
+    rng = np.random.default_rng(2)
+    nb = 4
+    G = _random_unitary_group(rng, nb, 2).astype(np.complex128)
+    U = _random_unitary_group(rng, nb, 1)[0].astype(np.complex128)
+    A = (rng.normal(size=(2, 2, nb, nb)) + 1j * rng.normal(size=(2, 2, nb, nb))).astype(np.complex64)
+    for kwargs in (
+        dict(unitary_group=jnp.asarray(G)),
+        dict(time_reversal_U=jnp.asarray(U), time_reversal_k_convention="mod"),
+        dict(spatial_group=jnp.asarray(G)),
+    ):
+        pf = make_project_fn(**kwargs)
+        out = jax.jit(pf)(jnp.asarray(A))
+        assert out.dtype == jnp.complex64, (kwargs.keys(), out.dtype)
+    # the loop form (above the GEMM threshold) has the same contract
+    nb_big = sym._GEMM_MAX_NB + 1
+    Gb = _random_unitary_group(rng, nb_big, 2).astype(np.complex128)
+    Ab = (rng.normal(size=(1, 1, nb_big, nb_big)) + 0j).astype(np.complex64)
+    assert jax.jit(make_project_fn(unitary_group=jnp.asarray(Gb)))(jnp.asarray(Ab)).dtype == jnp.complex64
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
 @pytest.mark.parametrize("gemm_threshold", [0, 24])
 @pytest.mark.parametrize("kind", ["unitary", "spatial", "spatial_map", "time_reversal", "time_reversal_map"])
 def test_complex_symmetry_promotes_real_density_without_losing_operator(
-    dtype, gemm_threshold, kind, monkeypatch,
+    dtype, gemm_threshold, kind, monkeypatch, enable_x64,
 ):
-    with jax.experimental.enable_x64(dtype == jnp.float64):
+    with enable_x64(dtype == jnp.float64):
         import jax_hf.symmetry as module
         monkeypatch.setattr(module, "_GEMM_MAX_NB", gemm_threshold, raising=False)
         sigma_y = np.array([[0.0, -1j], [1j, 0.0]])

@@ -43,8 +43,50 @@ def _flip_k(
     raise ValueError(f"k_convention must be 'mod' or 'flip', got {k_convention!r}")
 
 
-def _sum_unitary_conj(A: jax.Array, G: jax.Array) -> jax.Array:
-    """Return ``sum_i g_i @ A @ g_i†`` without normalization."""
+# Orbital dimension up to which the group sum is applied as one precomputed
+# GEMM on vec(A) (an (nb², nb²) matrix: 16 bytes × nb⁴, i.e. 5 MB at nb=24).
+# Measured on the nk=49, nb=16 bilayer: the per-element conjugation loop costs
+# 30-40 ms per call (16 batched 16×16 matmuls that XLA:CPU runs far below
+# peak) against 5.7 ms for the single (2401, 256) @ (256, 256) product, and
+# the projector is applied about six times per CG iteration.  Above the
+# threshold the nb⁴ matrix outgrows the 2·|G|·nb³ loop and its memory.
+_GEMM_MAX_NB = 24
+
+
+def _conj_sum_matrix(G: jax.Array) -> jax.Array:
+    """Matrix of ``vec(A) -> vec(sum_i g_i A g_i†)`` for row-major ``vec``.
+
+    ``vec(g A g†) = (g ⊗ conj(g)) vec(A)``; the sum over the group elements is
+    formed once, at ``make_project_fn`` time, from concrete unitaries.
+    """
+    G = jnp.asarray(G)
+    ng, nb = G.shape[0], G.shape[-1]
+    M = jnp.zeros((nb * nb, nb * nb), dtype=G.dtype)
+    for i in range(ng):
+        M = M + jnp.kron(G[i], jnp.conj(G[i]))
+    return M
+
+
+def _apply_vec_matrix(A: jax.Array, M: jax.Array) -> jax.Array:
+    """Apply a vec-space matrix ``M`` to the last two axes of ``A``."""
+    nb = A.shape[-1]
+    flat = A.reshape(A.shape[:-2] + (nb * nb,))
+    return (flat @ jnp.swapaxes(M.astype(A.dtype), -1, -2)).reshape(A.shape)
+
+
+def _sum_unitary_conj(
+    A: jax.Array, G: jax.Array, M_sum: jax.Array | None = None,
+) -> jax.Array:
+    """Return ``sum_i g_i @ A @ g_i†`` without normalization.
+
+    ``M_sum`` is the precomputed :func:`_conj_sum_matrix` of ``G``; when given
+    the sum is one GEMM instead of ``len(G)`` batched conjugations.
+    """
+    if M_sum is not None:
+        return _apply_vec_matrix(A, M_sum)
+    # The group elements follow the working dtype of ``A``: a complex128 group
+    # applied to a complex64 density must not promote the loop carry.
+    G = G.astype(A.dtype)
     ng = G.shape[0]
 
     def body(i, acc):
@@ -55,10 +97,12 @@ def _sum_unitary_conj(A: jax.Array, G: jax.Array) -> jax.Array:
     return lax.fori_loop(0, ng, body, jnp.zeros_like(A))
 
 
-def _avg_unitary_conj(A: jax.Array, G: jax.Array) -> jax.Array:
+def _avg_unitary_conj(
+    A: jax.Array, G: jax.Array, M_sum: jax.Array | None = None,
+) -> jax.Array:
     """Average ``A`` over unitary conjugation by the elements of ``G``."""
     ng = G.shape[0]
-    return _sum_unitary_conj(A, G) / jnp.asarray(float(ng), dtype=A.dtype)
+    return _sum_unitary_conj(A, G, M_sum) / jnp.asarray(float(ng), dtype=A.dtype)
 
 
 def _avg_combined_group(
@@ -67,11 +111,13 @@ def _avg_combined_group(
     G_flip: jax.Array,
     k_convention: str,
     flip_axes: tuple[int, ...] = (0, 1),
+    M_same: jax.Array | None = None,
+    M_flip: jax.Array | None = None,
 ) -> jax.Array:
     """Average over a group split into same-k and flipped-k elements."""
-    acc = _sum_unitary_conj(A, G_same)
+    acc = _sum_unitary_conj(A, G_same, M_same)
     A_neg = _flip_k(A, k_convention, flip_axes)
-    acc = acc + _sum_unitary_conj(A_neg, G_flip)
+    acc = acc + _sum_unitary_conj(A_neg, G_flip, M_flip)
     N = G_same.shape[0] + G_flip.shape[0]
     return acc / jnp.asarray(float(N), dtype=A.dtype)
 
@@ -97,7 +143,7 @@ def _avg_spatial_group_via_k_maps(
     # Coerce up front so callers passing numpy arrays (e.g. the cpp_hf
     # backend, which uses np internally) don't trip the fori_loop tracer.
     A_j = jnp.asarray(A)
-    spatial_group = jnp.asarray(spatial_group)
+    spatial_group = jnp.asarray(spatial_group).astype(A_j.dtype)
     k_index_i = jnp.asarray(k_index_i)
     k_index_j = jnp.asarray(k_index_j)
     n_g = spatial_group.shape[0]
@@ -126,7 +172,7 @@ def _avg_time_reversal_via_k_map(
     lies inside the patch.  Where invalid, ``A[k]`` is left untouched.
     """
     A_j = jnp.asarray(A)
-    U = jnp.asarray(U)
+    U = jnp.asarray(U).astype(A_j.dtype)
     k_index_i = jnp.asarray(k_index_i)
     k_index_j = jnp.asarray(k_index_j)
     valid = jnp.asarray(valid)
@@ -144,6 +190,7 @@ def _avg_time_reversal(
     flip_axes: tuple[int, ...] = (0, 1),
 ) -> jax.Array:
     """Average ``A`` with its time-reversed partner."""
+    U = U.astype(A.dtype)
     UH = jnp.conj(jnp.swapaxes(U, -1, -2))
     A_neg = _flip_k(A, k_convention, flip_axes)
     A_tr = U @ jnp.conj(A_neg) @ UH
@@ -212,6 +259,14 @@ def make_project_fn(
     S = None if spatial_group is None else jnp.asarray(spatial_group)
     U = None if time_reversal_U is None else jnp.asarray(time_reversal_U)
     requires_complex = any(jnp.iscomplexobj(op) for op in (G, S, U) if op is not None)
+    # Precomputed vec-space group sums for the GEMM form (see _GEMM_MAX_NB).
+    nb_g = None
+    for ops in (G, S):
+        if ops is not None:
+            nb_g = int(ops.shape[-1])
+    use_gemm = nb_g is not None and nb_g <= _GEMM_MAX_NB
+    M_G = _conj_sum_matrix(G) if (use_gemm and G is not None) else None
+    M_S = _conj_sum_matrix(S) if (use_gemm and S is not None) else None
     s_k_conv = str(spatial_k_convention)
     s_k_axes = tuple(spatial_k_flip_axes)
     t_k_conv = str(time_reversal_k_convention)
@@ -266,14 +321,18 @@ def make_project_fn(
             if G is not None:
                 # Compose orbital-only and spatial averages: the orbital
                 # average commutes with k-indexing, so do it after.
-                out = _avg_unitary_conj(out, G)
+                out = _avg_unitary_conj(out, G, M_G)
         elif G is not None and S is not None:
-            out = _avg_combined_group(out, G, S, s_k_conv, s_k_axes)
+            out = _avg_combined_group(
+                out, G, S, s_k_conv, s_k_axes, M_same=M_G, M_flip=M_S,
+            )
         elif G is not None:
-            out = _avg_unitary_conj(out, G)
+            out = _avg_unitary_conj(out, G, M_G)
         elif S is not None:
             I_mat = jnp.eye(S.shape[-1], dtype=S.dtype)[None]
-            out = _avg_combined_group(out, I_mat, S, s_k_conv, s_k_axes)
+            out = _avg_combined_group(
+                out, I_mat, S, s_k_conv, s_k_axes, M_flip=M_S,
+            )
         if U is not None:
             if t_idx_i is not None:
                 out = _avg_time_reversal_via_k_map(out, U, t_idx_i, t_idx_j, t_valid)

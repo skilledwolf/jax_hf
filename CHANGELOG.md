@@ -36,6 +36,17 @@ This project adheres to [Semantic Versioning](https://semver.org).
 - Reuse the initial SCF chemical-potential solve when level shifting is zero.
 - Reuse accepted projected CG trial eigensystems, while retaining the original
   unprojected reconstruction order for float32 convergence.
+- Apply unitary and spatial group averages in `make_project_fn` as one
+  precomputed GEMM on `vec(A)` when `nb <= 24` (the `(nb², nb²)` matrix is
+  formed once from the concrete unitaries). On the nk=49, nb=16 bilayer the
+  PM projector drops from 31 ms to 5.7 ms per call; it is applied about six
+  times per CG iteration (every density that enters a Fock build, plus the
+  Fermi-Dirac fixed point), so the CG solve runs 1.75x faster end to end
+  (514 -> 293 ms per iteration in the same process). Above the threshold the
+  per-element conjugation loop is kept.
+- Fix a dtype promotion in the projector: a complex128 group or time-reversal
+  unitary applied to a complex64 density promoted the `fori_loop` carry and
+  raised under x64; the operators now follow the density dtype.
 - CG backtracking now evaluates the true nonlinear objective and may perform
   multiple Fock builds per outer iteration. Newton may use a damped
   fixed-point fallback near occupation degeneracies. These checks trade some
