@@ -1,8 +1,0 @@
-{"seed": 0, "method": "rdiis", "jax_converged": true, "cpp_converged": true, "jax_iterations": 7, "cpp_iterations": 7, "energy_error": 5.400124791776761e-13, "density_max_error": 7.889244812986362e-13}
-{"seed": 0, "method": "anderson", "jax_converged": true, "cpp_converged": true, "jax_iterations": 7, "cpp_iterations": 7, "energy_error": 5.417888360170764e-13, "density_max_error": 7.912559496503491e-13}
-{"seed": 1, "method": "rdiis", "jax_converged": true, "cpp_converged": true, "jax_iterations": 10, "cpp_iterations": 10, "energy_error": 4.0123460109953157e-13, "density_max_error": 2.519815578946596e-13}
-{"seed": 1, "method": "anderson", "jax_converged": true, "cpp_converged": true, "jax_iterations": 10, "cpp_iterations": 10, "energy_error": 4.0234482412415673e-13, "density_max_error": 2.5170438754461745e-13}
-{"seed": 2, "method": "rdiis", "jax_converged": true, "cpp_converged": true, "jax_iterations": 11, "cpp_iterations": 11, "energy_error": 5.933031843596837e-13, "density_max_error": 3.4494629375103614e-13}
-{"seed": 2, "method": "anderson", "jax_converged": true, "cpp_converged": true, "jax_iterations": 12, "cpp_iterations": 12, "energy_error": 5.972999872483342e-13, "density_max_error": 3.4516833835596117e-13}
-{"seed": 3, "method": "rdiis", "jax_converged": true, "cpp_converged": true, "jax_iterations": 13, "cpp_iterations": 13, "energy_error": 7.625011733125575e-13, "density_max_error": 3.821387650759789e-13}
-{"seed": 3, "method": "anderson", "jax_converged": true, "cpp_converged": true, "jax_iterations": 14, "cpp_iterations": 14, "energy_error": 7.567280135845067e-13, "density_max_error": 3.8125058665627876e-13}
